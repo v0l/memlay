@@ -27,6 +27,10 @@ num_cpus = "1.16"
 # Utils
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+config = "0.14"
+anyhow = "1"
 hex = "0.4"
 
 # Web server
