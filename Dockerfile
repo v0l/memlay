@@ -6,6 +6,7 @@ WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY benches ./benches
 
 RUN cargo build --release --bin memlay
 
