@@ -109,6 +109,11 @@ impl EventStore {
         self.index.query_by_p_tag(pubkey, limit)
     }
 
+    /// Query events by any other single-letter tag value
+    pub fn query_by_tag(&self, letter: char, value: &str, limit: usize) -> Vec<Arc<Event>> {
+        self.index.query_by_tag(letter, value, limit)
+    }
+
     /// Number of events in the store
     pub fn len(&self) -> usize {
         self.index.len()

@@ -65,10 +65,15 @@ impl NostrMessage {
                         .as_str()
                         .ok_or("Missing subscription ID")?
                         .to_string();
-                    let filters_json = &arr[2];
-                    let filters: Vec<crate::subscription::Filter> =
-                        serde_json::from_value(filters_json.clone())
-                            .map_err(|e| format!("Invalid filters: {}", e))?;
+                    // NIP-01: ["REQ", "<id>", <filter1>, <filter2>, ...]
+                    // Each element from index 2 onward is a single filter object.
+                    let mut filters = Vec::new();
+                    for filter_json in &arr[2..] {
+                        let filter: crate::subscription::Filter =
+                            serde_json::from_value(filter_json.clone())
+                                .map_err(|e| format!("Invalid filter: {}", e))?;
+                        filters.push(filter);
+                    }
                     Ok(NostrMessage::Request { id, filters })
                 }
                 "EOSE" => {

@@ -4,6 +4,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+/// Tag letter used as key in `by_tag_other`.
+type TagLetter = char;
+
 /// Reference to an event, used in sorted indexes.
 /// Sorts by created_at DESC (newest first), then by id as tiebreaker.
 #[derive(Clone)]
@@ -65,9 +68,14 @@ pub struct EventIndex {
     by_pubkey: RwLock<BTreeMap<[u8; 32], BTreeSet<EventRef>>>,
     by_kind: RwLock<BTreeMap<u32, BTreeSet<EventRef>>>,
 
-    // Tag indexes
+    // Dedicated fast indexes for the two most-common tag types
     by_tag_e: RwLock<BTreeMap<[u8; 32], BTreeSet<EventRef>>>,
     by_tag_p: RwLock<BTreeMap<[u8; 32], BTreeSet<EventRef>>>,
+
+    // Generic index for every other single-letter tag (NIP-01 §tags)
+    // Outer key: tag letter ('t', 'a', 'd', …)
+    // Inner key: raw tag value string
+    by_tag_other: RwLock<HashMap<TagLetter, BTreeMap<String, BTreeSet<EventRef>>>>,
 }
 
 impl EventIndex {
@@ -78,6 +86,7 @@ impl EventIndex {
             by_kind: RwLock::new(BTreeMap::new()),
             by_tag_e: RwLock::new(BTreeMap::new()),
             by_tag_p: RwLock::new(BTreeMap::new()),
+            by_tag_other: RwLock::new(HashMap::new()),
         }
     }
 
@@ -115,6 +124,26 @@ impl EventIndex {
             let mut by_tag_p = self.by_tag_p.write();
             for p_tag in event.p_tags() {
                 by_tag_p.entry(p_tag).or_default().insert(event_ref.clone());
+            }
+        }
+
+        // Generic tag index for all other single-letter tags
+        {
+            let mut by_tag_other = self.by_tag_other.write();
+            for tag in &event.tags {
+                let mut chars = tag.name.chars();
+                if let (Some(letter), None) = (chars.next(), chars.next()) {
+                    if letter != 'e' && letter != 'p' {
+                        if let Some(value) = tag.value() {
+                            by_tag_other
+                                .entry(letter)
+                                .or_default()
+                                .entry(value.to_string())
+                                .or_default()
+                                .insert(event_ref.clone());
+                        }
+                    }
+                }
             }
         }
     }
@@ -173,6 +202,31 @@ impl EventIndex {
                     set.remove(&dummy_ref);
                     if set.is_empty() {
                         by_tag_p.remove(&p_tag);
+                    }
+                }
+            }
+        }
+
+        // Remove from generic tag index
+        {
+            let mut by_tag_other = self.by_tag_other.write();
+            for tag in &event.tags {
+                let mut chars = tag.name.chars();
+                if let (Some(letter), None) = (chars.next(), chars.next()) {
+                    if letter != 'e' && letter != 'p' {
+                        if let Some(value) = tag.value() {
+                            if let Some(inner) = by_tag_other.get_mut(&letter) {
+                                if let Some(set) = inner.get_mut(value) {
+                                    set.remove(&dummy_ref);
+                                    if set.is_empty() {
+                                        inner.remove(value);
+                                    }
+                                }
+                                if inner.is_empty() {
+                                    by_tag_other.remove(&letter);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -258,6 +312,21 @@ impl EventIndex {
         self.by_tag_p
             .read()
             .get(pubkey)
+            .map(|set| {
+                set.iter()
+                    .take(limit)
+                    .map(|r| Arc::clone(&r.event))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Query by any other single-letter tag value (events with `["x", "<value>"]`).
+    pub fn query_by_tag(&self, letter: char, value: &str, limit: usize) -> Vec<Arc<Event>> {
+        self.by_tag_other
+            .read()
+            .get(&letter)
+            .and_then(|inner| inner.get(value))
             .map(|set| {
                 set.iter()
                     .take(limit)

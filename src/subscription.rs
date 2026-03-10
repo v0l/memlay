@@ -1,7 +1,10 @@
 use crate::event::Event;
 use crate::store::EventStore;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,16 +13,129 @@ pub struct Subscription {
     pub filters: Vec<Filter>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// NIP-01 subscription filter.
+///
+/// Tag filters are stored in `tag_filters` keyed by the single-letter tag name.
+/// On the wire they appear as `#e`, `#p`, `#t`, etc.  The dedicated `e` and `p`
+/// entries are backed by fast 32-byte indexes; every other letter uses the
+/// generic string index.
+#[derive(Debug, Clone, Default)]
 pub struct Filter {
     pub ids: Option<Vec<String>>,
     pub kinds: Option<Vec<u32>>,
     pub authors: Option<Vec<String>>,
-    pub e_tags: Option<Vec<String>>,
-    pub p_tags: Option<Vec<String>>,
+    /// Keyed by single-letter tag name (e.g. `'e'`, `'p'`, `'t'`).
+    pub tag_filters: HashMap<char, Vec<String>>,
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: Option<usize>,
+}
+
+impl Filter {
+    /// Convenience accessor for `#e` tag filter values.
+    pub fn e_tags(&self) -> Option<&Vec<String>> {
+        self.tag_filters.get(&'e')
+    }
+
+    /// Convenience accessor for `#p` tag filter values.
+    pub fn p_tags(&self) -> Option<&Vec<String>> {
+        self.tag_filters.get(&'p')
+    }
+}
+
+// ── Custom Serialize ────────────────────────────────────────────────────────
+
+impl Serialize for Filter {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // Count non-None / non-empty fields so we can size the map.
+        let tag_count = self.tag_filters.len();
+        let fixed = [
+            self.ids.is_some(),
+            self.kinds.is_some(),
+            self.authors.is_some(),
+            self.since.is_some(),
+            self.until.is_some(),
+            self.limit.is_some(),
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+        let mut map = s.serialize_map(Some(fixed + tag_count))?;
+        if let Some(v) = &self.ids {
+            map.serialize_entry("ids", v)?;
+        }
+        if let Some(v) = &self.kinds {
+            map.serialize_entry("kinds", v)?;
+        }
+        if let Some(v) = &self.authors {
+            map.serialize_entry("authors", v)?;
+        }
+        for (letter, values) in &self.tag_filters {
+            let key = format!("#{letter}");
+            map.serialize_entry(&key, values)?;
+        }
+        if let Some(v) = self.since {
+            map.serialize_entry("since", &v)?;
+        }
+        if let Some(v) = self.until {
+            map.serialize_entry("until", &v)?;
+        }
+        if let Some(v) = self.limit {
+            map.serialize_entry("limit", &v)?;
+        }
+        map.end()
+    }
+}
+
+// ── Custom Deserialize ───────────────────────────────────────────────────────
+
+impl<'de> Deserialize<'de> for Filter {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct FilterVisitor;
+
+        impl<'de> Visitor<'de> for FilterVisitor {
+            type Value = Filter;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a NIP-01 filter object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Filter, A::Error> {
+                let mut filter = Filter::default();
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "ids" => filter.ids = Some(map.next_value()?),
+                        "kinds" => filter.kinds = Some(map.next_value()?),
+                        "authors" => filter.authors = Some(map.next_value()?),
+                        "since" => filter.since = Some(map.next_value()?),
+                        "until" => filter.until = Some(map.next_value()?),
+                        "limit" => filter.limit = Some(map.next_value()?),
+                        k if k.starts_with('#') => {
+                            let letter = k[1..]
+                                .chars()
+                                .next()
+                                .ok_or_else(|| de::Error::custom("empty tag filter key"))?;
+                            if k[1..].chars().count() == 1 {
+                                let values: Vec<String> = map.next_value()?;
+                                filter.tag_filters.insert(letter, values);
+                            } else {
+                                // multi-char after '#' – skip
+                                let _ = map.next_value::<serde_json::Value>()?;
+                            }
+                        }
+                        _ => {
+                            // unknown field – skip
+                            let _ = map.next_value::<serde_json::Value>()?;
+                        }
+                    }
+                }
+                Ok(filter)
+            }
+        }
+
+        d.deserialize_map(FilterVisitor)
+    }
 }
 
 pub struct SubscriptionManager {
@@ -62,8 +178,7 @@ impl SubscriptionManager {
     pub fn query_filter(&self, filter: &Filter) -> Vec<Arc<Event>> {
         if filter.kinds.is_none()
             && filter.authors.is_none()
-            && filter.e_tags.is_none()
-            && filter.p_tags.is_none()
+            && filter.tag_filters.is_empty()
             && filter.since.is_none()
             && filter.until.is_none()
             && filter.ids.is_none()
@@ -73,18 +188,18 @@ impl SubscriptionManager {
 
         let mut results: Vec<Arc<Event>> = Vec::new();
         let mut result_ids: HashSet<[u8; 32]> = HashSet::new();
+        let limit = filter.limit.unwrap_or(500);
 
-        // Priority order: IDs > e-tags > p-tags > authors > kinds
-        // First get candidates from the most selective index
+        // Priority order: IDs > #e > #p > other tags > authors > kinds
         let mut candidates: Vec<Arc<Event>> = Vec::new();
 
         if let Some(ids) = &filter.ids {
             for id in ids {
                 if let Ok(event_id) = hex::decode(id) {
                     if event_id.len() == 32 {
-                        let mut event_id_arr = [0u8; 32];
-                        event_id_arr.copy_from_slice(&event_id);
-                        if let Some(event) = self.store.get(&event_id_arr) {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&event_id);
+                        if let Some(event) = self.store.get(&arr) {
                             if filter.since.map_or(true, |s| event.created_at >= s)
                                 && filter.until.map_or(true, |u| event.created_at <= u)
                             {
@@ -94,86 +209,77 @@ impl SubscriptionManager {
                     }
                 }
             }
-        } else if let Some(e_tags) = &filter.e_tags {
-            for e_tag in e_tags {
-                if let Ok(event_id) = hex::decode(e_tag) {
-                    if event_id.len() == 32 {
-                        let mut event_id_arr = [0u8; 32];
-                        event_id_arr.copy_from_slice(&event_id);
-                        let events = self
-                            .store
-                            .query_by_e_tag(&event_id_arr, filter.limit.unwrap_or(100));
-                        candidates.extend(events);
+        } else if let Some(e_vals) = filter.tag_filters.get(&'e') {
+            for val in e_vals {
+                if let Ok(bytes) = hex::decode(val) {
+                    if bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        candidates.extend(self.store.query_by_e_tag(&arr, limit));
                     }
                 }
             }
-        } else if let Some(p_tags) = &filter.p_tags {
-            for p_tag in p_tags {
-                if let Ok(pubkey) = hex::decode(p_tag) {
-                    if pubkey.len() == 32 {
-                        let mut pubkey_arr = [0u8; 32];
-                        pubkey_arr.copy_from_slice(&pubkey);
-                        let events = self
-                            .store
-                            .query_by_p_tag(&pubkey_arr, filter.limit.unwrap_or(100));
-                        candidates.extend(events);
+        } else if let Some(p_vals) = filter.tag_filters.get(&'p') {
+            for val in p_vals {
+                if let Ok(bytes) = hex::decode(val) {
+                    if bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        candidates.extend(self.store.query_by_p_tag(&arr, limit));
                     }
                 }
+            }
+        } else if let Some((&letter, values)) = filter
+            .tag_filters
+            .iter()
+            .find(|&(&l, _)| l != 'e' && l != 'p')
+        {
+            for val in values {
+                candidates.extend(self.store.query_by_tag(letter, val, limit));
             }
         } else if let Some(authors) = &filter.authors {
             for author in authors {
-                if let Ok(pubkey) = hex::decode(author) {
-                    if pubkey.len() == 32 {
-                        let mut pubkey_arr = [0u8; 32];
-                        pubkey_arr.copy_from_slice(&pubkey);
-                        let events = self
-                            .store
-                            .query_by_pubkey(&pubkey_arr, filter.limit.unwrap_or(100));
-                        candidates.extend(events);
+                if let Ok(pk) = hex::decode(author) {
+                    if pk.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&pk);
+                        candidates.extend(self.store.query_by_pubkey(&arr, limit));
                     }
                 }
             }
         } else if let Some(kinds) = &filter.kinds {
             for kind in kinds {
-                let events = self.store.query_by_kind(*kind, filter.limit.unwrap_or(100));
-                candidates.extend(events);
+                candidates.extend(self.store.query_by_kind(*kind, limit));
             }
         }
 
-        // Now intersect with remaining filters (AND logic within filter)
+        // Intersect with all remaining filter criteria (AND logic)
         for event in candidates {
             let matches = filter.since.map_or(true, |s| event.created_at >= s)
                 && filter.until.map_or(true, |u| event.created_at <= u)
-                && filter.authors.as_ref().map_or(true, |authors| {
-                    authors.iter().any(|a| {
-                        hex::decode(a).map_or(false, |pk| pk.len() == 32 && pk == event.pubkey)
-                    })
-                })
-                && filter.authors.as_ref().map_or(true, |authors| {
-                    authors.iter().any(|a| {
-                        hex::decode(a).map_or(false, |pk| {
-                            pk.len() == 32 && pk.as_slice() == event.pubkey.as_slice()
-                        })
-                    })
-                })
                 && filter
                     .kinds
                     .as_ref()
                     .map_or(true, |kinds| kinds.contains(&event.kind))
-                && filter.e_tags.as_ref().map_or(true, |e_tags| {
-                    e_tags.iter().any(|e| {
-                        hex::decode(e).map_or(false, |eid| {
-                            eid.len() == 32
-                                && event.e_tags().any(|et| eid.as_slice() == et.as_slice())
-                        })
+                && filter.authors.as_ref().map_or(true, |authors| {
+                    authors.iter().any(|a| {
+                        hex::decode(a)
+                            .map_or(false, |pk| pk.len() == 32 && pk.as_slice() == event.pubkey)
                     })
                 })
-                && filter.p_tags.as_ref().map_or(true, |p_tags| {
-                    p_tags.iter().any(|p| {
-                        hex::decode(p).map_or(false, |pk| {
-                            pk.len() == 32
-                                && event.p_tags().any(|ep| pk.as_slice() == ep.as_slice())
-                        })
+                && filter.tag_filters.iter().all(|(&letter, values)| {
+                    // For every tag constraint ALL specified letters must match (AND).
+                    // Within each letter the event must have at least one matching value (OR).
+                    event.tags.iter().any(|tag| {
+                        let mut chars = tag.name.chars();
+                        let matches_letter = matches!(
+                            (chars.next(), chars.next()),
+                            (Some(l), None) if l == letter
+                        );
+                        matches_letter
+                            && tag
+                                .value()
+                                .map_or(false, |v| values.iter().any(|fv| fv == v))
                     })
                 });
 
@@ -184,9 +290,8 @@ impl SubscriptionManager {
             }
         }
 
-        // Apply limit
-        if let Some(limit) = filter.limit {
-            results.truncate(limit);
+        if let Some(lim) = filter.limit {
+            results.truncate(lim);
         }
 
         results
@@ -212,6 +317,28 @@ mod tests {
         Arc::new(Event::from_json(json.as_bytes()).unwrap())
     }
 
+    /// Build an event whose tags array is given as raw JSON tag arrays,
+    /// e.g. `&[r#"["e","abcd..."]"#, r#"["t","nostr"]"#]`.
+    fn make_event_with_raw_tags(
+        id: u8,
+        pubkey: u8,
+        kind: u32,
+        created_at: u64,
+        raw_tags: &[&str],
+    ) -> Arc<Event> {
+        let tags_json = raw_tags.join(",");
+        let json = format!(
+            r#"{{"id":"{:0>64}","pubkey":"{:0>64}","created_at":{},"kind":{},"tags":[{}],"content":"test","sig":"{:0>128}"}}"#,
+            format!("{:x}", id),
+            format!("{:x}", pubkey),
+            created_at,
+            kind,
+            tags_json,
+            "0"
+        );
+        Arc::new(Event::from_json(json.as_bytes()).unwrap())
+    }
+
     fn make_event_with_tags(
         id: u8,
         pubkey: u8,
@@ -220,44 +347,23 @@ mod tests {
         e_tags: &[u8],
         p_tags: &[u8],
     ) -> Arc<Event> {
-        let e_tags_str: Vec<String> = e_tags
+        let raw: Vec<String> = e_tags
             .iter()
-            .map(|e| format!("{:0>64}", format!("{:x}", e)))
+            .map(|e| format!(r#"["e","{}"]"#, format!("{:0>64}", format!("{:x}", e))))
+            .chain(
+                p_tags
+                    .iter()
+                    .map(|p| format!(r#"["p","{}"]"#, format!("{:0>64}", format!("{:x}", p)))),
+            )
             .collect();
-        let p_tags_str: Vec<String> = p_tags
-            .iter()
-            .map(|p| format!("{:0>64}", format!("{:x}", p)))
-            .collect();
+        let raw_refs: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
+        make_event_with_raw_tags(id, pubkey, kind, created_at, &raw_refs)
+    }
 
-        let e_tags_json = e_tags_str
-            .iter()
-            .map(|e| format!(r#"["e","{}"]"#, e))
-            .collect::<Vec<_>>()
-            .join(",");
-        let p_tags_json = p_tags_str
-            .iter()
-            .map(|p| format!(r#"["p","{}"]"#, p))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let json = format!(
-            r#"{{"id":"{:0>64}","pubkey":"{:0>64}","created_at":{},"kind":{},"tags":[{}],"content":"test","sig":"{:0>128}"}}"#,
-            format!("{:x}", id),
-            format!("{:x}", pubkey),
-            created_at,
-            kind,
-            if e_tags_json.is_empty() && p_tags_json.is_empty() {
-                String::new()
-            } else if e_tags_json.is_empty() {
-                p_tags_json
-            } else if p_tags_json.is_empty() {
-                e_tags_json
-            } else {
-                format!("{},{}", e_tags_json, p_tags_json)
-            },
-            "0"
-        );
-        Arc::new(Event::from_json(json.as_bytes()).unwrap())
+    fn tag_filter(letter: char, values: Vec<String>) -> Filter {
+        let mut f = Filter::default();
+        f.tag_filters.insert(letter, values);
+        f
     }
 
     #[test]
@@ -371,12 +477,12 @@ mod tests {
         let mut p_tag = [0u8; 32];
         p_tag[31] = 3;
 
-        let filter = Filter {
+        let mut filter = Filter {
             kinds: Some(vec![1]),
             authors: Some(vec![hex::encode(author)]),
-            p_tags: Some(vec![hex::encode(p_tag)]),
             ..Default::default()
         };
+        filter.tag_filters.insert('p', vec![hex::encode(p_tag)]);
 
         let results = sm.query_filter(&filter);
         assert_eq!(results.len(), 1);
@@ -410,26 +516,15 @@ mod tests {
         let sm = SubscriptionManager::new(Arc::new(store));
 
         let event1 = make_event(1, 1, 1, 1000);
-        let event2_json = format!(
-            r#"{{"id":"{:0>64}","pubkey":"{:0>64}","created_at":{},"kind":{},"tags":[["e","{:0>64}"]],"content":"reply","sig":"{:0>128}"}}"#,
-            format!("{:x}", 2),
-            format!("{:x}", 1),
-            2000,
-            1,
-            format!("{:x}", event1.id[31]),
-            "0"
-        );
-        let event2 = Arc::new(Event::from_json(event2_json.as_bytes()).unwrap());
+        let e_ref = format!(r#"["e","{}"]"#, hex::encode(event1.id));
+        let event2 = make_event_with_raw_tags(2, 1, 1, 2000, &[&e_ref]);
         sm.store.insert(event1);
         sm.store.insert(event2.clone());
 
         let mut e_tag = [0u8; 32];
         e_tag[31] = 1;
 
-        let filter = Filter {
-            e_tags: Some(vec![hex::encode(e_tag)]),
-            ..Default::default()
-        };
+        let filter = tag_filter('e', vec![hex::encode(e_tag)]);
 
         let results = sm.query_filter(&filter);
         assert_eq!(results.len(), 1);
@@ -510,13 +605,46 @@ mod tests {
         let mut p_tag = [0u8; 32];
         p_tag[31] = 1;
 
-        let filter = Filter {
-            p_tags: Some(vec![hex::encode(p_tag)]),
-            ..Default::default()
-        };
+        let filter = tag_filter('p', vec![hex::encode(p_tag)]);
 
         let results = sm.query_filter(&filter);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id[31], 1);
+    }
+
+    #[test]
+    fn test_query_generic_t_tag() {
+        let store = EventStore::new(StoreConfig::default());
+        let sm = SubscriptionManager::new(Arc::new(store));
+
+        sm.store.insert(make_event_with_raw_tags(
+            1,
+            1,
+            1,
+            1000,
+            &[r#"["t","nostr"]"#],
+        ));
+        sm.store.insert(make_event_with_raw_tags(
+            2,
+            1,
+            1,
+            2000,
+            &[r#"["t","bitcoin"]"#],
+        ));
+        sm.store.insert(make_event_with_raw_tags(
+            3,
+            1,
+            1,
+            3000,
+            &[r#"["t","nostr"]"#, r#"["t","bitcoin"]"#],
+        ));
+
+        let filter = tag_filter('t', vec!["nostr".to_string()]);
+        let results = sm.query_filter(&filter);
+        assert_eq!(results.len(), 2);
+        // both event 1 and 3 have #t=nostr
+        let mut ids: Vec<u8> = results.iter().map(|e| e.id[31]).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 3]);
     }
 }

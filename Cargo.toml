@@ -44,6 +44,7 @@ rand = "0.8"
 nostr-archive-cursor = { version = "0.5", features = ["sync"] }
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
+nostr-sdk = "0.44"
 
 [[bench]]
 name = "store_bench"
