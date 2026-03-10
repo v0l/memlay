@@ -1,5 +1,7 @@
 use bytes::Bytes;
+use secp256k1::{schnorr::Signature, Message, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 /// A parsed tag from a Nostr event.
@@ -37,17 +39,17 @@ pub struct Event {
 }
 
 impl Event {
-    /// Parse an event from JSON bytes.
-    pub fn from_json(json: &[u8]) -> Result<Self, EventParseError> {
+    /// Parse an event from JSON bytes, skipping id/signature verification.
+    /// Only for internal tests and benchmarks — do not use on untrusted input.
+    #[cfg(any(test, feature = "unchecked"))]
+    pub fn from_json_unchecked(json: &[u8]) -> Result<Self, EventParseError> {
         let raw_event: RawEvent = serde_json::from_slice(json)?;
-
         let id = parse_hex_32(&raw_event.id).ok_or(EventParseError::InvalidId)?;
         let pubkey = parse_hex_32(&raw_event.pubkey).ok_or(EventParseError::InvalidPubkey)?;
         let sig = parse_hex_64(&raw_event.sig).ok_or(EventParseError::InvalidSignature)?;
-
         let tags = raw_event
             .tags
-            .into_iter()
+            .iter()
             .filter_map(|tag_arr| {
                 if tag_arr.is_empty() {
                     return None;
@@ -58,6 +60,64 @@ impl Event {
                 })
             })
             .collect();
+        Ok(Event {
+            id,
+            pubkey,
+            created_at: raw_event.created_at,
+            kind: raw_event.kind,
+            tags,
+            content: raw_event.content,
+            sig,
+            raw: Bytes::copy_from_slice(json),
+        })
+    }
+
+    /// Parse an event from JSON bytes and verify its id and signature.
+    pub fn from_json(json: &[u8]) -> Result<Self, EventParseError> {
+        let raw_event: RawEvent = serde_json::from_slice(json)?;
+
+        let id = parse_hex_32(&raw_event.id).ok_or(EventParseError::InvalidId)?;
+        let pubkey = parse_hex_32(&raw_event.pubkey).ok_or(EventParseError::InvalidPubkey)?;
+        let sig = parse_hex_64(&raw_event.sig).ok_or(EventParseError::InvalidSignature)?;
+
+        let tags: Vec<Tag> = raw_event
+            .tags
+            .iter()
+            .filter_map(|tag_arr| {
+                if tag_arr.is_empty() {
+                    return None;
+                }
+                Some(Tag {
+                    name: tag_arr[0].clone(),
+                    values: tag_arr[1..].to_vec(),
+                })
+            })
+            .collect();
+
+        // Verify event id = SHA-256([0, pubkey, created_at, kind, tags, content])
+        let serialised = serde_json::to_vec(&serde_json::json!([
+            0,
+            raw_event.pubkey,
+            raw_event.created_at,
+            raw_event.kind,
+            raw_event.tags,
+            raw_event.content,
+        ]))
+        .map_err(EventParseError::Json)?;
+        let computed: [u8; 32] = Sha256::digest(&serialised).into();
+        if computed != id {
+            return Err(EventParseError::IdMismatch);
+        }
+
+        // Verify Schnorr signature
+        let xonly =
+            XOnlyPublicKey::from_slice(&pubkey).map_err(|_| EventParseError::InvalidPubkey)?;
+        let schnorr_sig =
+            Signature::from_slice(&sig).map_err(|_| EventParseError::InvalidSignature)?;
+        let msg = Message::from_digest(id);
+        secp256k1::global::SECP256K1
+            .verify_schnorr(&schnorr_sig, &msg, &xonly)
+            .map_err(|_| EventParseError::BadSignature)?;
 
         Ok(Event {
             id,
@@ -142,6 +202,10 @@ pub enum EventParseError {
     InvalidPubkey,
     #[error("Invalid signature (expected 64-byte hex)")]
     InvalidSignature,
+    #[error("Event id does not match content hash")]
+    IdMismatch,
+    #[error("Signature verification failed")]
+    BadSignature,
 }
 
 /// Parse a 32-byte hex string into bytes
@@ -201,7 +265,7 @@ mod tests {
             "sig": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005"
         }"#;
 
-        let event = Event::from_json(json.as_bytes()).unwrap();
+        let event = Event::from_json_unchecked(json.as_bytes()).unwrap();
         assert_eq!(event.id[31], 1);
         assert_eq!(event.pubkey[31], 2);
         assert_eq!(event.created_at, 1234567890);

@@ -15,7 +15,7 @@ fn generate_random_event(rng: &mut impl Rng, id: u64, pubkey_pool: &[[u8; 32]]) 
     let mut sig = [0u8; 64];
     rng.fill_bytes(&mut sig);
 
-    Event::from_json(
+    Event::from_json_unchecked(
         format!(
             r#"{{"id":"{}","pubkey":"{}","created_at":{},"kind":{},"tags":[],"content":"benchmark test content","sig":"{}"}}"#,
             hex_encode(&id_bytes),
@@ -139,12 +139,10 @@ fn bench_concurrent_queries(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
-    let store = std::sync::Arc::new(memlay::store::EventStore::new(
-        memlay::store::StoreConfig {
-            max_events: 100_000,
-            max_bytes: 0,
-        },
-    ));
+    let store = std::sync::Arc::new(memlay::store::EventStore::new(memlay::store::StoreConfig {
+        max_events: 100_000,
+        max_bytes: 0,
+    }));
 
     for i in 0..100_000u64 {
         let event = generate_random_event(&mut rng, i, &pubkey_pool);
@@ -183,10 +181,12 @@ fn bench_insertion(c: &mut Criterion) {
 
         group.bench_function("sequential_insert", |b| {
             b.iter_with_setup(
-                || memlay::store::EventStore::new(memlay::store::StoreConfig {
-                    max_events: load,
-                    max_bytes: 0,
-                }),
+                || {
+                    memlay::store::EventStore::new(memlay::store::StoreConfig {
+                        max_events: load,
+                        max_bytes: 0,
+                    })
+                },
                 |store| {
                     let mut rng = StdRng::seed_from_u64(42);
                     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);

@@ -29,7 +29,7 @@ fn random_event(rng: &mut impl Rng, id: u64, pubkey_pool: &[[u8; 32]]) -> Arc<Ev
         hex_encode(&sig)
     );
 
-    Arc::new(Event::from_json(json.as_bytes()).unwrap())
+    Arc::new(Event::from_json_unchecked(json.as_bytes()).unwrap())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

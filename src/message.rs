@@ -11,18 +11,19 @@ pub enum NostrMessage {
         id: String,
         filters: Vec<crate::subscription::Filter>,
     },
+    Close {
+        id: String,
+    },
     EndOfStoredEvents {
         id: String,
     },
     Notification {
         message: String,
     },
-    Success {
+    /// ["OK", "<event_id>", <accepted: bool>, "<message>"]
+    Ok {
         id: String,
-        message: String,
-    },
-    Error {
-        id: String,
+        accepted: bool,
         message: String,
     },
 }
@@ -30,7 +31,6 @@ pub enum NostrMessage {
 impl NostrMessage {
     /// Parse a Nostr message from a JSON string
     pub fn from_json(json: &str) -> Result<Self, String> {
-        // Try to parse as array first (Nostr protocol format)
         let value: serde_json::Value =
             serde_json::from_str(json).map_err(|e| format!("JSON parse error: {}", e))?;
 
@@ -49,9 +49,9 @@ impl NostrMessage {
                     let event_json = &arr[1];
                     let event = Event::from_json(
                         &serde_json::to_vec(event_json)
-                            .map_err(|e| format!("Event parse error: {}", e))?,
+                            .map_err(|e| format!("Event serialise error: {}", e))?,
                     )
-                    .map_err(|e| format!("Invalid event: {}", e))?;
+                    .map_err(|e| format!("{}", e))?;
                     Ok(NostrMessage::Event {
                         event,
                         sub_id: None,
@@ -66,7 +66,6 @@ impl NostrMessage {
                         .ok_or("Missing subscription ID")?
                         .to_string();
                     // NIP-01: ["REQ", "<id>", <filter1>, <filter2>, ...]
-                    // Each element from index 2 onward is a single filter object.
                     let mut filters = Vec::new();
                     for filter_json in &arr[2..] {
                         let filter: crate::subscription::Filter =
@@ -75,6 +74,16 @@ impl NostrMessage {
                         filters.push(filter);
                     }
                     Ok(NostrMessage::Request { id, filters })
+                }
+                "CLOSE" => {
+                    if arr.len() < 2 {
+                        return Err("Missing subscription ID".to_string());
+                    }
+                    let id = arr[1]
+                        .as_str()
+                        .ok_or("Invalid subscription ID")?
+                        .to_string();
+                    Ok(NostrMessage::Close { id })
                 }
                 "EOSE" => {
                     if arr.len() < 2 {
@@ -91,20 +100,17 @@ impl NostrMessage {
                     Ok(NostrMessage::Notification { message })
                 }
                 "OK" => {
-                    if arr.len() < 3 {
+                    if arr.len() < 4 {
                         return Err("Missing OK fields".to_string());
                     }
                     let id = arr[1].as_str().ok_or("Invalid OK id")?.to_string();
-                    let message = arr[2].as_str().ok_or("Invalid OK message")?.to_string();
-                    Ok(NostrMessage::Success { id, message })
-                }
-                "CLOSED" | "ERROR" => {
-                    if arr.len() < 3 {
-                        return Err("Missing CLOSED/ERROR fields".to_string());
-                    }
-                    let id = arr[1].as_str().ok_or("Invalid id")?.to_string();
-                    let message = arr[2].as_str().ok_or("Invalid message")?.to_string();
-                    Ok(NostrMessage::Error { id, message })
+                    let accepted = arr[2].as_bool().ok_or("Invalid OK accepted field")?;
+                    let message = arr[3].as_str().ok_or("Invalid OK message")?.to_string();
+                    Ok(NostrMessage::Ok {
+                        id,
+                        accepted,
+                        message,
+                    })
                 }
                 _ => Err(format!("Unknown message type: {}", msg_type)),
             }
@@ -131,17 +137,22 @@ impl NostrMessage {
                 let filters_json = serde_json::to_string(filters).unwrap_or_default();
                 format!(r#"["REQ","{}",{}]"#, id, filters_json)
             }
+            NostrMessage::Close { id } => {
+                format!(r#"["CLOSE","{}"]"#, id)
+            }
             NostrMessage::EndOfStoredEvents { id } => {
                 format!(r#"["EOSE","{}"]"#, id)
             }
             NostrMessage::Notification { message } => {
-                format!(r#"["NOTICE","{}"]"#, message)
+                // Escape the message as a proper JSON string value
+                serde_json::to_string(&serde_json::json!(["NOTICE", message])).unwrap_or_default()
             }
-            NostrMessage::Success { id, message } => {
-                format!(r#"["OK","{}","{}"]"#, id, message)
-            }
-            NostrMessage::Error { id, message } => {
-                format!(r#"["ERROR","{}","{}"]"#, id, message)
+            NostrMessage::Ok {
+                id,
+                accepted,
+                message,
+            } => {
+                format!(r#"["OK","{}",{},"{}"]"#, id, accepted, message)
             }
         }
     }

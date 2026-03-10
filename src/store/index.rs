@@ -356,7 +356,7 @@ mod tests {
             kind,
             "0"
         );
-        Arc::new(Event::from_json(json.as_bytes()).unwrap())
+        Arc::new(Event::from_json_unchecked(json.as_bytes()).unwrap())
     }
 
     #[test]

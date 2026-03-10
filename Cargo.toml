@@ -3,6 +3,9 @@ name = "memlay"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+unchecked = []
+
 [lib]
 name = "memlay"
 path = "src/lib.rs"
@@ -32,6 +35,8 @@ clap = { version = "4", features = ["derive"] }
 config = "0.14"
 anyhow = "1"
 hex = "0.4"
+secp256k1 = { version = "0.29", features = ["global-context"] }
+sha2 = "0.10"
 
 # Web server
 axum = { version = "0.7", features = ["ws"] }

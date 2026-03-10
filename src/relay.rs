@@ -1,6 +1,7 @@
 use crate::config::Config;
+use crate::message::NostrMessage;
 use crate::store::{EventStore, StoreConfig};
-use crate::subscription::SubscriptionManager;
+use crate::subscription::{Filter, Subscription, SubscriptionManager};
 use axum::{
     extract::ws::{WebSocket, WebSocketUpgrade},
     http::{HeaderMap, HeaderValue},
@@ -9,10 +10,16 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use tokio::sync::broadcast;
+
+/// Capacity of the relay-wide new-event broadcast channel.
+const BROADCAST_CAP: usize = 1024;
 
 pub struct Relay {
     pub events: Arc<EventStore>,
     pub subscriptions: Arc<SubscriptionManager>,
+    /// Sender side of the relay-wide broadcast for newly accepted events.
+    tx: broadcast::Sender<Arc<crate::event::Event>>,
     config: Config,
 }
 
@@ -23,24 +30,22 @@ impl Relay {
             max_bytes: config.max_bytes,
         }));
         let subscriptions = Arc::new(SubscriptionManager::new(events.clone()));
-        Self {
-            events,
-            subscriptions,
-            config,
-        }
+        let (tx, _) = broadcast::channel(BROADCAST_CAP);
+        Self { events, subscriptions, tx, config }
     }
 
     pub fn router(self) -> Router {
         let subscriptions = self.subscriptions.clone();
+        let tx = self.tx.clone();
         let config = self.config.clone();
+
         Router::new().route(
             "/",
             get(move |headers: HeaderMap, ws: Option<WebSocketUpgrade>| {
                 let subscriptions = subscriptions.clone();
+                let tx = tx.clone();
                 let config = config.clone();
                 async move {
-                    // NIP-11: serve relay info document when Accept header is
-                    // application/nostr+json, regardless of WebSocket upgrade.
                     let wants_info = headers
                         .get("accept")
                         .and_then(|v| v.to_str().ok())
@@ -57,7 +62,7 @@ impl Relay {
                                 tracing::warn!("WebSocket upgrade failed: {}", err);
                             })
                             .on_upgrade(move |socket| {
-                                handle_socket(socket, subscriptions)
+                                handle_socket(socket, subscriptions, tx)
                             })
                             .into_response(),
                         None => landing_page().into_response(),
@@ -67,6 +72,8 @@ impl Relay {
         )
     }
 }
+
+// ── HTTP handlers ─────────────────────────────────────────────────────────────
 
 fn nip11_handler(config: &Config) -> impl IntoResponse {
     let body = serde_json::json!({
@@ -97,56 +104,208 @@ fn landing_page() -> impl IntoResponse {
     (headers, html)
 }
 
-async fn handle_socket(mut socket: WebSocket, subscriptions: Arc<SubscriptionManager>) {
+// ── WebSocket connection handler ──────────────────────────────────────────────
+
+async fn handle_socket(
+    mut socket: WebSocket,
+    subscriptions: Arc<SubscriptionManager>,
+    tx: broadcast::Sender<Arc<crate::event::Event>>,
+) {
+    // Per-connection subscription state: sub_id → filters
+    let mut conn_subs: std::collections::HashMap<String, Vec<Filter>> =
+        std::collections::HashMap::new();
+
+    let mut rx = tx.subscribe();
+
     loop {
-        let msg = match socket.recv().await {
-            Some(Ok(msg)) => msg,
-            _ => break,
-        };
-        
-        match msg {
-            axum::extract::ws::Message::Text(text) => {
-                let msg = crate::message::NostrMessage::from_json(&text);
+        tokio::select! {
+            // ── inbound message from client ───────────────────────────────
+            msg = socket.recv() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    _ => break,
+                };
+
                 match msg {
-                    Ok(crate::message::NostrMessage::Event { event, .. }) => {
-                        let ev = Arc::new(event);
-                        let _ = subscriptions.store.insert(ev);
+                    axum::extract::ws::Message::Text(text) => {
+                        handle_text(&text, &mut socket, &subscriptions, &tx, &mut conn_subs).await;
                     }
-                    Ok(crate::message::NostrMessage::Request { id, filters }) => {
-                        for filter in filters {
-                            let events = subscriptions.query_filter(&filter);
-                            for event in events {
-                                let msg = crate::message::NostrMessage::Event {
-                                    sub_id: Some(id.clone()),
-                                    event: (*event).clone(),
-                                };
-                                let json = msg.to_json();
-                                let _ = socket.send(axum::extract::ws::Message::Text(json)).await;
-                            }
-                        }
-                        let eose = crate::message::NostrMessage::EndOfStoredEvents { id };
-                        let _ = socket
-                            .send(axum::extract::ws::Message::Text(eose.to_json()))
-                            .await;
+                    axum::extract::ws::Message::Binary(_) => {
+                        let notice = NostrMessage::Notification {
+                            message: "binary messages are not supported".to_string(),
+                        };
+                        let _ = socket.send(axum::extract::ws::Message::Text(notice.to_json())).await;
                     }
-                    Err(e) => {
-                        let _ = socket.send(axum::extract::ws::Message::Text(format!(
-                            r#"["ERROR","{}"]"#,
-                            e
-                        )));
+                    axum::extract::ws::Message::Ping(data) => {
+                        let _ = socket.send(axum::extract::ws::Message::Pong(data)).await;
                     }
-                    _ => {}
+                    axum::extract::ws::Message::Pong(_) => {}
+                    axum::extract::ws::Message::Close(_) => break,
                 }
             }
-            axum::extract::ws::Message::Binary(_) => {
-                let _ = socket.send(axum::extract::ws::Message::Text(
-                    r#"["ERROR","Binary messages not supported"]"#
-                        .to_string()
-                )).await;
+
+            // ── new event broadcast from another connection ───────────────
+            event = rx.recv() => {
+                match event {
+                    Ok(event) => {
+                        // Check every active subscription on this connection
+                        for (sub_id, filters) in &conn_subs {
+                            for filter in filters {
+                                if filter_matches(filter, &event) {
+                                    let msg = NostrMessage::Event {
+                                        sub_id: Some(sub_id.clone()),
+                                        event: (*event).clone(),
+                                    };
+                                    if socket
+                                        .send(axum::extract::ws::Message::Text(msg.to_json()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    break; // only send once per subscription even if multiple filters match
+                                }
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("broadcast lagged by {} events", n);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
-            axum::extract::ws::Message::Ping(_) => {}
-            axum::extract::ws::Message::Pong(_) => {}
-            axum::extract::ws::Message::Close(_) => break,
         }
     }
+
+    // Clean up all subscriptions for this connection on disconnect
+    for sub_id in conn_subs.keys() {
+        subscriptions.remove_subscription(sub_id);
+    }
+}
+
+async fn handle_text(
+    text: &str,
+    socket: &mut WebSocket,
+    subscriptions: &Arc<SubscriptionManager>,
+    tx: &broadcast::Sender<Arc<crate::event::Event>>,
+    conn_subs: &mut std::collections::HashMap<String, Vec<Filter>>,
+) {
+    match NostrMessage::from_json(text) {
+        Ok(NostrMessage::Event { event, .. }) => {
+            let event_id = hex::encode(event.id);
+            let ev = Arc::new(event);
+
+            // Duplicate check before insert
+            if subscriptions.store.get(&ev.id).is_some() {
+                let ok = NostrMessage::Ok {
+                    id: event_id,
+                    accepted: true,
+                    message: "duplicate: already have this event".to_string(),
+                };
+                let _ = socket.send(axum::extract::ws::Message::Text(ok.to_json())).await;
+                return;
+            }
+
+            subscriptions.store.insert(ev.clone());
+
+            // Broadcast to live subscriptions on other connections
+            let _ = tx.send(ev);
+
+            let ok = NostrMessage::Ok {
+                id: event_id,
+                accepted: true,
+                message: String::new(),
+            };
+            let _ = socket.send(axum::extract::ws::Message::Text(ok.to_json())).await;
+        }
+
+        Ok(NostrMessage::Request { id, filters }) => {
+            // Register subscription
+            subscriptions.add_subscription(Subscription {
+                id: id.clone(),
+                filters: filters.clone(),
+            });
+            conn_subs.insert(id.clone(), filters.clone());
+
+            // Send stored matching events
+            for filter in &filters {
+                let events = subscriptions.query_filter(filter);
+                for event in events {
+                    let msg = NostrMessage::Event {
+                        sub_id: Some(id.clone()),
+                        event: (*event).clone(),
+                    };
+                    if socket
+                        .send(axum::extract::ws::Message::Text(msg.to_json()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+
+            let eose = NostrMessage::EndOfStoredEvents { id };
+            let _ = socket.send(axum::extract::ws::Message::Text(eose.to_json())).await;
+        }
+
+        Ok(NostrMessage::Close { id }) => {
+            subscriptions.remove_subscription(&id);
+            conn_subs.remove(&id);
+        }
+
+        Err(e) => {
+            let notice = NostrMessage::Notification { message: e };
+            let _ = socket.send(axum::extract::ws::Message::Text(notice.to_json())).await;
+        }
+
+        _ => {} // client-side messages (OK, EOSE, NOTICE) — ignore
+    }
+}
+
+// ── filter matching for live delivery ────────────────────────────────────────
+
+/// Returns true if `event` matches `filter` (same AND logic as query_filter,
+/// but applied to a single event without going through the store).
+fn filter_matches(filter: &Filter, event: &crate::event::Event) -> bool {
+    if let Some(since) = filter.since {
+        if event.created_at < since {
+            return false;
+        }
+    }
+    if let Some(until) = filter.until {
+        if event.created_at > until {
+            return false;
+        }
+    }
+    if let Some(kinds) = &filter.kinds {
+        if !kinds.contains(&event.kind) {
+            return false;
+        }
+    }
+    if let Some(ids) = &filter.ids {
+        let event_id_hex = hex::encode(event.id);
+        if !ids.iter().any(|id| event_id_hex.starts_with(id.as_str())) {
+            return false;
+        }
+    }
+    if let Some(authors) = &filter.authors {
+        let pubkey_hex = hex::encode(event.pubkey);
+        if !authors.iter().any(|a| pubkey_hex.starts_with(a.as_str())) {
+            return false;
+        }
+    }
+    if !filter.tag_filters.is_empty() {
+        for (&letter, values) in &filter.tag_filters {
+            let matched = event.tags.iter().any(|tag| {
+                let mut chars = tag.name.chars();
+                matches!((chars.next(), chars.next()), (Some(l), None) if l == letter)
+                    && tag.value().map_or(false, |v| values.iter().any(|fv| fv == v))
+            });
+            if !matched {
+                return false;
+            }
+        }
+    }
+    true
 }

@@ -316,11 +316,9 @@ mod tests {
             kind,
             "0"
         );
-        Arc::new(Event::from_json(json.as_bytes()).unwrap())
+        Arc::new(Event::from_json_unchecked(json.as_bytes()).unwrap())
     }
 
-    /// Build an event whose tags array is given as raw JSON tag arrays,
-    /// e.g. `&[r#"["e","abcd..."]"#, r#"["t","nostr"]"#]`.
     fn make_event_with_raw_tags(
         id: u8,
         pubkey: u8,
@@ -338,7 +336,7 @@ mod tests {
             tags_json,
             "0"
         );
-        Arc::new(Event::from_json(json.as_bytes()).unwrap())
+        Arc::new(Event::from_json_unchecked(json.as_bytes()).unwrap())
     }
 
     fn make_event_with_tags(
