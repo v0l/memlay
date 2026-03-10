@@ -45,6 +45,7 @@ nostr-archive-cursor = { version = "0.5", features = ["sync"] }
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 nostr-sdk = "0.44"
+tungstenite = "0.26"
 
 [[bench]]
 name = "store_bench"
@@ -52,4 +53,8 @@ harness = false
 
 [[bench]]
 name = "relay_bench"
+harness = false
+
+[[bench]]
+name = "ingest_bench"
 harness = false
