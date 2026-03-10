@@ -41,14 +41,20 @@ impl EventStore {
         }
     }
 
-    /// Insert an event, returning any evicted events
-    pub fn insert(&self, event: Arc<Event>) -> Vec<Arc<Event>> {
+    /// Check if an event id is already in the store without touching LRU.
+    pub fn contains(&self, id: &[u8; 32]) -> bool {
+        self.index.get(id).is_some()
+    }
+
+    /// Insert an event, returning any evicted events.
+    /// Returns `None` if the event was already present (duplicate).
+    pub fn insert(&self, event: Arc<Event>) -> Option<Vec<Arc<Event>>> {
         let event_size = event.size();
         let event_id = event.id;
 
         // Check if event already exists
         if self.index.get(&event_id).is_some() {
-            return vec![];
+            return None;
         }
 
         // Determine which events need to be evicted
@@ -68,7 +74,7 @@ impl EventStore {
         // Insert the new event
         self.index.insert(event);
 
-        evicted
+        Some(evicted)
     }
 
     /// Get an event by ID
@@ -179,7 +185,7 @@ mod tests {
         assert_eq!(store.len(), 3);
 
         // Insert 4th event, should evict oldest (id=1)
-        let evicted = store.insert(make_event(4, 1, 1, 4000));
+        let evicted = store.insert(make_event(4, 1, 1, 4000)).unwrap();
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].id[31], 1);
         assert_eq!(store.len(), 3);

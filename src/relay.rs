@@ -222,35 +222,31 @@ async fn handle_text(
             let event_id = hex::encode(event.id);
             let ev = Arc::new(event);
 
-            // Duplicate check before insert
-            if subscriptions.store.get(&ev.id).is_some() {
-                tracing::debug!(%addr, id = %event_id, "duplicate event");
-                let ok = NostrMessage::Ok {
-                    id: event_id,
-                    accepted: true,
-                    message: "duplicate: already have this event".to_string(),
-                };
-                let _ = socket.send(axum::extract::ws::Message::Text(ok.to_json())).await;
-                return;
-            }
-
-            tracing::info!(
-                %addr,
-                id = %event_id,
-                kind = ev.kind,
-                pubkey = %hex::encode(ev.pubkey),
-                "event stored"
-            );
-
-            subscriptions.store.insert(ev.clone());
-
-            // Broadcast to live subscriptions on other connections
-            let _ = tx.send(ev);
-
-            let ok = NostrMessage::Ok {
-                id: event_id,
-                accepted: true,
-                message: String::new(),
+            let ok = match subscriptions.store.insert(ev.clone()) {
+                None => {
+                    tracing::debug!(%addr, id = %event_id, "duplicate event");
+                    NostrMessage::Ok {
+                        id: event_id,
+                        accepted: true,
+                        message: "duplicate: already have this event".to_string(),
+                    }
+                }
+                Some(_) => {
+                    tracing::info!(
+                        %addr,
+                        id = %event_id,
+                        kind = ev.kind,
+                        pubkey = %hex::encode(ev.pubkey),
+                        "event stored"
+                    );
+                    // Broadcast to live subscriptions on other connections
+                    let _ = tx.send(ev);
+                    NostrMessage::Ok {
+                        id: event_id,
+                        accepted: true,
+                        message: String::new(),
+                    }
+                }
             };
             let _ = socket.send(axum::extract::ws::Message::Text(ok.to_json())).await;
         }
