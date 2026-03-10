@@ -3,12 +3,13 @@ use crate::message::NostrMessage;
 use crate::store::{EventStore, StoreConfig};
 use crate::subscription::{Filter, Subscription, SubscriptionManager};
 use axum::{
-    extract::ws::{WebSocket, WebSocketUpgrade},
+    extract::{ws::{WebSocket, WebSocketUpgrade}, ConnectInfo},
     http::{HeaderMap, HeaderValue},
     response::IntoResponse,
     routing::get,
     Router,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -46,7 +47,11 @@ impl Relay {
                 async move { stats_handler(events) }
             }))
             .route("/",
-            get(move |headers: HeaderMap, ws: Option<WebSocketUpgrade>| {
+            get(move |
+                ConnectInfo(addr): ConnectInfo<SocketAddr>,
+                headers: HeaderMap,
+                ws: Option<WebSocketUpgrade>,
+            | {
                 let subscriptions = subscriptions.clone();
                 let tx = tx.clone();
                 let config = config.clone();
@@ -63,11 +68,11 @@ impl Relay {
 
                     match ws {
                         Some(ws) => ws
-                            .on_failed_upgrade(|err| {
-                                tracing::warn!("WebSocket upgrade failed: {}", err);
+                            .on_failed_upgrade(move |err| {
+                                tracing::warn!(%addr, "WebSocket upgrade failed: {}", err);
                             })
                             .on_upgrade(move |socket| {
-                                handle_socket(socket, subscriptions, tx)
+                                handle_socket(socket, addr, subscriptions, tx)
                             })
                             .into_response(),
                         None => landing_page().into_response(),
@@ -125,9 +130,12 @@ fn landing_page() -> impl IntoResponse {
 
 async fn handle_socket(
     mut socket: WebSocket,
+    addr: SocketAddr,
     subscriptions: Arc<SubscriptionManager>,
     tx: broadcast::Sender<Arc<crate::event::Event>>,
 ) {
+    tracing::info!(%addr, "client connected");
+
     // Per-connection subscription state: sub_id → filters
     let mut conn_subs: std::collections::HashMap<String, Vec<Filter>> =
         std::collections::HashMap::new();
@@ -145,7 +153,7 @@ async fn handle_socket(
 
                 match msg {
                     axum::extract::ws::Message::Text(text) => {
-                        handle_text(&text, &mut socket, &subscriptions, &tx, &mut conn_subs).await;
+                        handle_text(&text, addr, &mut socket, &subscriptions, &tx, &mut conn_subs).await;
                     }
                     axum::extract::ws::Message::Binary(_) => {
                         let notice = NostrMessage::Notification {
@@ -198,10 +206,12 @@ async fn handle_socket(
     for sub_id in conn_subs.keys() {
         subscriptions.remove_subscription(sub_id);
     }
+    tracing::info!(%addr, "client disconnected");
 }
 
 async fn handle_text(
     text: &str,
+    addr: SocketAddr,
     socket: &mut WebSocket,
     subscriptions: &Arc<SubscriptionManager>,
     tx: &broadcast::Sender<Arc<crate::event::Event>>,
@@ -214,6 +224,7 @@ async fn handle_text(
 
             // Duplicate check before insert
             if subscriptions.store.get(&ev.id).is_some() {
+                tracing::debug!(%addr, id = %event_id, "duplicate event");
                 let ok = NostrMessage::Ok {
                     id: event_id,
                     accepted: true,
@@ -222,6 +233,14 @@ async fn handle_text(
                 let _ = socket.send(axum::extract::ws::Message::Text(ok.to_json())).await;
                 return;
             }
+
+            tracing::info!(
+                %addr,
+                id = %event_id,
+                kind = ev.kind,
+                pubkey = %hex::encode(ev.pubkey),
+                "event stored"
+            );
 
             subscriptions.store.insert(ev.clone());
 

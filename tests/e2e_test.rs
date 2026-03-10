@@ -17,7 +17,9 @@ async fn spawn_relay() -> String {
 
     let tcp = TokioTcpListener::bind(addr).await.unwrap();
     tokio::spawn(async move {
-        axum::serve(tcp, router).await.unwrap();
+        axum::serve(tcp, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .await
+            .unwrap();
     });
 
     url
