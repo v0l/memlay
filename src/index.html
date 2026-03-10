@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>memlay</title>
+<style>
+  :root { --bg: #0d0d0d; --fg: #e8e8e8; --accent: #7c3aed; --muted: #888; --border: #222; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--fg); font: 16px/1.6 system-ui, sans-serif;
+         display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  main { max-width: 520px; width: 100%; padding: 2rem 1.5rem; }
+  h1 { font-size: 2rem; font-weight: 700; color: var(--accent); margin-bottom: .25rem; }
+  .tagline { color: var(--muted); margin-bottom: 2rem; font-size: .95rem; }
+  .pill { display: inline-block; background: var(--border); border-radius: 999px;
+           padding: .15rem .7rem; font-size: .8rem; color: var(--muted); margin-right: .3rem; }
+  section { border: 1px solid var(--border); border-radius: .5rem; padding: 1.25rem 1.5rem;
+            margin-bottom: 1rem; }
+  section h2 { font-size: .75rem; text-transform: uppercase; letter-spacing: .08em;
+               color: var(--muted); margin-bottom: .75rem; }
+  code { background: var(--border); border-radius: .25rem; padding: .1rem .4rem;
+         font-size: .9rem; font-family: ui-monospace, monospace; color: var(--fg); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .row { display: flex; justify-content: space-between; align-items: center;
+         padding: .35rem 0; border-bottom: 1px solid var(--border); font-size: .9rem; }
+  .row:last-child { border-bottom: none; }
+  .row span:first-child { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>memlay</h1>
+  <p class="tagline">High-performance in-memory Nostr relay</p>
+
+  <section>
+    <h2>Connect</h2>
+    <div class="row">
+      <span>WebSocket</span>
+      <code id="ws-url"></code>
+    </div>
+    <div class="row">
+      <span>NIPs</span>
+      <span><span class="pill">NIP-01</span><span class="pill">NIP-11</span></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Info</h2>
+    <div class="row"><span>Software</span>
+      <a href="https://github.com/v0l/memlay">github.com/v0l/memlay</a></div>
+    <div class="row"><span>Version</span><code>{{VERSION}}</code></div>
+  </section>
+</main>
+<script>
+  const u = location.href.replace(/^http/, 'ws').replace(/\/$/, '');
+  document.getElementById('ws-url').textContent = u;
+</script>
+</body>
+</html>

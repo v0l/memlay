@@ -3,7 +3,7 @@ use crate::store::{EventStore, StoreConfig};
 use crate::subscription::SubscriptionManager;
 use axum::{
     extract::ws::{WebSocket, WebSocketUpgrade},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue},
     response::IntoResponse,
     routing::get,
     Router,
@@ -60,7 +60,7 @@ impl Relay {
                                 handle_socket(socket, subscriptions)
                             })
                             .into_response(),
-                        None => (StatusCode::BAD_REQUEST, "Expected WebSocket upgrade or Accept: application/nostr+json").into_response(),
+                        None => landing_page().into_response(),
                     }
                 }
             }),
@@ -88,6 +88,13 @@ fn nip11_handler(config: &Config) -> impl IntoResponse {
     headers.insert("Access-Control-Allow-Methods", HeaderValue::from_static("GET"));
 
     (headers, axum::Json(body)).into_response()
+}
+
+fn landing_page() -> impl IntoResponse {
+    let html = include_str!("index.html").replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
+    let mut headers = HeaderMap::new();
+    headers.insert("Content-Type", HeaderValue::from_static("text/html; charset=utf-8"));
+    (headers, html)
 }
 
 async fn handle_socket(mut socket: WebSocket, subscriptions: Arc<SubscriptionManager>) {
