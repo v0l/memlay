@@ -188,7 +188,9 @@ impl SubscriptionManager {
 
         let mut results: Vec<Arc<Event>> = Vec::new();
         let mut result_ids: HashSet<[u8; 32]> = HashSet::new();
-        let limit = filter.limit.unwrap_or(500);
+        // Use the filter's limit as the index fetch cap when set; otherwise
+        // fetch everything — the explicit truncation at the end handles it.
+        let fetch_limit = filter.limit.unwrap_or(usize::MAX);
 
         // Priority order: IDs > #e > #p > other tags > authors > kinds
         let mut candidates: Vec<Arc<Event>> = Vec::new();
@@ -215,7 +217,7 @@ impl SubscriptionManager {
                     if bytes.len() == 32 {
                         let mut arr = [0u8; 32];
                         arr.copy_from_slice(&bytes);
-                        candidates.extend(self.store.query_by_e_tag(&arr, limit));
+                        candidates.extend(self.store.query_by_e_tag(&arr, fetch_limit));
                     }
                 }
             }
@@ -225,7 +227,7 @@ impl SubscriptionManager {
                     if bytes.len() == 32 {
                         let mut arr = [0u8; 32];
                         arr.copy_from_slice(&bytes);
-                        candidates.extend(self.store.query_by_p_tag(&arr, limit));
+                        candidates.extend(self.store.query_by_p_tag(&arr, fetch_limit));
                     }
                 }
             }
@@ -235,7 +237,7 @@ impl SubscriptionManager {
             .find(|&(&l, _)| l != 'e' && l != 'p')
         {
             for val in values {
-                candidates.extend(self.store.query_by_tag(letter, val, limit));
+                candidates.extend(self.store.query_by_tag(letter, val, fetch_limit));
             }
         } else if let Some(authors) = &filter.authors {
             for author in authors {
@@ -243,13 +245,13 @@ impl SubscriptionManager {
                     if pk.len() == 32 {
                         let mut arr = [0u8; 32];
                         arr.copy_from_slice(&pk);
-                        candidates.extend(self.store.query_by_pubkey(&arr, limit));
+                        candidates.extend(self.store.query_by_pubkey(&arr, fetch_limit));
                     }
                 }
             }
         } else if let Some(kinds) = &filter.kinds {
             for kind in kinds {
-                candidates.extend(self.store.query_by_kind(*kind, limit));
+                candidates.extend(self.store.query_by_kind(*kind, fetch_limit));
             }
         }
 
