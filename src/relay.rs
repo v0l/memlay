@@ -1,12 +1,19 @@
 use crate::config::Config;
 use crate::store::{EventStore, StoreConfig};
 use crate::subscription::SubscriptionManager;
-use axum::{extract::ws::{WebSocket, WebSocketUpgrade}, response::IntoResponse, routing::get, Router};
+use axum::{
+    extract::ws::{WebSocket, WebSocketUpgrade},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
 use std::sync::Arc;
 
 pub struct Relay {
     pub events: Arc<EventStore>,
     pub subscriptions: Arc<SubscriptionManager>,
+    config: Config,
 }
 
 impl Relay {
@@ -19,32 +26,68 @@ impl Relay {
         Self {
             events,
             subscriptions,
+            config,
         }
     }
 
     pub fn router(self) -> Router {
         let subscriptions = self.subscriptions.clone();
-        Router::new()
-            .route("/", get(move |ws: WebSocketUpgrade| async move {
-                ws.on_failed_upgrade(|err| {
-                    tracing::warn!("WebSocket failed to upgrade: {}", err);
-                })
-                .on_upgrade(move |socket: WebSocket| {
-                    handle_socket(socket, subscriptions.clone())
-                })
-            }))
-            .route("/info", get(info_handler))
+        let config = self.config.clone();
+        Router::new().route(
+            "/",
+            get(move |headers: HeaderMap, ws: Option<WebSocketUpgrade>| {
+                let subscriptions = subscriptions.clone();
+                let config = config.clone();
+                async move {
+                    // NIP-11: serve relay info document when Accept header is
+                    // application/nostr+json, regardless of WebSocket upgrade.
+                    let wants_info = headers
+                        .get("accept")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.contains("application/nostr+json"))
+                        .unwrap_or(false);
+
+                    if wants_info {
+                        return nip11_handler(&config).into_response();
+                    }
+
+                    match ws {
+                        Some(ws) => ws
+                            .on_failed_upgrade(|err| {
+                                tracing::warn!("WebSocket upgrade failed: {}", err);
+                            })
+                            .on_upgrade(move |socket| {
+                                handle_socket(socket, subscriptions)
+                            })
+                            .into_response(),
+                        None => (StatusCode::BAD_REQUEST, "Expected WebSocket upgrade or Accept: application/nostr+json").into_response(),
+                    }
+                }
+            }),
+        )
     }
 }
 
-async fn info_handler() -> impl IntoResponse {
-    let json = serde_json::json!({
+fn nip11_handler(config: &Config) -> impl IntoResponse {
+    let body = serde_json::json!({
         "name": "memlay",
-        "description": "High Performance In-Memory Nostr Relay",
-        "pubkey": "",
-        "supported_nips": [1, 9, 11, 20, 22]
+        "description": "High-performance in-memory Nostr relay",
+        "software": "https://github.com/v0l/memlay",
+        "version": env!("CARGO_PKG_VERSION"),
+        "supported_nips": [1, 11],
+        "limitation": {
+            "max_subscriptions": config.max_subscriptions,
+            "max_limit": config.max_limit,
+        }
     });
-    (axum::response::Json(json)).into_response()
+
+    let mut headers = HeaderMap::new();
+    headers.insert("Content-Type", HeaderValue::from_static("application/nostr+json"));
+    headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
+    headers.insert("Access-Control-Allow-Headers", HeaderValue::from_static("*"));
+    headers.insert("Access-Control-Allow-Methods", HeaderValue::from_static("GET"));
+
+    (headers, axum::Json(body)).into_response()
 }
 
 async fn handle_socket(mut socket: WebSocket, subscriptions: Arc<SubscriptionManager>) {

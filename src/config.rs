@@ -8,6 +8,12 @@ pub struct Config {
     pub max_events: usize,
     #[serde(default)]
     pub max_bytes: usize,
+    /// Maximum concurrent subscriptions per connection (advertised in NIP-11)
+    #[serde(default = "default_max_subscriptions")]
+    pub max_subscriptions: usize,
+    /// Maximum value a client may request for `limit` in a filter (advertised in NIP-11)
+    #[serde(default = "default_max_limit")]
+    pub max_limit: usize,
 }
 
 fn default_bind_addr() -> String {
@@ -16,6 +22,14 @@ fn default_bind_addr() -> String {
 
 fn default_max_events() -> usize {
     1_000_000
+}
+
+fn default_max_subscriptions() -> usize {
+    300
+}
+
+fn default_max_limit() -> usize {
+    5000
 }
 
 impl Config {
@@ -35,6 +49,8 @@ impl Default for Config {
             bind_addr: default_bind_addr(),
             max_events: default_max_events(),
             max_bytes: 0,
+            max_subscriptions: default_max_subscriptions(),
+            max_limit: default_max_limit(),
         }
     }
 }
