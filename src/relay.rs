@@ -39,8 +39,13 @@ impl Relay {
         let tx = self.tx.clone();
         let config = self.config.clone();
 
-        Router::new().route(
-            "/",
+        let events_for_stats = self.events.clone();
+        Router::new()
+            .route("/stats", get(move || {
+                let events = events_for_stats.clone();
+                async move { stats_handler(events) }
+            }))
+            .route("/",
             get(move |headers: HeaderMap, ws: Option<WebSocketUpgrade>| {
                 let subscriptions = subscriptions.clone();
                 let tx = tx.clone();
@@ -68,12 +73,24 @@ impl Relay {
                         None => landing_page().into_response(),
                     }
                 }
-            }),
-        )
+            }))
     }
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
+
+fn stats_handler(events: Arc<crate::store::EventStore>) -> impl IntoResponse {
+    let cfg = events.config();
+    let body = serde_json::json!({
+        "events": events.len(),
+        "bytes": events.bytes_used(),
+        "max_events": cfg.max_events,
+        "max_bytes": cfg.max_bytes,
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
+    (headers, axum::Json(body))
+}
 
 fn nip11_handler(config: &Config) -> impl IntoResponse {
     let body = serde_json::json!({

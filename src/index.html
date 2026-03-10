@@ -46,6 +46,13 @@
   </section>
 
   <section>
+    <h2>Store</h2>
+    <div class="row"><span>Events</span><span id="stat-events">—</span></div>
+    <div class="row"><span>Memory</span><span id="stat-bytes">—</span></div>
+    <div class="row"><span>Capacity</span><span id="stat-capacity">—</span></div>
+  </section>
+
+  <section>
     <h2>Info</h2>
     <div class="row"><span>Software</span>
       <a href="https://github.com/v0l/memlay">github.com/v0l/memlay</a></div>
@@ -55,6 +62,29 @@
 <script>
   const u = location.href.replace(/^http/, 'ws').replace(/\/$/, '');
   document.getElementById('ws-url').textContent = u;
+
+  function fmt(n) { return n.toLocaleString(); }
+  function fmtBytes(b) {
+    if (b === 0) return 'unlimited';
+    const units = ['B','KB','MB','GB'];
+    let i = 0;
+    while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+    return b.toFixed(1) + ' ' + units[i];
+  }
+
+  async function refreshStats() {
+    try {
+      const s = await fetch('/stats').then(r => r.json());
+      document.getElementById('stat-events').textContent =
+        fmt(s.events) + (s.max_events ? ' / ' + fmt(s.max_events) : '');
+      document.getElementById('stat-bytes').textContent = fmtBytes(s.bytes);
+      document.getElementById('stat-capacity').textContent =
+        s.max_events ? Math.round(s.events / s.max_events * 100) + '%' : '—';
+    } catch (_) {}
+  }
+
+  refreshStats();
+  setInterval(refreshStats, 2000);
 </script>
 </body>
 </html>
