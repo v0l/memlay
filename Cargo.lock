@@ -1311,6 +1311,7 @@ dependencies = [
  "config",
  "criterion",
  "crossbeam-channel",
+ "dashmap",
  "hex",
  "nostr-archive-cursor",
  "nostr-sdk",

@@ -19,7 +19,10 @@ async fn main() {
     let cli = Cli::parse();
 
     let config = Config::load(&cli.config).unwrap_or_else(|e| {
-        tracing::warn!("Failed to load config from {}: {e}, using defaults", cli.config);
+        tracing::warn!(
+            "Failed to load config from {}: {e}, using defaults",
+            cli.config
+        );
         Config::default()
     });
 
@@ -32,7 +35,10 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
         .expect("Failed to bind");
-    axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .await
-        .unwrap();
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

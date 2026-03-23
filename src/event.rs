@@ -1,12 +1,13 @@
 use bytes::Bytes;
-use secp256k1::{schnorr::Signature, Message, XOnlyPublicKey};
+use hex::FromHex;
+use secp256k1::{Message, XOnlyPublicKey, schnorr::Signature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
 /// A parsed tag from a Nostr event.
 /// First element is the tag type (e.g., "e", "p", "t"), rest are values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Tag {
     pub name: String,
     pub values: Vec<String>,
@@ -213,12 +214,7 @@ fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }
-    let mut bytes = [0u8; 32];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        let hex_str = std::str::from_utf8(chunk).ok()?;
-        bytes[i] = u8::from_str_radix(hex_str, 16).ok()?;
-    }
-    Some(bytes)
+    <[u8; 32]>::from_hex(s).ok()
 }
 
 /// Parse a 64-byte hex string into bytes
@@ -226,27 +222,7 @@ fn parse_hex_64(s: &str) -> Option<[u8; 64]> {
     if s.len() != 128 {
         return None;
     }
-    let mut bytes = [0u8; 64];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        let hex_str = std::str::from_utf8(chunk).ok()?;
-        bytes[i] = u8::from_str_radix(hex_str, 16).ok()?;
-    }
-    Some(bytes)
-}
-
-/// Helper for hex encoding (we'll add hex crate later if needed)
-mod hex {
-    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-
-    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        let bytes = bytes.as_ref();
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for &b in bytes {
-            s.push(HEX_CHARS[(b >> 4) as usize] as char);
-            s.push(HEX_CHARS[(b & 0xf) as usize] as char);
-        }
-        s
-    }
+    <[u8; 64]>::from_hex(s).ok()
 }
 
 #[cfg(test)]

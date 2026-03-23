@@ -3,11 +3,14 @@ use crate::message::NostrMessage;
 use crate::store::{EventStore, StoreConfig};
 use crate::subscription::{Filter, Subscription, SubscriptionManager};
 use axum::{
-    extract::{ws::{WebSocket, WebSocketUpgrade}, ConnectInfo},
+    Router,
+    extract::{
+        ConnectInfo,
+        ws::{WebSocket, WebSocketUpgrade},
+    },
     http::{HeaderMap, HeaderValue},
     response::IntoResponse,
     routing::get,
-    Router,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,7 +35,12 @@ impl Relay {
         }));
         let subscriptions = Arc::new(SubscriptionManager::new(events.clone()));
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
-        Self { events, subscriptions, tx, config }
+        Self {
+            events,
+            subscriptions,
+            tx,
+            config,
+        }
     }
 
     pub fn router(self) -> Router {
@@ -42,43 +50,48 @@ impl Relay {
 
         let events_for_stats = self.events.clone();
         Router::new()
-            .route("/stats", get(move || {
-                let events = events_for_stats.clone();
-                async move { stats_handler(events) }
-            }))
-            .route("/",
-            get(move |
-                ConnectInfo(addr): ConnectInfo<SocketAddr>,
-                headers: HeaderMap,
-                ws: Option<WebSocketUpgrade>,
-            | {
-                let subscriptions = subscriptions.clone();
-                let tx = tx.clone();
-                let config = config.clone();
-                async move {
-                    let wants_info = headers
-                        .get("accept")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|v| v.contains("application/nostr+json"))
-                        .unwrap_or(false);
+            .route(
+                "/stats",
+                get(move || {
+                    let events = events_for_stats.clone();
+                    async move { stats_handler(events) }
+                }),
+            )
+            .route(
+                "/",
+                get(
+                    move |ConnectInfo(addr): ConnectInfo<SocketAddr>,
+                          headers: HeaderMap,
+                          ws: Option<WebSocketUpgrade>| {
+                        let subscriptions = subscriptions.clone();
+                        let tx = tx.clone();
+                        let config = config.clone();
+                        async move {
+                            let wants_info = headers
+                                .get("accept")
+                                .and_then(|v| v.to_str().ok())
+                                .map(|v| v.contains("application/nostr+json"))
+                                .unwrap_or(false);
 
-                    if wants_info {
-                        return nip11_handler(&config).into_response();
-                    }
+                            if wants_info {
+                                return nip11_handler(&config).into_response();
+                            }
 
-                    match ws {
-                        Some(ws) => ws
-                            .on_failed_upgrade(move |err| {
-                                tracing::warn!(%addr, "WebSocket upgrade failed: {}", err);
-                            })
-                            .on_upgrade(move |socket| {
-                                handle_socket(socket, addr, subscriptions, tx)
-                            })
-                            .into_response(),
-                        None => landing_page().into_response(),
-                    }
-                }
-            }))
+                            match ws {
+                                Some(ws) => ws
+                                    .on_failed_upgrade(move |err| {
+                                        tracing::warn!(%addr, "WebSocket upgrade failed: {}", err);
+                                    })
+                                    .on_upgrade(move |socket| {
+                                        handle_socket(socket, addr, subscriptions, tx)
+                                    })
+                                    .into_response(),
+                                None => landing_page().into_response(),
+                            }
+                        }
+                    },
+                ),
+            )
     }
 }
 
@@ -111,10 +124,19 @@ fn nip11_handler(config: &Config) -> impl IntoResponse {
     });
 
     let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_static("application/nostr+json"));
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_static("application/nostr+json"),
+    );
     headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
-    headers.insert("Access-Control-Allow-Headers", HeaderValue::from_static("*"));
-    headers.insert("Access-Control-Allow-Methods", HeaderValue::from_static("GET"));
+    headers.insert(
+        "Access-Control-Allow-Headers",
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        "Access-Control-Allow-Methods",
+        HeaderValue::from_static("GET"),
+    );
 
     (headers, axum::Json(body)).into_response()
 }
@@ -122,7 +144,10 @@ fn nip11_handler(config: &Config) -> impl IntoResponse {
 fn landing_page() -> impl IntoResponse {
     let html = include_str!("index.html").replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
     let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_static("text/html; charset=utf-8"));
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
     (headers, html)
 }
 
@@ -239,6 +264,8 @@ async fn handle_text(
                         pubkey = %hex::encode(ev.pubkey),
                         "event stored"
                     );
+                    // Invalidate query cache on new event insertion
+                    subscriptions.invalidate_cache();
                     // Broadcast to live subscriptions on other connections
                     let _ = tx.send(ev);
                     NostrMessage::Ok {
@@ -248,7 +275,9 @@ async fn handle_text(
                     }
                 }
             };
-            let _ = socket.send(axum::extract::ws::Message::Text(ok.to_json())).await;
+            let _ = socket
+                .send(axum::extract::ws::Message::Text(ok.to_json()))
+                .await;
         }
 
         Ok(NostrMessage::Request { id, filters }) => {
@@ -278,7 +307,9 @@ async fn handle_text(
             }
 
             let eose = NostrMessage::EndOfStoredEvents { id };
-            let _ = socket.send(axum::extract::ws::Message::Text(eose.to_json())).await;
+            let _ = socket
+                .send(axum::extract::ws::Message::Text(eose.to_json()))
+                .await;
         }
 
         Ok(NostrMessage::Close { id }) => {
@@ -288,7 +319,9 @@ async fn handle_text(
 
         Err(e) => {
             let notice = NostrMessage::Notification { message: e };
-            let _ = socket.send(axum::extract::ws::Message::Text(notice.to_json())).await;
+            let _ = socket
+                .send(axum::extract::ws::Message::Text(notice.to_json()))
+                .await;
         }
 
         _ => {} // client-side messages (OK, EOSE, NOTICE) — ignore
@@ -300,30 +333,30 @@ async fn handle_text(
 /// Returns true if `event` matches `filter` (same AND logic as query_filter,
 /// but applied to a single event without going through the store).
 fn filter_matches(filter: &Filter, event: &crate::event::Event) -> bool {
-    if let Some(since) = filter.since {
-        if event.created_at < since {
-            return false;
-        }
+    if let Some(since) = filter.since
+        && event.created_at < since
+    {
+        return false;
     }
-    if let Some(until) = filter.until {
-        if event.created_at > until {
-            return false;
-        }
+    if let Some(until) = filter.until
+        && event.created_at > until
+    {
+        return false;
     }
-    if let Some(kinds) = &filter.kinds {
-        if !kinds.contains(&event.kind) {
-            return false;
-        }
+    if let Some(kinds) = &filter.kinds
+        && !kinds.contains(&event.kind)
+    {
+        return false;
     }
     if let Some(ids) = &filter.ids {
         let event_id_hex = hex::encode(event.id);
-        if !ids.iter().any(|id| event_id_hex.starts_with(id.as_str())) {
+        if !ids.iter().any(|id| event_id_hex.starts_with(&id.as_hex())) {
             return false;
         }
     }
     if let Some(authors) = &filter.authors {
         let pubkey_hex = hex::encode(event.pubkey);
-        if !authors.iter().any(|a| pubkey_hex.starts_with(a.as_str())) {
+        if !authors.iter().any(|a| pubkey_hex.starts_with(&a.as_hex())) {
             return false;
         }
     }
@@ -332,7 +365,7 @@ fn filter_matches(filter: &Filter, event: &crate::event::Event) -> bool {
             let matched = event.tags.iter().any(|tag| {
                 let mut chars = tag.name.chars();
                 matches!((chars.next(), chars.next()), (Some(l), None) if l == letter)
-                    && tag.value().map_or(false, |v| values.iter().any(|fv| fv == v))
+                    && tag.value().is_some_and(|v| values.iter().any(|fv| fv == v))
             });
             if !matched {
                 return false;

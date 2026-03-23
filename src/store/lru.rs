@@ -65,10 +65,10 @@ impl LruTracker {
 
     /// Remove an event from tracking (called when event is explicitly deleted)
     pub fn remove(&mut self, id: &[u8; 32]) {
-        if let Some(pos) = self.order.iter().position(|(eid, _)| eid == id) {
-            if let Some((_, size)) = self.order.remove(pos) {
-                self.current_bytes = self.current_bytes.saturating_sub(size);
-            }
+        if let Some(pos) = self.order.iter().position(|(eid, _)| eid == id)
+            && let Some((_, size)) = self.order.remove(pos)
+        {
+            self.current_bytes = self.current_bytes.saturating_sub(size);
         }
     }
 

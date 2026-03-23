@@ -1,16 +1,80 @@
 use crate::event::Event;
 use crate::store::EventStore;
+use dashmap::DashMap;
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+
+/// Trait for filter matching against an event
+pub trait FilterMatch {
+    /// Returns true if the event matches this filter
+    fn matches_event(&self, event: &Event) -> bool;
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
     pub id: String,
     pub filters: Vec<Filter>,
+}
+
+/// Pre-parsed 32-byte hex value that serializes/deserializes as hex string.
+#[derive(Debug, Clone, Copy, Default, Hash, PartialEq, Eq)]
+pub struct Hex32(pub [u8; 32]);
+
+impl Hex32 {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn as_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    pub fn starts_with(&self, prefix: &str) -> bool {
+        if prefix.len() > 64 { return false; }
+        let hex = self.as_hex();
+        hex.starts_with(prefix)
+    }
+}
+
+impl Serialize for Hex32 {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Hex32 {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Hex32Visitor;
+
+        impl<'de> Visitor<'de> for Hex32Visitor {
+            type Value = Hex32;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a 64-character hex string")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Hex32, E> {
+                let bytes = hex::decode(v).map_err(de::Error::custom)?;
+                if bytes.len() != 32 {
+                    return Err(de::Error::custom("expected 32 bytes"));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Ok(Hex32(arr))
+            }
+        }
+
+        d.deserialize_str(Hex32Visitor)
+    }
 }
 
 /// NIP-01 subscription filter.
@@ -21,14 +85,21 @@ pub struct Subscription {
 /// generic string index.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
-    pub ids: Option<Vec<String>>,
+    /// Event IDs (stored as parsed bytes, serialized as hex strings)
+    pub ids: Option<Vec<Hex32>>,
     pub kinds: Option<Vec<u32>>,
-    pub authors: Option<Vec<String>>,
+    /// Authors (stored as parsed bytes, serialized as hex strings)
+    pub authors: Option<Vec<Hex32>>,
     /// Keyed by single-letter tag name (e.g. `'e'`, `'p'`, `'t'`).
+    /// For 'e' and 'p' tags, values are also stored as bytes in e_tags_bytes/p_tags_bytes.
     pub tag_filters: HashMap<char, Vec<String>>,
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: Option<usize>,
+    /// Pre-parsed e-tag values (32-byte event IDs)
+    pub e_tags_bytes: Option<Vec<Hex32>>,
+    /// Pre-parsed p-tag values (32-byte pubkeys)
+    pub p_tags_bytes: Option<Vec<Hex32>>,
 }
 
 impl Filter {
@@ -40,6 +111,44 @@ impl Filter {
     /// Convenience accessor for `#p` tag filter values.
     pub fn p_tags(&self) -> Option<&Vec<String>> {
         self.tag_filters.get(&'p')
+    }
+
+    /// Pre-parse hex filter values to bytes for fast lookups.
+    /// This converts e-tag and p-tag string values to Hex32 for fast index lookups.
+    pub fn parse_hex_values(&mut self) {
+        // Parse e-tags
+        if let Some(e_vals) = self.tag_filters.get(&'e') {
+            let e_bytes: Vec<Hex32> = e_vals
+                .iter()
+                .filter_map(|val| {
+                    let bytes = hex::decode(val).ok()?;
+                    if bytes.len() != 32 { return None; }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    Some(Hex32(arr))
+                })
+                .collect();
+            if !e_bytes.is_empty() {
+                self.e_tags_bytes = Some(e_bytes);
+            }
+        }
+
+        // Parse p-tags
+        if let Some(p_vals) = self.tag_filters.get(&'p') {
+            let p_bytes: Vec<Hex32> = p_vals
+                .iter()
+                .filter_map(|val| {
+                    let bytes = hex::decode(val).ok()?;
+                    if bytes.len() != 32 { return None; }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    Some(Hex32(arr))
+                })
+                .collect();
+            if !p_bytes.is_empty() {
+                self.p_tags_bytes = Some(p_bytes);
+            }
+        }
     }
 }
 
@@ -141,6 +250,55 @@ impl<'de> Deserialize<'de> for Filter {
 pub struct SubscriptionManager {
     subscriptions: parking_lot::RwLock<HashMap<String, Subscription>>,
     pub store: Arc<EventStore>,
+    /// LRU cache for query results (max 1000 entries by default)
+    cache: Arc<DashMap<CacheKey, Vec<Arc<Event>>>>,
+    cache_max_entries: usize,
+}
+
+/// Cache key for query results.
+/// Captures all filter fields that affect query results.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CacheKey {
+    pub ids: Option<Vec<Hex32>>,
+    pub kinds: Option<Vec<u32>>,
+    pub authors: Option<Vec<Hex32>>,
+    pub tag_filters: Vec<(char, String)>,
+    pub since: Option<u64>,
+    pub until: Option<u64>,
+}
+
+impl CacheKey {
+    pub fn from_filter(filter: &Filter) -> Self {
+        // Convert HashMap to sorted Vec for Hash impl
+        let mut tag_filters: Vec<(char, String)> = filter
+            .tag_filters
+            .iter()
+            .flat_map(|(&letter, values)| {
+                values.iter().map(move |v| (letter, v.clone()))
+            })
+            .collect();
+        tag_filters.sort();
+        
+        Self {
+            ids: filter.ids.clone(),
+            kinds: filter.kinds.clone(),
+            authors: filter.authors.clone(),
+            tag_filters,
+            since: filter.since,
+            until: filter.until,
+        }
+    }
+}
+
+impl Hash for CacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.ids.hash(state);
+        self.kinds.hash(state);
+        self.authors.hash(state);
+        self.tag_filters.hash(state);
+        self.since.hash(state);
+        self.until.hash(state);
+    }
 }
 
 impl SubscriptionManager {
@@ -148,11 +306,27 @@ impl SubscriptionManager {
         Self {
             subscriptions: parking_lot::RwLock::new(HashMap::new()),
             store,
+            cache: Arc::new(DashMap::with_capacity(1000)),
+            cache_max_entries: 1000,
         }
     }
 
-    pub fn add_subscription(&self, sub: Subscription) {
+    /// Create a new SubscriptionManager with custom cache size
+    pub fn with_cache_size(store: Arc<EventStore>, max_entries: usize) -> Self {
+        Self {
+            subscriptions: parking_lot::RwLock::new(HashMap::new()),
+            store,
+            cache: Arc::new(DashMap::with_capacity(max_entries)),
+            cache_max_entries: max_entries,
+        }
+    }
+
+    pub fn add_subscription(&self, mut sub: Subscription) {
         let mut subs = self.subscriptions.write();
+        // Pre-parse e-tag and p-tag values once at subscription time
+        for filter in &mut sub.filters {
+            filter.parse_hex_values();
+        }
         subs.insert(sub.id.clone(), sub);
     }
 
@@ -186,109 +360,166 @@ impl SubscriptionManager {
             return Vec::new();
         }
 
+        let cache_key = CacheKey::from_filter(filter);
+
+        if let Some(cached) = self.cache.get(&cache_key) {
+            return (*cached).clone();
+        }
+
+        let results = self.query_filter_internal(filter);
+
+        if !results.is_empty() {
+            self.cache.insert(cache_key, results.clone());
+        }
+
+        results
+    }
+
+    fn query_filter_internal(&self, filter: &Filter) -> Vec<Arc<Event>> {
         let mut results: Vec<Arc<Event>> = Vec::new();
         let mut result_ids: HashSet<[u8; 32]> = HashSet::new();
-        // Use the filter's limit as the index fetch cap when set; otherwise
-        // fetch everything — the explicit truncation at the end handles it.
         let fetch_limit = filter.limit.unwrap_or(usize::MAX);
 
-        // Priority order: IDs > #e > #p > other tags > authors > kinds
-        let mut candidates: Vec<Arc<Event>> = Vec::new();
+        // Pre-allocate with hint
+        let mut candidates: Vec<Arc<Event>> = Vec::with_capacity(32);
 
-        if let Some(ids) = &filter.ids {
-            for id in ids {
-                if let Ok(event_id) = hex::decode(id) {
-                    if event_id.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&event_id);
-                        if let Some(event) = self.store.get(&arr) {
-                            if filter.since.map_or(true, |s| event.created_at >= s)
-                                && filter.until.map_or(true, |u| event.created_at <= u)
-                            {
-                                candidates.push(event);
-                            }
-                        }
+        // Determine the best index to start with based on selectivity
+        // Priority: ids (most selective) > e-tags > p-tags > generic tags > authors > kinds (least selective)
+        let use_ids = filter.ids.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let use_e_tags = filter.e_tags_bytes.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let use_p_tags = filter.p_tags_bytes.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let has_generic_tags = filter
+            .tag_filters
+            .iter()
+            .any(|(&l, v)| l != 'e' && l != 'p' && !v.is_empty());
+        let use_authors = filter.authors.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let use_kinds = filter
+            .kinds
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+
+        // Fetch from most selective index first
+        if use_ids {
+            if let Some(ids) = &filter.ids {
+                for id in ids {
+                    if let Some(event) = self.store.get(id.as_bytes())
+                        && filter.since.is_none_or(|l| event.created_at >= l)
+                        && filter.until.is_none_or(|u| event.created_at <= u)
+                    {
+                        candidates.push(event);
                     }
                 }
             }
-        } else if let Some(e_vals) = filter.tag_filters.get(&'e') {
-            for val in e_vals {
-                if let Ok(bytes) = hex::decode(val) {
-                    if bytes.len() == 32 {
+        } else if use_e_tags {
+            if let Some(e_bytes) = &filter.e_tags_bytes {
+                for bytes in e_bytes {
+                    candidates.extend(self.store.query_by_e_tag(bytes.as_bytes(), fetch_limit));
+                }
+            } else if let Some(e_vals) = filter.e_tags() {
+                for val in e_vals {
+                    if let Ok(b) = hex::decode(val)
+                        && b.len() == 32
+                    {
                         let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&bytes);
+                        arr.copy_from_slice(&b);
                         candidates.extend(self.store.query_by_e_tag(&arr, fetch_limit));
                     }
                 }
             }
-        } else if let Some(p_vals) = filter.tag_filters.get(&'p') {
-            for val in p_vals {
-                if let Ok(bytes) = hex::decode(val) {
-                    if bytes.len() == 32 {
+        } else if use_p_tags {
+            if let Some(p_bytes) = &filter.p_tags_bytes {
+                for bytes in p_bytes {
+                    candidates.extend(self.store.query_by_p_tag(bytes.as_bytes(), fetch_limit));
+                }
+            } else if let Some(p_vals) = filter.p_tags() {
+                for val in p_vals {
+                    if let Ok(b) = hex::decode(val)
+                        && b.len() == 32
+                    {
                         let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&bytes);
+                        arr.copy_from_slice(&b);
                         candidates.extend(self.store.query_by_p_tag(&arr, fetch_limit));
                     }
                 }
             }
-        } else if let Some((&letter, values)) = filter
-            .tag_filters
-            .iter()
-            .find(|&(&l, _)| l != 'e' && l != 'p')
-        {
-            for val in values {
-                candidates.extend(self.store.query_by_tag(letter, val, fetch_limit));
+        } else if has_generic_tags {
+            if let Some(letter) = filter
+                .tag_filters
+                .keys()
+                .find(|&l| *l != 'e' && *l != 'p')
+                .copied()
+            {
+                if let Some(values) = filter.tag_filters.get(&letter) {
+                    for val in values {
+                        candidates.extend(self.store.query_by_tag(letter, val, fetch_limit));
+                    }
+                }
             }
-        } else if let Some(authors) = &filter.authors {
-            for author in authors {
-                if let Ok(pk) = hex::decode(author) {
-                    if pk.len() == 32 {
+        } else if use_authors {
+            if let Some(authors) = &filter.authors {
+                for author in authors {
+                    candidates.extend(self.store.query_by_pubkey(author.as_bytes(), fetch_limit));
+                }
+            } else if let Some(p_vals) = filter.p_tags() {
+                for val in p_vals {
+                    if let Ok(b) = hex::decode(val)
+                        && b.len() == 32
+                    {
                         let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&pk);
+                        arr.copy_from_slice(&b);
                         candidates.extend(self.store.query_by_pubkey(&arr, fetch_limit));
                     }
                 }
             }
-        } else if let Some(kinds) = &filter.kinds {
-            for kind in kinds {
-                candidates.extend(self.store.query_by_kind(*kind, fetch_limit));
+        } else if use_kinds {
+            if let Some(kinds) = &filter.kinds {
+                for kind in kinds {
+                    candidates.extend(self.store.query_by_kind(*kind, fetch_limit));
+                }
             }
         }
 
-        // Intersect with all remaining filter criteria (AND logic)
+        // Pre-compute author set for filtering if needed
+        let author_set: Option<HashSet<[u8; 32]>> = filter
+            .authors
+            .as_ref()
+            .map(|authors| authors.iter().map(|a| *a.as_bytes()).collect());
+
+        // Apply AND filters: since, until, kinds, authors, and non-primary tag filters
         for event in candidates {
-            let matches = filter.since.map_or(true, |s| event.created_at >= s)
-                && filter.until.map_or(true, |u| event.created_at <= u)
+            let matches = filter.since.is_none_or(|s| event.created_at >= s)
+                && filter.until.is_none_or(|u| event.created_at <= u)
                 && filter
                     .kinds
                     .as_ref()
-                    .map_or(true, |kinds| kinds.contains(&event.kind))
-                && filter.authors.as_ref().map_or(true, |authors| {
-                    authors.iter().any(|a| {
-                        hex::decode(a)
-                            .map_or(false, |pk| pk.len() == 32 && pk.as_slice() == event.pubkey)
-                    })
-                })
+                    .is_none_or(|kinds| kinds.contains(&event.kind))
+                && author_set
+                    .as_ref()
+                    .is_none_or(|authors| authors.contains(&event.pubkey))
                 && filter.tag_filters.iter().all(|(&letter, values)| {
-                    // For every tag constraint ALL specified letters must match (AND).
-                    // Within each letter the event must have at least one matching value (OR).
+                    // Skip the primary tag index we already queried
+                    if use_ids {
+                        return true;
+                    }
+                    if use_e_tags && letter == 'e' {
+                        return true;
+                    }
+                    if use_p_tags && letter == 'p' {
+                        return true;
+                    }
+                    if has_generic_tags && letter != 'e' && letter != 'p' {
+                        return true;
+                    }
                     event.tags.iter().any(|tag| {
                         let mut chars = tag.name.chars();
-                        let matches_letter = matches!(
-                            (chars.next(), chars.next()),
-                            (Some(l), None) if l == letter
-                        );
-                        matches_letter
-                            && tag
-                                .value()
-                                .map_or(false, |v| values.iter().any(|fv| fv == v))
+                        matches!((chars.next(), chars.next()), (Some(l), None) if l == letter)
+                            && tag.value().is_some_and(|v| values.iter().any(|fv| fv == v))
                     })
                 });
 
-            if matches {
-                if result_ids.insert(event.id) {
-                    results.push(event);
-                }
+            if matches && result_ids.insert(event.id) {
+                results.push(event);
             }
         }
 
@@ -298,6 +529,26 @@ impl SubscriptionManager {
 
         results
     }
+
+    /// Invalidate the entire cache (called on new event insertion)
+    pub fn invalidate_cache(&self) {
+        self.cache.clear();
+    }
+
+    /// Get cache statistics
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            size: self.cache.len(),
+            max_entries: self.cache_max_entries,
+        }
+    }
+}
+
+/// Cache statistics
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    pub size: usize,
+    pub max_entries: usize,
 }
 
 #[cfg(test)]
@@ -646,5 +897,218 @@ mod tests {
         let mut ids: Vec<u8> = results.iter().map(|e| e.id[31]).collect();
         ids.sort();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_cache_hit_returns_same_results() {
+        let store = EventStore::new(StoreConfig::default());
+        let sm = SubscriptionManager::new(Arc::new(store));
+
+        sm.store.insert(make_event(1, 1, 1, 1000));
+        sm.store.insert(make_event(2, 1, 1, 2000));
+        sm.store.insert(make_event(3, 1, 2, 3000));
+
+        let filter = Filter {
+            kinds: Some(vec![1]),
+            limit: Some(10),
+            ..Default::default()
+        };
+
+        // First query - cache miss
+        let results1 = sm.query_filter(&filter);
+        assert_eq!(results1.len(), 2);
+
+        // Second query - cache hit - should return same results
+        let results2 = sm.query_filter(&filter);
+        assert_eq!(results2.len(), 2);
+
+        // Results should be identical
+        assert_eq!(results1[0].id, results2[0].id);
+        assert_eq!(results1[1].id, results2[1].id);
+    }
+
+    #[test]
+    fn test_cache_invalidation_on_new_event() {
+        let store = EventStore::new(StoreConfig::default());
+        let sm = SubscriptionManager::new(Arc::new(store));
+
+        sm.store.insert(make_event(1, 1, 1, 1000));
+        sm.store.insert(make_event(2, 1, 1, 2000));
+
+        let filter = Filter {
+            kinds: Some(vec![1]),
+            limit: Some(10),
+            ..Default::default()
+        };
+
+        // Populate cache
+        let results1 = sm.query_filter(&filter);
+        assert_eq!(results1.len(), 2);
+
+        // Store inserts directly, so we need to invalidate cache to reflect new data
+        // This simulates what the relay does when storing events
+        let new_event = make_event(3, 1, 1, 3000);
+        let event_id = new_event.id;
+        sm.store.insert(new_event);
+        sm.invalidate_cache();
+
+        // Cache invalidation ensures new query sees 3 events
+        let results2 = sm.query_filter(&filter);
+        assert_eq!(results2.len(), 3);
+
+        // Verify new event is included
+        let ids: Vec<[u8; 32]> = results2.iter().map(|e| e.id).collect();
+        assert!(ids.contains(&event_id));
+    }
+
+    #[test]
+    fn test_cache_statistics() {
+        let store = EventStore::new(StoreConfig::default());
+        let sm = SubscriptionManager::new(Arc::new(store));
+
+        sm.store.insert(make_event(1, 1, 1, 1000));
+        sm.store.insert(make_event(2, 1, 1, 2000));
+
+        // Initially cache is empty
+        let stats = sm.cache_stats();
+        assert_eq!(stats.size, 0);
+        assert_eq!(stats.max_entries, 1000);
+
+        // Populate cache with one query
+        let filter = Filter {
+            kinds: Some(vec![1]),
+            limit: Some(10),
+            ..Default::default()
+        };
+        sm.query_filter(&filter);
+
+        // Cache should have one entry
+        let stats = sm.cache_stats();
+        assert_eq!(stats.size, 1);
+
+        // Add different filters to populate more cache entries
+        let filter2 = Filter {
+            kinds: Some(vec![1, 2]),
+            limit: Some(10),
+            ..Default::default()
+        };
+        sm.query_filter(&filter2);
+
+        let stats = sm.cache_stats();
+        assert_eq!(stats.size, 2);
+
+        // Invalidate cache
+        sm.invalidate_cache();
+
+        let stats = sm.cache_stats();
+        assert_eq!(stats.size, 0);
+    }
+
+    #[test]
+    fn test_cache_different_filters_different_keys() {
+        let store = EventStore::new(StoreConfig::default());
+        let sm = SubscriptionManager::new(Arc::new(store));
+
+        sm.store.insert(make_event(1, 1, 1, 1000));
+        sm.store.insert(make_event(2, 1, 1, 2000));
+        sm.store.insert(make_event(3, 1, 2, 3000));
+
+        let filter1 = Filter {
+            kinds: Some(vec![1]),
+            limit: Some(10),
+            ..Default::default()
+        };
+
+        let filter2 = Filter {
+            kinds: Some(vec![2]),
+            limit: Some(10),
+            ..Default::default()
+        };
+
+        // Both queries populate cache
+        let results1 = sm.query_filter(&filter1);
+        let results2 = sm.query_filter(&filter2);
+
+        assert_eq!(results1.len(), 2);
+        assert_eq!(results2.len(), 1);
+
+        // Cache should have 2 entries
+        let stats = sm.cache_stats();
+        assert_eq!(stats.size, 2);
+    }
+
+    #[test]
+    fn test_cache_with_same_filter_twice_after_invalidation() {
+        let store = EventStore::new(StoreConfig::default());
+        let sm = SubscriptionManager::new(Arc::new(store));
+
+        sm.store.insert(make_event(1, 1, 1, 1000));
+        sm.store.insert(make_event(2, 1, 1, 2000));
+
+        let filter = Filter {
+            kinds: Some(vec![1]),
+            limit: Some(10),
+            ..Default::default()
+        };
+
+        // First query
+        let results1 = sm.query_filter(&filter);
+        assert_eq!(results1.len(), 2);
+
+        // Invalidate
+        sm.invalidate_cache();
+
+        // Second query - should recompute
+        let results2 = sm.query_filter(&filter);
+        assert_eq!(results2.len(), 2);
+
+        // Cache should have 1 entry
+        let stats = sm.cache_stats();
+        assert_eq!(stats.size, 1);
+    }
+}
+
+impl FilterMatch for Filter {
+    fn matches_event(&self, event: &Event) -> bool {
+        if let Some(since) = self.since
+            && event.created_at < since
+        {
+            return false;
+        }
+        if let Some(until) = self.until
+            && event.created_at > until
+        {
+            return false;
+        }
+        if let Some(kinds) = &self.kinds
+            && !kinds.contains(&event.kind)
+        {
+            return false;
+        }
+        if let Some(ids) = &self.ids {
+            let event_id_hex = hex::encode(event.id);
+            if !ids.iter().any(|id| event_id_hex.starts_with(&id.as_hex())) {
+                return false;
+            }
+        }
+        if let Some(authors) = &self.authors {
+            let pubkey_hex = hex::encode(event.pubkey);
+            if !authors.iter().any(|a| pubkey_hex.starts_with(&a.as_hex())) {
+                return false;
+            }
+        }
+        if !self.tag_filters.is_empty() {
+            for (&letter, values) in &self.tag_filters {
+                let matched = event.tags.iter().any(|tag| {
+                    let mut chars = tag.name.chars();
+                    matches!((chars.next(), chars.next()), (Some(l), None) if l == letter)
+                        && tag.value().is_some_and(|v| values.iter().any(|fv| fv == v))
+                });
+                if !matched {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }

@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use memlay::event::Event;
 use memlay::store::{EventStore, StoreConfig};
 use nostr_archive_cursor::NostrCursor;

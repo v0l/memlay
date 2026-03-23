@@ -1,0 +1,16 @@
+# Memlay Configuration
+
+# Server binding address
+bind_addr = "0.0.0.0:8080"
+
+# Maximum number of events to store (LRU eviction when exceeded)
+max_events = 1000000
+
+# Maximum memory usage in bytes (0 = unlimited)
+max_bytes = 0
+
+# Maximum concurrent subscriptions per connection
+max_subscriptions = 300
+
+# Maximum value a client may request for `limit` in a filter
+max_limit = 5000

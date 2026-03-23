@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener as TokioListener;
-use tungstenite::{connect, Message};
+use tungstenite::{Message, connect};
 
 // ── data model ───────────────────────────────────────────────────────────────
 
@@ -41,7 +41,9 @@ struct EventMeta {
 /// Load up to `limit` events, returning both the raw `["EVENT",…]` wire
 /// frames and lightweight metadata for filter construction.
 fn load_events(dir: &str, limit: usize) -> (Vec<String>, Vec<EventMeta>) {
-    let cursor = NostrCursor::new(dir.into()).with_dedupe(true).with_max_parallelism();
+    let cursor = NostrCursor::new(dir.into())
+        .with_dedupe(true)
+        .with_max_parallelism();
 
     let frames: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::with_capacity(limit)));
     let metas: Arc<Mutex<Vec<EventMeta>>> = Arc::new(Mutex::new(Vec::with_capacity(limit)));
@@ -82,7 +84,13 @@ fn load_events(dir: &str, limit: usize) -> (Vec<String>, Vec<EventMeta>) {
                             .map(|s| s.to_string());
 
                         let created_at = v["created_at"].as_u64().unwrap_or(0);
-                        metas2.lock().unwrap().push(EventMeta { id, pubkey, kind, created_at, e_tag });
+                        metas2.lock().unwrap().push(EventMeta {
+                            id,
+                            pubkey,
+                            kind,
+                            created_at,
+                            e_tag,
+                        });
                     }
                     f.push(format!(r#"["EVENT",{}]"#, json));
                 }
@@ -229,7 +237,11 @@ fn main() {
     eprint!("Loading up to {} events from {} … ", limit, archive_dir);
     let t_load = Instant::now();
     let (frames, metas) = load_events(&archive_dir, limit);
-    eprintln!("loaded {} in {:.2}s", frames.len(), t_load.elapsed().as_secs_f64());
+    eprintln!(
+        "loaded {} in {:.2}s",
+        frames.len(),
+        t_load.elapsed().as_secs_f64()
+    );
 
     if frames.is_empty() {
         eprintln!("No events found — check NOSTR_ARCHIVE_DIR.");
@@ -259,11 +271,16 @@ fn main() {
 
     let total_bytes: usize = frames.iter().map(|f| f.len()).sum();
     let total_events = frames.len();
-    eprintln!("Sending {} events ({:.1} MB) …", total_events, total_bytes as f64 / 1e6);
+    eprintln!(
+        "Sending {} events ({:.1} MB) …",
+        total_events,
+        total_bytes as f64 / 1e6
+    );
 
     let t_ingest = Instant::now();
     for frame in &frames {
-        ws.send(Message::Text(frame.as_str().into())).expect("ws send failed");
+        ws.send(Message::Text(frame.as_str().into()))
+            .expect("ws send failed");
     }
     flush(&mut ws);
     let ingest_elapsed = t_ingest.elapsed();
@@ -293,12 +310,18 @@ fn main() {
     // 1. Each top kind individually, with and without limit
     for &k in top_kinds {
         let count = kind_counts[&k];
-        results.push(bench_query(&mut ws, &format!("kind {} (limit 100) [{} total]", k, count), rounds, move |_| {
-            format!(r#"{{"kinds":[{}],"limit":100}}"#, k)
-        }));
-        results.push(bench_query(&mut ws, &format!("kind {} (no limit) [{} total]", k, count), rounds, move |_| {
-            format!(r#"{{"kinds":[{}]}}"#, k)
-        }));
+        results.push(bench_query(
+            &mut ws,
+            &format!("kind {} (limit 100) [{} total]", k, count),
+            rounds,
+            move |_| format!(r#"{{"kinds":[{}],"limit":100}}"#, k),
+        ));
+        results.push(bench_query(
+            &mut ws,
+            &format!("kind {} (no limit) [{} total]", k, count),
+            rounds,
+            move |_| format!(r#"{{"kinds":[{}]}}"#, k),
+        ));
     }
 
     // Pick a few authors with varying event counts for author scenarios.
@@ -324,12 +347,18 @@ fn main() {
     for (pk, total) in &sample_authors {
         let pk = *pk;
         let total = *total;
-        results.push(bench_query(&mut ws, &format!("author (limit 100) [{} total]", total), rounds, move |_| {
-            format!(r#"{{"authors":["{}"],"limit":100}}"#, pk)
-        }));
-        results.push(bench_query(&mut ws, &format!("author (no limit) [{} total]", total), rounds, move |_| {
-            format!(r#"{{"authors":["{}"]}}"#, pk)
-        }));
+        results.push(bench_query(
+            &mut ws,
+            &format!("author (limit 100) [{} total]", total),
+            rounds,
+            move |_| format!(r#"{{"authors":["{}"],"limit":100}}"#, pk),
+        ));
+        results.push(bench_query(
+            &mut ws,
+            &format!("author (no limit) [{} total]", total),
+            rounds,
+            move |_| format!(r#"{{"authors":["{}"]}}"#, pk),
+        ));
     }
 
     // 3. By event ID (single lookup — same cost every time)

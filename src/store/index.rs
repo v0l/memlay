@@ -1,14 +1,14 @@
 use crate::event::Event;
 use parking_lot::RwLock;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// Tag letter used as key in `by_tag_other`.
 type TagLetter = char;
 
 /// Reference to an event, used in sorted indexes.
-/// Sorts by created_at DESC (newest first), then by id as tiebreaker.
+/// Stores the Arc<Event> pointer for zero-copy event access.
 #[derive(Clone)]
 pub struct EventRef {
     pub created_at: u64,
@@ -26,7 +26,7 @@ impl EventRef {
     }
 }
 
-// Only compare by created_at and id, ignore the event pointer
+// Only compare by created_at and id
 impl PartialEq for EventRef {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
@@ -64,58 +64,58 @@ pub struct EventIndex {
     // Primary index: O(1) lookup by id
     by_id: RwLock<HashMap<[u8; 32], Arc<Event>>>,
 
-    // Secondary indexes: sorted by created_at (via EventRef ordering)
-    by_pubkey: RwLock<BTreeMap<[u8; 32], BTreeSet<EventRef>>>,
-    by_kind: RwLock<BTreeMap<u32, BTreeSet<EventRef>>>,
+    // Secondary indexes: sorted by created_at (via EventRef ordering in BTreeSet)
+    // Using HashMap for O(1) lookups instead of BTreeMap O(log n)
+    by_pubkey: RwLock<HashMap<[u8; 32], BTreeSet<EventRef>>>,
+    by_kind: RwLock<HashMap<u32, BTreeSet<EventRef>>>,
 
     // Dedicated fast indexes for the two most-common tag types
-    by_tag_e: RwLock<BTreeMap<[u8; 32], BTreeSet<EventRef>>>,
-    by_tag_p: RwLock<BTreeMap<[u8; 32], BTreeSet<EventRef>>>,
+    by_tag_e: RwLock<HashMap<[u8; 32], BTreeSet<EventRef>>>,
+    by_tag_p: RwLock<HashMap<[u8; 32], BTreeSet<EventRef>>>,
 
     // Generic index for every other single-letter tag (NIP-01 §tags)
     // Outer key: tag letter ('t', 'a', 'd', …)
     // Inner key: raw tag value string
-    by_tag_other: RwLock<HashMap<TagLetter, BTreeMap<String, BTreeSet<EventRef>>>>,
+    by_tag_other: RwLock<HashMap<TagLetter, HashMap<String, BTreeSet<EventRef>>>>,
 }
 
 impl EventIndex {
     pub fn new() -> Self {
         Self {
             by_id: RwLock::new(HashMap::new()),
-            by_pubkey: RwLock::new(BTreeMap::new()),
-            by_kind: RwLock::new(BTreeMap::new()),
-            by_tag_e: RwLock::new(BTreeMap::new()),
-            by_tag_p: RwLock::new(BTreeMap::new()),
+            by_pubkey: RwLock::new(HashMap::new()),
+            by_kind: RwLock::new(HashMap::new()),
+            by_tag_e: RwLock::new(HashMap::new()),
+            by_tag_p: RwLock::new(HashMap::new()),
             by_tag_other: RwLock::new(HashMap::new()),
         }
     }
 
     /// Insert an event into all indexes
     pub fn insert(&self, event: Arc<Event>) {
-        let event_ref = EventRef::new(Arc::clone(&event));
-
         // Primary index
-        self.by_id.write().insert(event.id, Arc::clone(&event));
+        self.by_id.write().insert(event.id, event.clone());
 
         // Pubkey index
-        self.by_pubkey
-            .write()
-            .entry(event.pubkey)
-            .or_default()
-            .insert(event_ref.clone());
+        {
+            let mut by_pubkey = self.by_pubkey.write();
+            let event_ref = EventRef::new(event.clone());
+            by_pubkey.entry(event.pubkey).or_default().insert(event_ref);
+        }
 
         // Kind index
-        self.by_kind
-            .write()
-            .entry(event.kind)
-            .or_default()
-            .insert(event_ref.clone());
+        {
+            let mut by_kind = self.by_kind.write();
+            let event_ref = EventRef::new(event.clone());
+            by_kind.entry(event.kind).or_default().insert(event_ref);
+        }
 
         // E-tag index
         {
             let mut by_tag_e = self.by_tag_e.write();
             for e_tag in event.e_tags() {
-                by_tag_e.entry(e_tag).or_default().insert(event_ref.clone());
+                let event_ref = EventRef::new(event.clone());
+                by_tag_e.entry(e_tag).or_default().insert(event_ref);
             }
         }
 
@@ -123,7 +123,8 @@ impl EventIndex {
         {
             let mut by_tag_p = self.by_tag_p.write();
             for p_tag in event.p_tags() {
-                by_tag_p.entry(p_tag).or_default().insert(event_ref.clone());
+                let event_ref = EventRef::new(event.clone());
+                by_tag_p.entry(p_tag).or_default().insert(event_ref);
             }
         }
 
@@ -132,17 +133,18 @@ impl EventIndex {
             let mut by_tag_other = self.by_tag_other.write();
             for tag in &event.tags {
                 let mut chars = tag.name.chars();
-                if let (Some(letter), None) = (chars.next(), chars.next()) {
-                    if letter != 'e' && letter != 'p' {
-                        if let Some(value) = tag.value() {
-                            by_tag_other
-                                .entry(letter)
-                                .or_default()
-                                .entry(value.to_string())
-                                .or_default()
-                                .insert(event_ref.clone());
-                        }
-                    }
+                if let (Some(letter), None) = (chars.next(), chars.next())
+                    && letter != 'e'
+                    && letter != 'p'
+                    && let Some(value) = tag.value()
+                {
+                    let event_ref = EventRef::new(event.clone());
+                    by_tag_other
+                        .entry(letter)
+                        .or_default()
+                        .entry(value.to_string())
+                        .or_default()
+                        .insert(event_ref);
                 }
             }
         }
@@ -159,7 +161,7 @@ impl EventIndex {
             event: Arc::clone(&event),
         };
 
-        // Remove from pubkey index
+        // Delete from pubkey index
         {
             let mut by_pubkey = self.by_pubkey.write();
             if let Some(set) = by_pubkey.get_mut(&event.pubkey) {
@@ -170,7 +172,7 @@ impl EventIndex {
             }
         }
 
-        // Remove from kind index
+        // Delete from kind index
         {
             let mut by_kind = self.by_kind.write();
             if let Some(set) = by_kind.get_mut(&event.kind) {
@@ -212,21 +214,20 @@ impl EventIndex {
             let mut by_tag_other = self.by_tag_other.write();
             for tag in &event.tags {
                 let mut chars = tag.name.chars();
-                if let (Some(letter), None) = (chars.next(), chars.next()) {
-                    if letter != 'e' && letter != 'p' {
-                        if let Some(value) = tag.value() {
-                            if let Some(inner) = by_tag_other.get_mut(&letter) {
-                                if let Some(set) = inner.get_mut(value) {
-                                    set.remove(&dummy_ref);
-                                    if set.is_empty() {
-                                        inner.remove(value);
-                                    }
-                                }
-                                if inner.is_empty() {
-                                    by_tag_other.remove(&letter);
-                                }
-                            }
+                if let (Some(letter), None) = (chars.next(), chars.next())
+                    && letter != 'e'
+                    && letter != 'p'
+                    && let Some(value) = tag.value()
+                    && let Some(inner) = by_tag_other.get_mut(&letter)
+                {
+                    if let Some(set) = inner.get_mut(value) {
+                        set.remove(&dummy_ref);
+                        if set.is_empty() {
+                            inner.remove(value);
                         }
+                    }
+                    if inner.is_empty() {
+                        by_tag_other.remove(&letter);
                     }
                 }
             }

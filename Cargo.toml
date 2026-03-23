@@ -22,6 +22,7 @@ serde_json = "1"
 # Data structures
 bytes = "1"
 parking_lot = "0.12"
+dashmap = "6"
 
 # Concurrency
 crossbeam-channel = "0.5"
@@ -62,4 +63,21 @@ harness = false
 
 [[bench]]
 name = "ingest_bench"
+harness = false
+
+[[bench]]
+name = "pipeline_bench"
+harness = false
+
+[[bench]]
+name = "subscription_cache_bench"
+harness = false
+required-features = ["unchecked"]
+
+[[bench]]
+name = "index_storage_bench"
+harness = false
+
+[[bench]]
+name = "concurrent_map_bench"
 harness = false

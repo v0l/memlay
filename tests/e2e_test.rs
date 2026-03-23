@@ -3,7 +3,7 @@ use nostr_sdk::prelude::*;
 use std::net::TcpListener;
 use std::time::Duration;
 use tokio::net::TcpListener as TokioTcpListener;
-use tungstenite::{connect, Message};
+use tungstenite::{Message, connect};
 
 /// Spawn a relay on a random available port and return the ws:// URL.
 async fn spawn_relay() -> String {
@@ -17,9 +17,12 @@ async fn spawn_relay() -> String {
 
     let tcp = TokioTcpListener::bind(addr).await.unwrap();
     tokio::spawn(async move {
-        axum::serve(tcp, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await
-            .unwrap();
+        axum::serve(
+            tcp,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     url
@@ -232,7 +235,9 @@ async fn test_wire_protocol() {
     .unwrap();
 }
 
-fn read_text(ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>) -> String {
+fn read_text(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+) -> String {
     loop {
         match ws.read().unwrap() {
             Message::Text(t) => return t.to_string(),

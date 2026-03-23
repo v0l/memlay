@@ -123,14 +123,14 @@ impl NostrMessage {
     pub fn to_json(&self) -> String {
         match self {
             NostrMessage::Event { sub_id, event } => {
-                let json = String::from_utf8(event.raw.to_vec())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
                 if let Some(id) = sub_id {
-                    format!(r#"["EVENT","{}",{}]"#, id, json)
+                    format!(
+                        r#"["EVENT","{}",{}]"#,
+                        id,
+                        String::from_utf8_lossy(&event.raw)
+                    )
                 } else {
-                    json
+                    String::from_utf8_lossy(&event.raw).into_owned()
                 }
             }
             NostrMessage::Request { id, filters } => {
@@ -144,8 +144,7 @@ impl NostrMessage {
                 format!(r#"["EOSE","{}"]"#, id)
             }
             NostrMessage::Notification { message } => {
-                // Escape the message as a proper JSON string value
-                serde_json::to_string(&serde_json::json!(["NOTICE", message])).unwrap_or_default()
+                format!(r#"["NOTICE","{}"]"#, message)
             }
             NostrMessage::Ok {
                 id,
