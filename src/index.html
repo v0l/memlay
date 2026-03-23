@@ -48,7 +48,7 @@
   <section>
     <h2>Store</h2>
     <div class="row"><span>Events</span><span id="stat-events">—</span></div>
-    <div class="row"><span>Memory</span><span id="stat-bytes">—</span></div>
+    <div class="row"><span>Memory Used</span><span id="stat-bytes">—</span></div>
     <div class="row"><span>Capacity</span><span id="stat-capacity">—</span></div>
   </section>
 
@@ -65,21 +65,35 @@
 
   function fmt(n) { return n.toLocaleString(); }
   function fmtBytes(b) {
-    if (b === 0) return 'unlimited';
+    if (b === 0) return '0 B';
     const units = ['B','KB','MB','GB'];
     let i = 0;
     while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
     return b.toFixed(1) + ' ' + units[i];
   }
 
+  function fmtCapacity(bytes, limit) {
+    if (!limit || limit === 0) return '—';  // unlimited
+    return Math.round(bytes / limit * 100) + '%';
+  }
+
   async function refreshStats() {
     try {
       const s = await fetch('/stats').then(r => r.json());
-      document.getElementById('stat-events').textContent =
-        fmt(s.events) + (s.max_events ? ' / ' + fmt(s.max_events) : '');
-      document.getElementById('stat-bytes').textContent = fmtBytes(s.bytes);
-      document.getElementById('stat-capacity').textContent =
-        s.max_events ? Math.round(s.events / s.max_events * 100) + '%' : '—';
+      document.getElementById('stat-events').textContent = fmt(s.events);
+      
+      // Show actual process memory usage (RSS) vs memory limit
+      const used = s.process_memory || s.store_bytes || 0;
+      const max = s.max_bytes || 0;
+      
+      if (max > 0) {
+        document.getElementById('stat-bytes').textContent = fmtBytes(used) + ' / ' + fmtBytes(max);
+      } else {
+        document.getElementById('stat-bytes').textContent = fmtBytes(used);
+      }
+      
+      // Capacity percentage (store memory vs limit)
+      document.getElementById('stat-capacity').textContent = fmtCapacity(s.store_bytes, s.max_bytes);
     } catch (_) {}
   }
 

@@ -1,6 +1,6 @@
 [package]
 name = "memlay"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [features]
@@ -44,6 +44,7 @@ rlimit = "0.10"
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
+sysinfo = "0.38.4"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

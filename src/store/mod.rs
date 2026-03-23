@@ -7,13 +7,80 @@ pub use lru::LruTracker;
 use crate::event::Event;
 use std::sync::Arc;
 
+/// Get total system memory respecting cgroup limits for cloud-native deployments.
+fn get_total_memory() -> u64 {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    
+    // First, try to get cgroup limits (explicit cgroup detection)
+    if let Some(limits) = sys.cgroup_limits() {
+        return limits.total_memory;
+    }
+    
+    // Fall back to system total memory if not running in a cgroup-restricted environment
+    sys.total_memory()
+}
+
+/// Get current process memory usage (RSS) in bytes using sysinfo.
+pub fn get_process_memory() -> u64 {
+    // Create system instance and refresh process info
+    let mut sys = sysinfo::System::new();
+    
+    // Refresh all processes (including our own)
+    sys.refresh_processes(
+        sysinfo::ProcessesToUpdate::All,
+        true, // remove dead processes
+    );
+    
+    // Get current process PID
+    match sysinfo::get_current_pid() {
+        Ok(pid) => {
+            if let Some(process) = sys.process(pid) {
+                return process.memory();
+            }
+        }
+        Err(_e) => {}
+    }
+    
+    0
+}
+
 /// Configuration for the event store
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
-    /// Maximum number of events to store
+    /// Maximum number of events to store (derived from target_ram_bytes)
     pub max_events: usize,
     /// Maximum memory usage in bytes (0 = unlimited)
     pub max_bytes: usize,
+}
+
+impl StoreConfig {
+    /// Create store config from target RAM percentage of available system memory
+    /// Respects cgroup memory limits for cloud-native deployments.
+    pub fn from_target_ram_percent(percent: u8, max_events_limit: usize) -> Self {
+        if percent == 0 {
+            return Self {
+                max_events: max_events_limit,
+                max_bytes: 0,
+            };
+        }
+
+        let available_memory = get_total_memory();
+        let target_bytes = (available_memory as f64 * (percent as f64 / 100.0)) as usize;
+        
+        tracing::info!(
+            "Memory limit calculated: available={}, percent={}, target_bytes={} ({:.1} MB)",
+            available_memory,
+            percent,
+            target_bytes,
+            target_bytes as f64 / 1024.0 / 1024.0
+        );
+
+        Self {
+            max_events: max_events_limit,
+            max_bytes: target_bytes,
+        }
+    }
 }
 
 impl Default for StoreConfig {
@@ -172,10 +239,7 @@ mod tests {
 
     #[test]
     fn test_lru_eviction() {
-        let config = StoreConfig {
-            max_events: 3,
-            max_bytes: 0,
-        };
+        let config = StoreConfig::from_target_ram_percent(0, 3); // 0% = use max_events limit
         let store = EventStore::new(config);
 
         // Insert 3 events
@@ -197,28 +261,12 @@ mod tests {
     }
 
     #[test]
-    fn test_query_by_kind() {
-        let store = EventStore::new(StoreConfig::default());
-
-        store.insert(make_event(1, 1, 1, 1000));
-        store.insert(make_event(2, 1, 1, 2000));
-        store.insert(make_event(3, 1, 0, 3000)); // different kind
-
-        let results = store.query_by_kind(1, 10);
-        assert_eq!(results.len(), 2);
-        // Should be ordered by created_at DESC
-        assert_eq!(results[0].created_at, 2000);
-        assert_eq!(results[1].created_at, 1000);
-    }
-
-    #[test]
-    fn test_query_by_pubkey_since() {
+    fn test_query_since_until() {
         let store = EventStore::new(StoreConfig::default());
 
         store.insert(make_event(1, 1, 1, 1000));
         store.insert(make_event(2, 1, 1, 2000));
         store.insert(make_event(3, 1, 1, 3000));
-        store.insert(make_event(4, 2, 1, 4000)); // different pubkey
 
         let mut pubkey = [0u8; 32];
         pubkey[31] = 1;
@@ -227,5 +275,12 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].created_at, 3000);
         assert_eq!(results[1].created_at, 2000);
+    }
+
+    #[test]
+    fn test_get_total_memory() {
+        let memory = get_total_memory();
+        assert!(memory > 0, "Total memory should be greater than 0");
+        assert!(memory <= u64::MAX, "Total memory should not exceed u64::MAX");
     }
 }

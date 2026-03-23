@@ -3,10 +3,10 @@
 # Server binding address
 bind_addr = "0.0.0.0:8080"
 
-# Maximum number of events to store (LRU eviction when exceeded)
-max_events = 1000000
+# Target RAM usage as percentage of available system memory (0 = unlimited)
+target_ram_percent = 80
 
-# Maximum memory usage in bytes (0 = unlimited)
+# Maximum bytes for exact memory limit (0 = use target_ram_percent)
 max_bytes = 0
 
 # Maximum concurrent subscriptions per connection

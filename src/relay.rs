@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Capacity of the relay-wide new-event broadcast channel.
-const BROADCAST_CAP: usize = 1024;
+const BROADCAST_CAP: usize = 8192;
 
 pub struct Relay {
     pub events: Arc<EventStore>,
@@ -29,10 +29,11 @@ pub struct Relay {
 
 impl Relay {
     pub fn new(config: Config) -> Self {
-        let events = Arc::new(EventStore::new(StoreConfig {
-            max_events: config.max_events,
-            max_bytes: config.max_bytes,
-        }));
+        let store_config = StoreConfig::from_target_ram_percent(
+            config.target_ram_percent,
+            config.max_limit,
+        );
+        let events = Arc::new(EventStore::new(store_config));
         let subscriptions = Arc::new(SubscriptionManager::new(events.clone()));
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
         Self {
@@ -99,11 +100,12 @@ impl Relay {
 
 fn stats_handler(events: Arc<crate::store::EventStore>) -> impl IntoResponse {
     let cfg = events.config();
+    let process_memory = crate::store::get_process_memory();
     let body = serde_json::json!({
         "events": events.len(),
-        "bytes": events.bytes_used(),
-        "max_events": cfg.max_events,
+        "store_bytes": events.bytes_used(),
         "max_bytes": cfg.max_bytes,
+        "process_memory": process_memory,
     });
     let mut headers = HeaderMap::new();
     headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
@@ -147,6 +149,10 @@ fn landing_page() -> impl IntoResponse {
     headers.insert(
         "Content-Type",
         HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(
+        "Cache-Control",
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
     );
     (headers, html)
 }
@@ -219,7 +225,7 @@ async fn handle_socket(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("broadcast lagged by {} events", n);
+                        tracing::warn!(%addr, "broadcast lagged by {} events", n);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
