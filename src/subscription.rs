@@ -45,6 +45,24 @@ impl Hex32 {
     }
 }
 
+impl From<&str> for Hex32 {
+    fn from(s: &str) -> Self {
+        let bytes = hex::decode(s).expect("invalid hex string");
+        if bytes.len() != 32 {
+            panic!("expected 32 bytes, got {}", bytes.len());
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Hex32(arr)
+    }
+}
+
+impl From<String> for Hex32 {
+    fn from(s: String) -> Self {
+        s.as_str().into()
+    }
+}
+
 impl Serialize for Hex32 {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&hex::encode(self.0))
@@ -386,8 +404,10 @@ impl SubscriptionManager {
         // Determine the best index to start with based on selectivity
         // Priority: ids (most selective) > e-tags > p-tags > generic tags > authors > kinds (least selective)
         let use_ids = filter.ids.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
-        let use_e_tags = filter.e_tags_bytes.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
-        let use_p_tags = filter.p_tags_bytes.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let use_e_tags = filter.e_tags_bytes.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+            || filter.e_tags().map(|v| !v.is_empty()).unwrap_or(false);
+        let use_p_tags = filter.p_tags_bytes.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+            || filter.p_tags().map(|v| !v.is_empty()).unwrap_or(false);
         let has_generic_tags = filter
             .tag_filters
             .iter()
@@ -417,6 +437,7 @@ impl SubscriptionManager {
                     candidates.extend(self.store.query_by_e_tag(bytes.as_bytes(), fetch_limit));
                 }
             } else if let Some(e_vals) = filter.e_tags() {
+                // Fallback: parse e-tag strings on-demand (for direct filter usage like in tests)
                 for val in e_vals {
                     if let Ok(b) = hex::decode(val)
                         && b.len() == 32
@@ -433,6 +454,7 @@ impl SubscriptionManager {
                     candidates.extend(self.store.query_by_p_tag(bytes.as_bytes(), fetch_limit));
                 }
             } else if let Some(p_vals) = filter.p_tags() {
+                // Fallback: parse p-tag strings on-demand
                 for val in p_vals {
                     if let Ok(b) = hex::decode(val)
                         && b.len() == 32
@@ -660,7 +682,7 @@ mod tests {
         author[31] = 1;
 
         let filter = Filter {
-            authors: Some(vec![hex::encode(author)]),
+            authors: Some(vec![Hex32::from(hex::encode(author))]),
             ..Default::default()
         };
 
@@ -679,7 +701,7 @@ mod tests {
         sm.store.insert(event2);
 
         let filter = Filter {
-            ids: Some(vec![hex::encode(event1.id)]),
+            ids: Some(vec![Hex32::from(hex::encode(event1.id))]),
             ..Default::default()
         };
 
@@ -702,7 +724,7 @@ mod tests {
 
         let filter = Filter {
             kinds: Some(vec![1]),
-            authors: Some(vec![hex::encode(author)]),
+            authors: Some(vec![Hex32::from(hex::encode(author))]),
             ..Default::default()
         };
 
@@ -730,7 +752,7 @@ mod tests {
 
         let mut filter = Filter {
             kinds: Some(vec![1]),
-            authors: Some(vec![hex::encode(author)]),
+            authors: Some(vec![Hex32::from(hex::encode(author))]),
             ..Default::default()
         };
         filter.tag_filters.insert('p', vec![hex::encode(p_tag)]);
@@ -816,7 +838,7 @@ mod tests {
         author2[31] = 2;
 
         let filter = Filter {
-            authors: Some(vec![hex::encode(author1), hex::encode(author2)]),
+            authors: Some(vec![Hex32::from(hex::encode(author1)), Hex32::from(hex::encode(author2))]),
             ..Default::default()
         };
 
