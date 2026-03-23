@@ -119,7 +119,7 @@ fn nip11_handler(config: &Config) -> impl IntoResponse {
         "supported_nips": [1, 11],
         "limitation": {
             "max_subscriptions": config.max_subscriptions,
-            "max_limit": config.max_limit,
+            "max_limit": config.max_limit
         }
     });
 

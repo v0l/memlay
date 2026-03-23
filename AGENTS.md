@@ -166,6 +166,17 @@ cargo doc --open               # Generate docs
 - Measure insertion throughput
 - Test multi-threaded query performance
 
+### Performance Testing Protocol
+
+**ALWAYS run benchmarks between task list improvements:**
+
+```bash
+cargo bench  # Run before changes
+cargo bench  # Run after changes
+```
+
+Run benchmarks after **each individual change**, not after batches of modifications. This isolates which specific changes improve or degrade performance, making it clear what worked and what didn't.
+
 ## Common Tasks
 
 ### Adding a New NIP
@@ -294,6 +305,12 @@ nostr-cli relay ws://localhost:8080/
 ### Build & Run
 ```bash
 cargo build --release && ./target/release/memlay --config config.toml
+```
+
+### Add dependencies
+Always use `cargo add` to ensure latest compatible versions:
+```bash
+cargo add <crate_name>  # Always use cargo add to ensure latest compatible versions
 ```
 
 ### Test Everything
