@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::message::NostrMessage;
-use crate::store::{EventStore, StoreConfig};
+use crate::store::{EventStore, InsertResult, StoreConfig};
 use crate::subscription::{Filter, Subscription, SubscriptionManager};
 use axum::{
     Router,
@@ -271,7 +271,18 @@ async fn handle_text(
             let ev = Arc::new(event);
 
             let ok = match subscriptions.store.insert(ev.clone()) {
-                None => {
+                InsertResult::Ephemeral => {
+                    tracing::debug!(%addr, id = %event_id, kind = ev.kind, "ephemeral event");
+                    // Ephemeral events are not stored but still broadcast to active subscribers
+                    subscriptions.invalidate_cache();
+                    let _ = tx.send(ev);
+                    NostrMessage::Ok {
+                        id: event_id,
+                        accepted: true,
+                        message: "ephemeral: will not be stored".to_string(),
+                    }
+                }
+                InsertResult::Duplicate => {
                     tracing::debug!(%addr, id = %event_id, "duplicate event");
                     NostrMessage::Ok {
                         id: event_id,
@@ -279,18 +290,19 @@ async fn handle_text(
                         message: "duplicate: already have this event".to_string(),
                     }
                 }
-                Some(_) => {
+                InsertResult::Stored { event, replaced } => {
                     tracing::info!(
                         %addr,
                         id = %event_id,
-                        kind = ev.kind,
-                        pubkey = %hex::encode(ev.pubkey),
+                        kind = event.kind,
+                        pubkey = %hex::encode(event.pubkey),
+                        replaced = replaced.len(),
                         "event stored"
                     );
                     // Invalidate query cache on new event insertion
                     subscriptions.invalidate_cache();
                     // Broadcast to live subscriptions on other connections
-                    let _ = tx.send(ev);
+                    let _ = tx.send(event);
                     NostrMessage::Ok {
                         id: event_id,
                         accepted: true,

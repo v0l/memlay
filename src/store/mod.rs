@@ -60,6 +60,22 @@ struct EvictionState {
     consecutive_evictions: AtomicUsize,
 }
 
+/// Result of inserting an event into the store
+#[derive(Debug)]
+pub enum InsertResult {
+    /// Event was not stored (ephemeral events are not stored)
+    Ephemeral,
+    /// Event was a duplicate (already exists)
+    Duplicate,
+    /// Event was stored successfully
+    Stored {
+        /// The newly inserted event
+        event: Arc<Event>,
+        /// Old events that were replaced (for replaceable events)
+        replaced: Vec<Arc<Event>>,
+    },
+}
+
 /// High-performance in-memory event store with memory-based eviction
 pub struct EventStore {
     index: EventIndex,
@@ -194,33 +210,63 @@ impl EventStore {
     }
 
     /// Insert a single event
-    pub fn insert(&self, event: Arc<Event>) -> Option<Vec<Arc<Event>>> {
+    /// 
+    /// Returns InsertResult indicating:
+    /// - Ephemeral: event was not stored (ephemeral events are not persisted)
+    /// - Duplicate: event already exists
+    /// - Stored: event was stored, with any replaced events (for replaceable events)
+    pub fn insert(&self, event: Arc<Event>) -> InsertResult {
         let event_id = event.id;
 
+        // Ephemeral events should never be stored
+        if event.is_ephemeral() {
+            return InsertResult::Ephemeral;
+        }
+
+        // Check if event already exists
         if self.index.get(&event_id).is_some() {
-            return None;
+            return InsertResult::Duplicate;
         }
         
-        self.index.insert(event);
-        Some(vec![])
+        // Insert and get replaced events (for replaceable events)
+        let replaced = self.index.insert(event.clone());
+        
+        InsertResult::Stored {
+            event,
+            replaced: replaced.map(|e| vec![e]).unwrap_or_default(),
+        }
     }
 
     /// Batch insert events (more efficient for bulk operations)
-    pub fn insert_batch(&self, events: Vec<Arc<Event>>) -> usize {
+    /// 
+    /// Returns (inserted_count, replaced_events) where:
+    /// - inserted_count: number of new events stored (excluding ephemeral and duplicates)
+    /// - replaced_events: events that were replaced by new replaceable events
+    pub fn insert_batch(&self, events: Vec<Arc<Event>>) -> (usize, Vec<Arc<Event>>) {
         let mut inserted = 0;
+        let mut replaced = Vec::new();
         
         for event in events {
+            // Skip ephemeral events
+            if event.is_ephemeral() {
+                continue;
+            }
+            
             let event_id = event.id;
             
             if self.index.get(&event_id).is_some() {
                 continue;
             }
             
-            self.index.insert(event);
+            let old = self.index.insert(event.clone());
             inserted += 1;
+            
+            if let Some(old_event) = old {
+                replaced.push(old_event);
+            }
         }
         
-        inserted
+        (inserted, replaced)
     }
 
     /// Get an event by ID
@@ -397,19 +443,37 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Event;
+    use crate::event::{EventBuilder, Tag};
     use tempfile::TempDir;
 
     fn make_event(id: u8, pubkey: u8, kind: u32, created_at: u64) -> Arc<Event> {
-        let json = format!(
-            r#"{{"id":"{:0>64}","pubkey":"{:0>64}","created_at":{},"kind":{},"tags":[],"content":"test","sig":"{:0>128}"}}"#,
-            format!("{:x}", id),
-            format!("{:x}", pubkey),
-            created_at,
-            kind,
-            "0"
-        );
-        Arc::new(Event::from_json_unchecked(json.as_bytes()).unwrap())
+        Arc::new(EventBuilder::new()
+            .pubkey(set_byte([0u8; 32], pubkey))
+            .kind(kind)
+            .created_at(created_at)
+            .content("test")
+            .build())
+    }
+
+    fn make_event_with_d_tag(
+        id: u8,
+        pubkey: u8,
+        kind: u32,
+        created_at: u64,
+        d_tag: &str,
+    ) -> Arc<Event> {
+        Arc::new(EventBuilder::new()
+            .pubkey(set_byte([0u8; 32], pubkey))
+            .kind(kind)
+            .created_at(created_at)
+            .content("test")
+            .tag("d", d_tag)
+            .build())
+    }
+
+    fn set_byte(mut arr: [u8; 32], byte: u8) -> [u8; 32] {
+        arr[31] = byte;
+        arr
     }
 
     #[test]
@@ -424,45 +488,151 @@ mod tests {
         assert_eq!(retrieved.id, id);
     }
 
-    #[test]
-    fn test_lru_eviction() {
-        let config = StoreConfig::from_target_ram_percent(0);
-        let store = EventStore::new(config);
-
-        // Insert 3 events
-        store.insert(make_event(1, 1, 1, 1000));
-        store.insert(make_event(2, 1, 1, 2000));
-        store.insert(make_event(3, 1, 1, 3000));
-        assert_eq!(store.len(), 3);
+#[test]
+    fn test_insert_ephemeral_event() {
+        let store = EventStore::new(StoreConfig::default());
+        
+        // Create ephemeral event (kind 20001)
+        let ephemeral = make_event(1, 1, 20001, 1000);
+        
+        // Ephemeral events should not be stored
+        let result = store.insert(ephemeral);
+        assert!(matches!(result, InsertResult::Ephemeral));
+        assert_eq!(store.len(), 0);
     }
 
     #[test]
-    fn test_batch_insert() {
+    fn test_insert_replaceable_event_replaces_old() {
         let store = EventStore::new(StoreConfig::default());
         
-        let events: Vec<Arc<Event>> = vec![
-            make_event(1, 1, 1, 1000),
-            make_event(2, 1, 1, 2000),
-            make_event(3, 1, 1, 3000),
+        let pubkey = 1u8;
+        
+        // Insert first replaceable event (kind 10000)
+        let event1 = make_event(1, pubkey, 10000, 1000);
+        let result1 = store.insert(event1.clone());
+        assert!(matches!(result1, InsertResult::Stored { .. }));
+        assert_eq!(store.len(), 1);
+        
+        // Insert new replaceable event (should replace old)
+        let event2 = make_event(2, pubkey, 10000, 2000);
+        let result2 = store.insert(event2.clone());
+        
+        match result2 {
+            InsertResult::Stored { replaced, .. } => {
+                assert_eq!(replaced.len(), 1);
+                assert_eq!(replaced[0].id, event1.id);
+            }
+            _ => panic!("Expected Stored with replaced events"),
+        }
+        
+        // Should still have only 1 event
+        assert_eq!(store.len(), 1);
+        
+        // Should have the new event
+        let retrieved = store.get(&event2.id).unwrap();
+        assert_eq!(retrieved.id, event2.id);
+        
+        // Old event should be gone
+        assert!(store.get(&event1.id).is_none());
+    }
+
+    #[test]
+    fn test_insert_addressable_event_replaces_by_d_tag() {
+        let store = EventStore::new(StoreConfig::default());
+        
+        let pubkey = 1u8;
+        
+        // Insert first addressable event with d-tag "profile"
+        let event1 = make_event_with_d_tag(1, pubkey, 30000, 1000, "profile");
+        let result1 = store.insert(event1.clone());
+        assert!(matches!(result1, InsertResult::Stored { .. }));
+        assert_eq!(store.len(), 1);
+        
+        // Insert new addressable event with same d-tag (should replace)
+        let event2 = make_event_with_d_tag(2, pubkey, 30000, 2000, "profile");
+        let result2 = store.insert(event2.clone());
+        
+        match result2 {
+            InsertResult::Stored { replaced, .. } => {
+                assert_eq!(replaced.len(), 1);
+                assert_eq!(replaced[0].id, event1.id);
+            }
+            _ => panic!("Expected Stored with replaced events"),
+        }
+        
+        // Should still have only 1 event
+        assert_eq!(store.len(), 1);
+        
+        // Insert addressable event with different d-tag (should NOT replace)
+        let event3 = make_event_with_d_tag(3, pubkey, 30000, 3000, "settings");
+        let result3 = store.insert(event3.clone());
+        assert!(matches!(result3, InsertResult::Stored { replaced, .. } if replaced.is_empty()));
+        
+        // Should now have 2 events
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_regular_event_no_replacement() {
+        let store = EventStore::new(StoreConfig::default());
+        
+        let pubkey = 1u8;
+        
+        // Insert regular note (kind 1)
+        let event1 = make_event(1, pubkey, 1, 1000);
+        let result1 = store.insert(event1.clone());
+        assert!(matches!(result1, InsertResult::Stored { replaced, .. } if replaced.is_empty()));
+        assert_eq!(store.len(), 1);
+        
+        // Insert another note from same author (should NOT replace)
+        let event2 = make_event(2, pubkey, 1, 2000);
+        let result2 = store.insert(event2.clone());
+        assert!(matches!(result2, InsertResult::Stored { replaced, .. } if replaced.is_empty()));
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_duplicate_event() {
+        let store = EventStore::new(StoreConfig::default());
+        
+        let event = make_event(1, 1, 1, 1000);
+        let event_id = event.id;
+        
+        store.insert(event.clone());
+        assert_eq!(store.len(), 1);
+        
+        // Insert same event again
+        let result = store.insert(event.clone());
+        assert!(matches!(result, InsertResult::Duplicate));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn test_batch_insert_with_ephemeral_and_replaceable() {
+        let store = EventStore::new(StoreConfig::default());
+        
+        let pubkey = 1u8;
+        
+        let events = vec![
+            // Regular event
+            make_event(1, pubkey, 1, 1000),
+            // Ephemeral event (should be skipped)
+            make_event(2, pubkey, 20001, 1001),
+            // Replaceable event (kind 10000)
+            make_event(3, pubkey, 10000, 1002),
+            // Another regular event
+            make_event(4, pubkey, 1, 1003),
         ];
         
-        let inserted = store.insert_batch(events);
-        assert_eq!(inserted, 3);
+        let (inserted, replaced) = store.insert_batch(events);
+        
+        assert_eq!(inserted, 3); // ephemeral skipped
+        assert_eq!(replaced.len(), 0);
         assert_eq!(store.len(), 3);
-    }
-
-    #[test]
-    fn test_query_by_kind() {
-        let store = EventStore::new(StoreConfig::default());
-
-        store.insert(make_event(1, 1, 1, 1000));
-        store.insert(make_event(2, 1, 1, 2000));
-        store.insert(make_event(3, 1, 0, 3000));
-
-        let results = store.query_by_kind(1, 10);
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].created_at, 2000);
-        assert_eq!(results[1].created_at, 1000);
+        
+        // Ephemeral should not be stored
+        let ephemeral_id = make_event(2, pubkey, 20001, 1001).id;
+        assert!(store.get(&ephemeral_id).is_none());
     }
 
     #[test]

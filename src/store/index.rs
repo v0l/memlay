@@ -1,4 +1,4 @@
-use crate::event::Event;
+use crate::event::{Event, ReplacementKey};
 use parking_lot::RwLock;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -96,6 +96,9 @@ pub struct EventIndex {
     
     // Oldest-first index for memory-based eviction
     by_oldest: RwLock<BTreeSet<EventRef>>,
+
+    // Replaceable events index: maps (pubkey, kind) or (pubkey, kind, d-tag) to latest event id
+    by_replaceable: RwLock<HashMap<ReplacementKey, [u8; 32]>>,
 }
 
 impl EventIndex {
@@ -108,11 +111,34 @@ impl EventIndex {
             by_tag_p: RwLock::new(HashMap::new()),
             by_tag_other: RwLock::new(HashMap::new()),
             by_oldest: RwLock::new(BTreeSet::new()),
+            by_replaceable: RwLock::new(HashMap::new()),
         }
     }
 
     /// Insert an event into all indexes
-    pub fn insert(&self, event: Arc<Event>) {
+    /// Returns the old event if this is a replaceable event that replaces an existing one
+    pub fn insert(&self, event: Arc<Event>) -> Option<Arc<Event>> {
+        let mut replaced = None;
+        let mut old_id_to_remove = None;
+
+        // Handle replaceable events: remove old version if exists
+        if event.is_replaceable() {
+            let key = event.replacement_key();
+            if let ReplacementKey::Replaceable { .. } | ReplacementKey::Addressable { .. } = &key {
+                let mut replaceable = self.by_replaceable.write();
+                if let Some(old_id) = replaceable.insert(key.clone(), event.id) {
+                    old_id_to_remove = Some(old_id);
+                }
+            }
+        }
+
+        // Remove old event outside of replaceable lock to avoid deadlock
+        if let Some(old_id) = old_id_to_remove {
+            if let Some(old_event) = self.remove(&old_id) {
+                replaced = Some(old_event);
+            }
+        }
+
         // Primary index
         self.by_id.write().insert(event.id, event.clone());
 
@@ -178,6 +204,8 @@ impl EventIndex {
             let event_ref = EventRef::new(event);
             by_oldest.insert(event_ref);
         }
+
+        replaced
     }
 
     /// Remove an event from all indexes
@@ -190,6 +218,15 @@ impl EventIndex {
             id: event.id,
             event: Arc::clone(&event),
         };
+
+        // Delete from replaceable index if this is a replaceable event
+        if event.is_replaceable() {
+            let key = event.replacement_key();
+            if let ReplacementKey::Replaceable { .. } | ReplacementKey::Addressable { .. } = &key {
+                let mut replaceable = self.by_replaceable.write();
+                replaceable.remove(&key);
+            }
+        }
 
         // Delete from pubkey index
         {
