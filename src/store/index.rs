@@ -7,6 +7,23 @@ use std::sync::Arc;
 /// Tag letter used as key in `by_tag_other`.
 type TagLetter = char;
 
+/// 64-bit hash for tag index keys.
+/// Computes a hash from the full 32-byte ID using XOR folding.
+/// Collision probability: ~0.000003% for 1M events (essentially zero).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TagIdHash(u64);
+
+impl TagIdHash {
+    pub fn from_id(id: &[u8; 32]) -> Self {
+        // Fold all 32 bytes into 8 bytes using XOR (uniform distribution)
+        let mut hash = [0u8; 8];
+        for (i, &byte) in id.iter().enumerate() {
+            hash[i % 8] ^= byte;
+        }
+        Self(u64::from_be_bytes(hash))
+    }
+}
+
 /// Reference to an event, used in sorted indexes.
 /// Stores the Arc<Event> pointer for zero-copy event access.
 #[derive(Clone)]
@@ -64,13 +81,13 @@ pub struct EventIndex {
     // Primary index: O(1) lookup by id
     by_id: RwLock<HashMap<[u8; 32], Arc<Event>>>,
 
-    // Pubkey index: all events from a pubkey
-    by_pubkey: RwLock<HashMap<[u8; 32], BTreeSet<EventRef>>>,
+    // Pubkey index: all events from a pubkey (64-bit hash of pubkey)
+    by_pubkey: RwLock<HashMap<TagIdHash, BTreeSet<EventRef>>>,
     by_kind: RwLock<HashMap<u32, BTreeSet<EventRef>>>,
 
-    // Dedicated fast indexes for the two most-common tag types
-    by_tag_e: RwLock<HashMap<[u8; 32], BTreeSet<EventRef>>>,
-    by_tag_p: RwLock<HashMap<[u8; 32], BTreeSet<EventRef>>>,
+    // Dedicated fast indexes for the two most-common tag types (64-bit hash)
+    by_tag_e: RwLock<HashMap<TagIdHash, BTreeSet<EventRef>>>,
+    by_tag_p: RwLock<HashMap<TagIdHash, BTreeSet<EventRef>>>,
 
     // Generic index for every other single-letter tag (NIP-01 §tags)
     // Outer key: tag letter ('t', 'a', 'd', …)
@@ -103,7 +120,8 @@ impl EventIndex {
         {
             let mut by_pubkey = self.by_pubkey.write();
             let event_ref = EventRef::new(event.clone());
-            by_pubkey.entry(event.pubkey).or_default().insert(event_ref);
+            let pubkey_hash = TagIdHash::from_id(&event.pubkey);
+            by_pubkey.entry(pubkey_hash).or_default().insert(event_ref);
         }
 
         // Kind index
@@ -118,7 +136,8 @@ impl EventIndex {
             let mut by_tag_e = self.by_tag_e.write();
             for e_tag in event.e_tags() {
                 let event_ref = EventRef::new(event.clone());
-                by_tag_e.entry(e_tag).or_default().insert(event_ref);
+                let e_tag_hash = TagIdHash::from_id(&e_tag);
+                by_tag_e.entry(e_tag_hash).or_default().insert(event_ref);
             }
         }
 
@@ -127,7 +146,8 @@ impl EventIndex {
             let mut by_tag_p = self.by_tag_p.write();
             for p_tag in event.p_tags() {
                 let event_ref = EventRef::new(event.clone());
-                by_tag_p.entry(p_tag).or_default().insert(event_ref);
+                let p_tag_hash = TagIdHash::from_id(&p_tag);
+                by_tag_p.entry(p_tag_hash).or_default().insert(event_ref);
             }
         }
 
@@ -174,10 +194,11 @@ impl EventIndex {
         // Delete from pubkey index
         {
             let mut by_pubkey = self.by_pubkey.write();
-            if let Some(set) = by_pubkey.get_mut(&event.pubkey) {
+            let pubkey_hash = TagIdHash::from_id(&event.pubkey);
+            if let Some(set) = by_pubkey.get_mut(&pubkey_hash) {
                 set.remove(&dummy_ref);
                 if set.is_empty() {
-                    by_pubkey.remove(&event.pubkey);
+                    by_pubkey.remove(&pubkey_hash);
                 }
             }
         }
@@ -197,10 +218,11 @@ impl EventIndex {
         {
             let mut by_tag_e = self.by_tag_e.write();
             for e_tag in event.e_tags() {
-                if let Some(set) = by_tag_e.get_mut(&e_tag) {
+                let e_tag_hash = TagIdHash::from_id(&e_tag);
+                if let Some(set) = by_tag_e.get_mut(&e_tag_hash) {
                     set.remove(&dummy_ref);
                     if set.is_empty() {
-                        by_tag_e.remove(&e_tag);
+                        by_tag_e.remove(&e_tag_hash);
                     }
                 }
             }
@@ -210,10 +232,11 @@ impl EventIndex {
         {
             let mut by_tag_p = self.by_tag_p.write();
             for p_tag in event.p_tags() {
-                if let Some(set) = by_tag_p.get_mut(&p_tag) {
+                let p_tag_hash = TagIdHash::from_id(&p_tag);
+                if let Some(set) = by_tag_p.get_mut(&p_tag_hash) {
                     set.remove(&dummy_ref);
                     if set.is_empty() {
-                        by_tag_p.remove(&p_tag);
+                        by_tag_p.remove(&p_tag_hash);
                     }
                 }
             }
@@ -277,9 +300,10 @@ impl EventIndex {
 
     /// Query by pubkey, returns events sorted by created_at DESC
     pub fn query_by_pubkey(&self, pubkey: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
+        let pubkey_hash = TagIdHash::from_id(pubkey);
         self.by_pubkey
             .read()
-            .get(pubkey)
+            .get(&pubkey_hash)
             .map(|set| {
                 set.iter()
                     .take(limit)
@@ -310,9 +334,10 @@ impl EventIndex {
         since: u64,
         limit: usize,
     ) -> Vec<Arc<Event>> {
+        let pubkey_hash = TagIdHash::from_id(pubkey);
         self.by_pubkey
             .read()
-            .get(pubkey)
+            .get(&pubkey_hash)
             .map(|set| {
                 set.iter()
                     .filter(|r| r.created_at >= since)
@@ -325,9 +350,10 @@ impl EventIndex {
 
     /// Query by e-tag (events referencing this event ID)
     pub fn query_by_e_tag(&self, event_id: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
+        let e_tag_hash = TagIdHash::from_id(event_id);
         self.by_tag_e
             .read()
-            .get(event_id)
+            .get(&e_tag_hash)
             .map(|set| {
                 set.iter()
                     .take(limit)
@@ -339,9 +365,10 @@ impl EventIndex {
 
     /// Query by p-tag (events mentioning this pubkey)
     pub fn query_by_p_tag(&self, pubkey: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
+        let p_tag_hash = TagIdHash::from_id(pubkey);
         self.by_tag_p
             .read()
-            .get(pubkey)
+            .get(&p_tag_hash)
             .map(|set| {
                 set.iter()
                     .take(limit)
