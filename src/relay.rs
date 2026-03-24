@@ -29,11 +29,27 @@ pub struct Relay {
 
 impl Relay {
     pub fn new(config: Config) -> Self {
-        let store_config = StoreConfig::from_target_ram_percent(config.target_ram_percent);
+        // Create store config with persistence if enabled
+        let store_config = if let Some(ref path) = config.persistence_path {
+            StoreConfig::with_persistence(config.target_ram_percent, path.clone())
+        } else {
+            StoreConfig::from_target_ram_percent(config.target_ram_percent)
+        };
+        
         let events = Arc::new(EventStore::new(store_config));
+        
+        // Load events from disk if persistence is enabled
+        if let Err(e) = events.load_from_disk() {
+            tracing::warn!(error = %e, "failed to load events from disk");
+        }
         
         // Start background eviction task
         events.start_eviction_task();
+        
+        // Start background persistence task if enabled
+        if config.persistence_path.is_some() {
+            events.start_persistence_task(config.persistence_interval);
+        }
         
         let subscriptions = Arc::new(SubscriptionManager::new(events.clone()));
         let (tx, _) = broadcast::channel(BROADCAST_CAP);

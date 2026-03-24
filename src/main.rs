@@ -5,8 +5,8 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(version, about = "memlay - in-memory Nostr relay")]
 struct Cli {
-    /// Path to config file (TOML, YAML, or JSON)
-    #[arg(short, long, default_value = "config.toml")]
+    /// Path to config file (YAML)
+    #[arg(short, long, default_value = "config.yaml")]
     config: String,
 }
 
@@ -42,15 +42,37 @@ async fn main() {
     tracing::debug!("Config: {config:?}");
 
     let relay = Relay::new(config.clone());
+    let events = relay.events.clone();
     let router = relay.router();
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
         .expect("Failed to bind");
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
-    .unwrap();
+    
+    // Graceful shutdown with persistence
+    let shutdown = tokio::signal::ctrl_c();
+    
+    tokio::select! {
+        res = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        ) => {
+            if let Err(e) = res {
+                tracing::error!("Server error: {}", e);
+            }
+        }
+        _ = shutdown => {
+            tracing::info!("Received shutdown signal");
+        }
+    }
+    
+    // Save events to disk on shutdown
+    if let Some(ref path) = config.persistence_path {
+        tracing::info!(path, "Saving events to disk before shutdown...");
+        if let Err(e) = events.save_to_disk() {
+            tracing::error!(error = %e, "Failed to save events to disk");
+        } else {
+            tracing::info!(count = events.len(), "Events saved successfully");
+        }
+    }
 }

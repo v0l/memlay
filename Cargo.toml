@@ -54,6 +54,7 @@ axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 nostr-sdk = "0.44"
 tungstenite = "0.26"
+tempfile = "3"
 
 [[bench]]
 name = "store_bench"

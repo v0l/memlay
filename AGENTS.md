@@ -63,7 +63,7 @@ cargo build --release          # Release build
 
 # Run
 cargo run --release            # Start relay on 0.0.0.0:8080
-cargo run --release -- --config custom.toml
+cargo run --release -- --config custom.yaml
 
 # Test
 cargo test                     # Run all tests
@@ -210,7 +210,7 @@ Run benchmarks after **each individual change**, not after batches of modificati
 ### Adding Configuration Options
 1. Add field to `Config` struct in `config.rs`
 2. Add default function with `#[serde(default = "default_foo")]
-3. Update TOML example in `config.toml`
+3. Update YAML example in `config.yaml`
 4. Add environment variable override (`MEMLAY_FOO`)
 5. Update NIP-11 response if applicable
 6. Document in AGENTS.md
@@ -275,7 +275,7 @@ nostr-cli relay ws://localhost:8080/
 ├── Cargo.toml                   # Dependencies and build config
 ├── README.md                    # User-facing documentation
 ├── TODO.md                      # Feature tracking
-├── config.toml                  # Default configuration
+├── config.yaml                  # Default configuration
 ├── src/
 │   ├── main.rs                  # Binary entry point
 │   ├── lib.rs                   # Library exports
@@ -304,7 +304,7 @@ nostr-cli relay ws://localhost:8080/
 
 ### Build & Run
 ```bash
-cargo build --release && ./target/release/memlay --config config.toml
+cargo build --release && ./target/release/memlay --config config.yaml
 ```
 
 ### Add dependencies

@@ -1,0 +1,25 @@
+# Memlay Configuration
+
+# Server binding address
+bind_addr: "0.0.0.0:8080"
+
+# Target RAM usage as percentage of available system memory (0 = unlimited)
+target_ram_percent: 80
+
+# Maximum bytes for exact memory limit (0 = use target_ram_percent)
+max_bytes: 0
+
+# Maximum concurrent subscriptions per connection
+max_subscriptions: 300
+
+# Maximum value a client may request for `limit` in a filter
+max_limit: 5000
+
+# Event persistence to disk (optional)
+# When set, events are saved to this directory and restored on restart
+# Set to null to disable persistence
+# persistence_path: "/var/lib/memlay/data"
+
+# Background persistence interval in seconds
+# Events are automatically saved to disk at this interval
+# persistence_interval: 60

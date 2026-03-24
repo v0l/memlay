@@ -16,12 +16,18 @@ pub struct Config {
     /// Maximum value a client may request for `limit` in a filter (advertised in NIP-11)
     #[serde(default = "default_max_limit")]
     pub max_limit: usize,
+    /// Enable event persistence to disk (optional path)
+    #[serde(default)]
+    pub persistence_path: Option<String>,
+    /// Background persistence interval in seconds (default: 60)
+    #[serde(default = "default_persistence_interval")]
+    pub persistence_interval: u64,
 }
 
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let cfg = config::Config::builder()
-            .add_source(config::File::with_name(path))
+            .add_source(config::File::with_name(path).format(config::FileFormat::Yaml))
             .add_source(config::Environment::default())
             .build()?;
 
@@ -45,6 +51,10 @@ fn default_max_limit() -> usize {
     5000
 }
 
+fn default_persistence_interval() -> u64 {
+    60
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -53,6 +63,8 @@ impl Default for Config {
             max_bytes: 0,
             max_subscriptions: default_max_subscriptions(),
             max_limit: default_max_limit(),
+            persistence_path: None,
+            persistence_interval: default_persistence_interval(),
         }
     }
 }

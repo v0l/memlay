@@ -298,6 +298,15 @@ impl EventIndex {
         self.by_id.read().len()
     }
 
+    /// Get all events for persistence
+    pub fn iter_all(&self) -> Vec<Arc<Event>> {
+        self.by_id
+            .read()
+            .values()
+            .cloned()
+            .collect()
+    }
+
     /// Query by pubkey, returns events sorted by created_at DESC
     pub fn query_by_pubkey(&self, pubkey: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         let pubkey_hash = TagIdHash::from_id(pubkey);
