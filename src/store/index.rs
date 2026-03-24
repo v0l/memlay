@@ -64,8 +64,7 @@ pub struct EventIndex {
     // Primary index: O(1) lookup by id
     by_id: RwLock<HashMap<[u8; 32], Arc<Event>>>,
 
-    // Secondary indexes: sorted by created_at (via EventRef ordering in BTreeSet)
-    // Using HashMap for O(1) lookups instead of BTreeMap O(log n)
+    // Pubkey index: all events from a pubkey
     by_pubkey: RwLock<HashMap<[u8; 32], BTreeSet<EventRef>>>,
     by_kind: RwLock<HashMap<u32, BTreeSet<EventRef>>>,
 
