@@ -92,8 +92,8 @@
         document.getElementById('stat-bytes').textContent = fmtBytes(used);
       }
       
-      // Capacity percentage (store memory vs limit)
-      document.getElementById('stat-capacity').textContent = fmtCapacity(s.store_bytes, s.max_bytes);
+      // Capacity percentage (process memory vs limit)
+      document.getElementById('stat-capacity').textContent = fmtCapacity(s.process_memory || 0, s.max_bytes);
     } catch (_) {}
   }
 
