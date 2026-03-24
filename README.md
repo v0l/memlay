@@ -11,6 +11,7 @@ High Performance In-Memory Nostr Relay
 - Event indexing by pubkey, kind, and tag references
 - Subscription management with filters (kinds, authors, e-tags, p-tags, since/until)
 - HTTP information endpoint at `/info`
+- Optional disk persistence for events (JSONL format)
 - Integration tests
 
 ## Query Plan Optimization
@@ -36,7 +37,39 @@ cargo build --release
 cargo run --release
 ```
 
-The relay will start on `127.0.0.1:8080` by default.
+The relay will start on `0.0.0.0:8080` by default.
+
+### Configuration
+
+Create a `config.yaml` file:
+
+```yaml
+bind_addr: "0.0.0.0:8080"
+target_ram_percent: 80
+max_bytes: 0
+max_subscriptions: 300
+max_limit: 5000
+```
+
+Or use environment variables:
+
+```bash
+MEMLAY_BIND_ADDR="0.0.0.0:8080" ./target/release/memlay
+```
+
+### Disk Persistence
+
+Enable event persistence to survive restarts:
+
+```yaml
+# Save events to this directory
+persistence_path: "/var/lib/memlay/data"
+
+# Auto-save interval in seconds (default: 60)
+persistence_interval: 60
+```
+
+Events are saved as JSONL (one JSON event per line) with atomic writes for crash safety.
 
 ### HTTP Endpoints
 
