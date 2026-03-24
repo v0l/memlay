@@ -8,6 +8,7 @@ pub mod subscription;
 #[cfg(test)]
 pub mod test_utils {
     pub use super::relay::Relay;
-    pub use super::store::{EventStore, StoreConfig};
+    pub use super::store::{EventStore};
+    pub use super::store::StoreConfig;
     pub use super::subscription::SubscriptionManager;
 }

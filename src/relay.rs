@@ -29,11 +29,12 @@ pub struct Relay {
 
 impl Relay {
     pub fn new(config: Config) -> Self {
-        let store_config = StoreConfig::from_target_ram_percent(
-            config.target_ram_percent,
-            config.max_limit,
-        );
+        let store_config = StoreConfig::from_target_ram_percent(config.target_ram_percent);
         let events = Arc::new(EventStore::new(store_config));
+        
+        // Start background eviction task
+        events.start_eviction_task();
+        
         let subscriptions = Arc::new(SubscriptionManager::new(events.clone()));
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
         Self {

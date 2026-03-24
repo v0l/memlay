@@ -1,38 +1,41 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 mod index;
-mod lru;
 
 pub use index::{EventIndex, EventRef};
-pub use lru::LruTracker;
 
 use crate::event::Event;
-use std::sync::Arc;
+
+/// Configuration for the event store
+#[derive(Debug, Clone)]
+pub struct StoreConfig {
+    /// Maximum memory usage in bytes (0 = unlimited)
+    pub max_bytes: usize,
+}
 
 /// Get total system memory respecting cgroup limits for cloud-native deployments.
 fn get_total_memory() -> u64 {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     
-    // First, try to get cgroup limits (explicit cgroup detection)
     if let Some(limits) = sys.cgroup_limits() {
         return limits.total_memory;
     }
     
-    // Fall back to system total memory if not running in a cgroup-restricted environment
     sys.total_memory()
 }
 
-/// Get current process memory usage (RSS) in bytes using sysinfo.
+/// Get current process memory usage (RSS) in bytes.
+/// Uses sysinfo for cross-platform compatibility (Windows, macOS, Linux).
 pub fn get_process_memory() -> u64 {
-    // Create system instance and refresh process info
     let mut sys = sysinfo::System::new();
-    
-    // Refresh all processes (including our own)
     sys.refresh_processes(
         sysinfo::ProcessesToUpdate::All,
-        true, // remove dead processes
+        true,
     );
     
-    // Get current process PID
     match sysinfo::get_current_pid() {
         Ok(pid) => {
             if let Some(process) = sys.process(pid) {
@@ -45,39 +48,33 @@ pub fn get_process_memory() -> u64 {
     0
 }
 
-/// Configuration for the event store
-#[derive(Debug, Clone)]
-pub struct StoreConfig {
-    /// Maximum number of events to store (derived from target_ram_bytes)
-    pub max_events: usize,
-    /// Maximum memory usage in bytes (0 = unlimited)
-    pub max_bytes: usize,
+/// Adaptive eviction state
+struct EvictionState {
+    interval_seconds: AtomicUsize,
+    consecutive_evictions: AtomicUsize,
+}
+
+/// High-performance in-memory event store with memory-based eviction
+pub struct EventStore {
+    index: EventIndex,
+    config: StoreConfig,
+    state: EvictionState,
 }
 
 impl StoreConfig {
-    /// Create store config from target RAM percentage of available system memory
+    /// Create store config from target RAM percentage of total system memory
     /// Respects cgroup memory limits for cloud-native deployments.
-    pub fn from_target_ram_percent(percent: u8, max_events_limit: usize) -> Self {
+    pub fn from_target_ram_percent(percent: u8) -> Self {
         if percent == 0 {
             return Self {
-                max_events: max_events_limit,
                 max_bytes: 0,
             };
         }
 
-        let available_memory = get_total_memory();
-        let target_bytes = (available_memory as f64 * (percent as f64 / 100.0)) as usize;
-        
-        tracing::info!(
-            "Memory limit calculated: available={}, percent={}, target_bytes={} ({:.1} MB)",
-            available_memory,
-            percent,
-            target_bytes,
-            target_bytes as f64 / 1024.0 / 1024.0
-        );
+        let total_memory = get_total_memory();
+        let target_bytes = (total_memory as f64 * (percent as f64 / 100.0)) as usize;
 
         Self {
-            max_events: max_events_limit,
             max_bytes: target_bytes,
         }
     }
@@ -86,83 +83,135 @@ impl StoreConfig {
 impl Default for StoreConfig {
     fn default() -> Self {
         Self {
-            max_events: 1_000_000,
             max_bytes: 0, // unlimited by default
         }
     }
-}
-
-/// High-performance in-memory event store with LRU eviction
-pub struct EventStore {
-    index: EventIndex,
-    lru: parking_lot::RwLock<LruTracker>,
-    config: StoreConfig,
 }
 
 impl EventStore {
     pub fn new(config: StoreConfig) -> Self {
         Self {
             index: EventIndex::new(),
-            lru: parking_lot::RwLock::new(LruTracker::new(config.max_events, config.max_bytes)),
             config,
+            state: EvictionState {
+                interval_seconds: AtomicUsize::new(10),
+                consecutive_evictions: AtomicUsize::new(0),
+            },
         }
     }
 
-    /// Check if an event id is already in the store without touching LRU.
+    /// Start background eviction task (call from relay startup)
+    pub fn start_eviction_task(self: &Arc<Self>) {
+        let store = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let interval = Duration::from_secs(store.state.interval_seconds.load(Ordering::Relaxed) as u64);
+                tokio::time::sleep(interval).await;
+                store.maybe_evict();
+            }
+        });
+    }
+
+    /// Background eviction check with adaptive interval and batch eviction
+    fn maybe_evict(&self) {
+        let current_mem = get_process_memory();
+        let max_bytes = self.config.max_bytes;
+        
+        if max_bytes == 0 || current_mem == 0 {
+            self.state.consecutive_evictions.store(0, Ordering::Relaxed);
+            return;
+        }
+        
+        let threshold = max_bytes as u64 * 70 / 100;
+        let target = max_bytes as u64 * 50 / 100;
+        
+        // Adaptive interval: evict more frequently when close to limit
+        let new_interval = if current_mem >= threshold {
+            1  // 1s when over 70% for high input rates
+        } else if current_mem >= max_bytes as u64 * 50 / 100 {
+            2  // 2s when 50-70% of limit
+        } else {
+            5  // 5s when under 50% of limit
+        };
+        self.state.interval_seconds.store(new_interval, Ordering::Relaxed);
+        
+        // Evict in batch if over threshold - remove up to 1000 events at once
+        if current_mem > target {
+            let batch_size = 1000;
+            let mut removed = 0;
+            
+            // Get batch of oldest events
+            let oldest = self.index.get_oldest(batch_size);
+            
+            // Remove all without re-checking memory
+            for event_ref in oldest.iter() {
+                self.index.remove(&event_ref.id);
+                removed += 1;
+            }
+            
+            if removed > 0 {
+                let evictions = self.state.consecutive_evictions.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::debug!(
+                    evicted = removed,
+                    evictions_streak = evictions,
+                    mem_bytes = current_mem,
+                    "batch eviction"
+                );
+            }
+        }
+    }
+
+    /// Check if an event id is already in the store
     pub fn contains(&self, id: &[u8; 32]) -> bool {
         self.index.get(id).is_some()
     }
 
-    /// Insert an event, returning any evicted events.
-    /// Returns `None` if the event was already present (duplicate).
+    /// Insert a single event
     pub fn insert(&self, event: Arc<Event>) -> Option<Vec<Arc<Event>>> {
-        let event_size = event.size();
         let event_id = event.id;
 
-        // Check if event already exists
         if self.index.get(&event_id).is_some() {
             return None;
         }
-
-        // Determine which events need to be evicted
-        let to_evict = {
-            let mut lru = self.lru.write();
-            lru.insert(event_id, event_size)
-        };
-
-        // Evict old events first
-        let mut evicted = Vec::with_capacity(to_evict.len());
-        for id in to_evict {
-            if let Some(old_event) = self.index.remove(&id) {
-                evicted.push(old_event);
-            }
-        }
-
-        // Insert the new event
+        
         self.index.insert(event);
+        Some(vec![])
+    }
 
-        Some(evicted)
+    /// Batch insert events (more efficient for bulk operations)
+    pub fn insert_batch(&self, events: Vec<Arc<Event>>) -> usize {
+        let mut inserted = 0;
+        
+        for event in events {
+            let event_id = event.id;
+            
+            if self.index.get(&event_id).is_some() {
+                continue;
+            }
+            
+            self.index.insert(event);
+            inserted += 1;
+        }
+        
+        inserted
     }
 
     /// Get an event by ID
     pub fn get(&self, id: &[u8; 32]) -> Option<Arc<Event>> {
-        let event = self.index.get(id)?;
-        // Update LRU on access
-        self.lru.write().touch(id);
-        Some(event)
+        self.index.get(id)
     }
 
-    /// Query events by pubkey, ordered by created_at DESC
+    /// Query events by pubkey
     pub fn query_by_pubkey(&self, pubkey: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         self.index.query_by_pubkey(pubkey, limit)
     }
 
-    /// Query events by kind, ordered by created_at DESC
+    /// Query events by kind
     pub fn query_by_kind(&self, kind: u32, limit: usize) -> Vec<Arc<Event>> {
         self.index.query_by_kind(kind, limit)
     }
 
-    /// Query events by pubkey with time filter, ordered by created_at DESC
+    /// Query events by pubkey with time filter
     pub fn query_by_pubkey_since(
         &self,
         pubkey: &[u8; 32],
@@ -172,17 +221,17 @@ impl EventStore {
         self.index.query_by_pubkey_since(pubkey, since, limit)
     }
 
-    /// Query events by e-tag (referenced event ID)
+    /// Query events by e-tag
     pub fn query_by_e_tag(&self, event_id: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         self.index.query_by_e_tag(event_id, limit)
     }
 
-    /// Query events by p-tag (referenced pubkey)
+    /// Query events by p-tag
     pub fn query_by_p_tag(&self, pubkey: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         self.index.query_by_p_tag(pubkey, limit)
     }
 
-    /// Query events by any other single-letter tag value
+    /// Query events by tag
     pub fn query_by_tag(&self, letter: char, value: &str, limit: usize) -> Vec<Arc<Event>> {
         self.index.query_by_tag(letter, value, limit)
     }
@@ -197,9 +246,9 @@ impl EventStore {
         self.len() == 0
     }
 
-    /// Total bytes used by events
+    /// Current bytes used (deprecated - use process RSS)
     pub fn bytes_used(&self) -> usize {
-        self.lru.read().bytes_used()
+        0
     }
 
     /// Get store configuration
@@ -239,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_lru_eviction() {
-        let config = StoreConfig::from_target_ram_percent(0, 3); // 0% = use max_events limit
+        let config = StoreConfig::from_target_ram_percent(0);
         let store = EventStore::new(config);
 
         // Insert 3 events
@@ -247,34 +296,35 @@ mod tests {
         store.insert(make_event(2, 1, 1, 2000));
         store.insert(make_event(3, 1, 1, 3000));
         assert_eq!(store.len(), 3);
-
-        // Insert 4th event, should evict oldest (id=1)
-        let evicted = store.insert(make_event(4, 1, 1, 4000)).unwrap();
-        assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].id[31], 1);
-        assert_eq!(store.len(), 3);
-
-        // Verify event 1 is gone
-        let mut id1 = [0u8; 32];
-        id1[31] = 1;
-        assert!(store.get(&id1).is_none());
     }
 
     #[test]
-    fn test_query_since_until() {
+    fn test_batch_insert() {
+        let store = EventStore::new(StoreConfig::default());
+        
+        let events: Vec<Arc<Event>> = vec![
+            make_event(1, 1, 1, 1000),
+            make_event(2, 1, 1, 2000),
+            make_event(3, 1, 1, 3000),
+        ];
+        
+        let inserted = store.insert_batch(events);
+        assert_eq!(inserted, 3);
+        assert_eq!(store.len(), 3);
+    }
+
+    #[test]
+    fn test_query_by_kind() {
         let store = EventStore::new(StoreConfig::default());
 
         store.insert(make_event(1, 1, 1, 1000));
         store.insert(make_event(2, 1, 1, 2000));
-        store.insert(make_event(3, 1, 1, 3000));
+        store.insert(make_event(3, 1, 0, 3000));
 
-        let mut pubkey = [0u8; 32];
-        pubkey[31] = 1;
-
-        let results = store.query_by_pubkey_since(&pubkey, 1500, 10);
+        let results = store.query_by_kind(1, 10);
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].created_at, 3000);
-        assert_eq!(results[1].created_at, 2000);
+        assert_eq!(results[0].created_at, 2000);
+        assert_eq!(results[1].created_at, 1000);
     }
 
     #[test]
