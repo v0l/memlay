@@ -58,17 +58,14 @@ impl Relay {
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
         let connection_count = Arc::new(AtomicUsize::new(0));
         
-        // Start periodic rate updates if metrics are enabled
-        if config.prometheus_url.is_some() {
-            let conn_count = connection_count.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    crate::metrics::ACTIVE_CONNECTIONS.set(conn_count.load(Ordering::Relaxed) as f64);
-                    crate::metrics::update_rates();
-                }
-            });
-        }
+        // Always start metrics collection for active connections
+        let conn_count = connection_count.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                crate::metrics::ACTIVE_CONNECTIONS.set(conn_count.load(Ordering::Relaxed) as f64);
+            }
+        });
         
         Self {
             events,
@@ -86,9 +83,6 @@ impl Relay {
 
         let events_for_stats = self.events.clone();
         let connection_count = self.connection_count.clone();
-        
-        // Check if metrics endpoint should be added before moving config
-        let prometheus_url = config.prometheus_url.clone();
         
         let mut router = Router::new()
             .route(
@@ -135,19 +129,27 @@ impl Relay {
                 ),
             );
         
-        // Add metrics endpoint if prometheus_url is configured
-        if let Some(prom_url) = prometheus_url {
-            router = router.route(
-                "/metrics",
-                get(move || metrics_handler(prom_url.clone())),
-            );
-        }
+        // Add metrics endpoint
+        router = router.route(
+            "/metrics",
+            get(metrics_handler),
+        );
         
         router
     }
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
+
+async fn metrics_handler() -> impl IntoResponse {
+    let metrics = crate::metrics::gather_metrics();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    (headers, metrics)
+}
 
 fn stats_handler(events: Arc<crate::store::EventStore>) -> impl IntoResponse {
     let cfg = events.config();
@@ -194,22 +196,18 @@ fn nip11_handler(config: &Config) -> impl IntoResponse {
     (headers, axum::Json(body)).into_response()
 }
 
-fn landing_page(config: &Config) -> impl IntoResponse {
+fn landing_page(_config: &Config) -> impl IntoResponse {
     let mut html = include_str!("index.html")
         .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
     
-    // Add metrics section if prometheus_url is configured
-    let metrics_section = if config.prometheus_url.is_some() {
-        r#"<section>
+    // Always show metrics section since /metrics is always available
+    let metrics_section = r#"<section>
     <h2>Metrics</h2>
     <div class="row">
       <span>Graphs</span>
       <a href="/metrics" target="_blank">View Prometheus Metrics</a>
     </div>
-  </section>"#
-    } else {
-        ""
-    };
+  </section>"#;
     html = html.replace("{{METRICS_SECTION}}", metrics_section);
     
     let mut headers = HeaderMap::new();
@@ -222,44 +220,6 @@ fn landing_page(config: &Config) -> impl IntoResponse {
         HeaderValue::from_static("no-cache, no-store, must-revalidate"),
     );
     (headers, html)
-}
-
-// ── Metrics handler ───────────────────────────────────────────────────────────
-
-async fn metrics_handler(prometheus_url: String) -> impl IntoResponse {
-    // Proxy request to Prometheus server
-    let client = reqwest::Client::new();
-    
-    match client.get(&prometheus_url).send().await {
-        Ok(response) => {
-            match response.status() {
-                reqwest::StatusCode::OK => {
-                    match response.text().await {
-                        Ok(body) => {
-                            let mut headers = HeaderMap::new();
-                            headers.insert(
-                                "Content-Type",
-                                HeaderValue::from_static("text/plain; version=0.0.4"),
-                            );
-                            (headers, body).into_response()
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to read metrics response: {}", e);
-                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to read metrics").into_response()
-                        }
-                    }
-                }
-                status => {
-                    tracing::warn!("Prometheus server returned: {}", status);
-                    (status, "Prometheus server error").into_response()
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("Failed to connect to Prometheus server: {}", e);
-            (axum::http::StatusCode::BAD_GATEWAY, "Failed to connect to Prometheus").into_response()
-        }
-    }
 }
 
 // ── WebSocket connection handler ──────────────────────────────────────────────
