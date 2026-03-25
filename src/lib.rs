@@ -1,6 +1,7 @@
 pub mod config;
 pub mod event;
 pub mod message;
+pub mod metrics;
 pub mod relay;
 pub mod store;
 pub mod subscription;

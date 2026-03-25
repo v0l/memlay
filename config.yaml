@@ -23,3 +23,8 @@ max_limit: 5000
 # Background persistence interval in seconds
 # Events are automatically saved to disk at this interval
 # persistence_interval: 60
+
+# Prometheus server URL for metrics proxy (optional)
+# When set, /metrics endpoint will proxy requests to this Prometheus server
+# The landing page will also show a link to view metrics
+# prometheus_url: "http://localhost:9090/api/v1/query?query=up"
