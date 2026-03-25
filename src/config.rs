@@ -22,6 +22,10 @@ pub struct Config {
     /// Background persistence interval in seconds (default: 60)
     #[serde(default = "default_persistence_interval")]
     pub persistence_interval: u64,
+    /// Prometheus server URL to proxy metrics requests (optional)
+    /// When set, /metrics endpoint will proxy to this server
+    #[serde(default)]
+    pub prometheus_url: Option<String>,
 }
 
 impl Config {
@@ -65,6 +69,7 @@ impl Default for Config {
             max_limit: default_max_limit(),
             persistence_path: None,
             persistence_interval: default_persistence_interval(),
+            prometheus_url: None,
         }
     }
 }

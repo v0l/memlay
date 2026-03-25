@@ -15,6 +15,7 @@ use axum::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Capacity of the relay-wide new-event broadcast channel.
 const BROADCAST_CAP: usize = 8192;
@@ -25,6 +26,8 @@ pub struct Relay {
     /// Sender side of the relay-wide broadcast for newly accepted events.
     tx: broadcast::Sender<Arc<crate::event::Event>>,
     config: Config,
+    /// Count of active WebSocket connections
+    connection_count: Arc<AtomicUsize>,
 }
 
 impl Relay {
@@ -53,11 +56,26 @@ impl Relay {
         
         let subscriptions = Arc::new(SubscriptionManager::new(events.clone()));
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
+        let connection_count = Arc::new(AtomicUsize::new(0));
+        
+        // Start periodic rate updates if metrics are enabled
+        if config.prometheus_url.is_some() {
+            let conn_count = connection_count.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    crate::metrics::ACTIVE_CONNECTIONS.set(conn_count.load(Ordering::Relaxed) as f64);
+                    crate::metrics::update_rates();
+                }
+            });
+        }
+        
         Self {
             events,
             subscriptions,
             tx,
             config,
+            connection_count,
         }
     }
 
@@ -67,7 +85,12 @@ impl Relay {
         let config = self.config.clone();
 
         let events_for_stats = self.events.clone();
-        Router::new()
+        let connection_count = self.connection_count.clone();
+        
+        // Check if metrics endpoint should be added before moving config
+        let prometheus_url = config.prometheus_url.clone();
+        
+        let mut router = Router::new()
             .route(
                 "/stats",
                 get(move || {
@@ -84,6 +107,7 @@ impl Relay {
                         let subscriptions = subscriptions.clone();
                         let tx = tx.clone();
                         let config = config.clone();
+                        let conn_count = connection_count.clone();
                         async move {
                             let wants_info = headers
                                 .get("accept")
@@ -101,15 +125,25 @@ impl Relay {
                                         tracing::warn!(%addr, "WebSocket upgrade failed: {}", err);
                                     })
                                     .on_upgrade(move |socket| {
-                                        handle_socket(socket, addr, subscriptions, tx)
+                                        handle_socket(socket, addr, subscriptions, tx, conn_count)
                                     })
                                     .into_response(),
-                                None => landing_page().into_response(),
+                                None => landing_page(&config).into_response(),
                             }
                         }
                     },
                 ),
-            )
+            );
+        
+        // Add metrics endpoint if prometheus_url is configured
+        if let Some(prom_url) = prometheus_url {
+            router = router.route(
+                "/metrics",
+                get(move || metrics_handler(prom_url.clone())),
+            );
+        }
+        
+        router
     }
 }
 
@@ -160,8 +194,24 @@ fn nip11_handler(config: &Config) -> impl IntoResponse {
     (headers, axum::Json(body)).into_response()
 }
 
-fn landing_page() -> impl IntoResponse {
-    let html = include_str!("index.html").replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
+fn landing_page(config: &Config) -> impl IntoResponse {
+    let mut html = include_str!("index.html")
+        .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
+    
+    // Add metrics section if prometheus_url is configured
+    let metrics_section = if config.prometheus_url.is_some() {
+        r#"<section>
+    <h2>Metrics</h2>
+    <div class="row">
+      <span>Graphs</span>
+      <a href="/metrics" target="_blank">View Prometheus Metrics</a>
+    </div>
+  </section>"#
+    } else {
+        ""
+    };
+    html = html.replace("{{METRICS_SECTION}}", metrics_section);
+    
     let mut headers = HeaderMap::new();
     headers.insert(
         "Content-Type",
@@ -174,6 +224,44 @@ fn landing_page() -> impl IntoResponse {
     (headers, html)
 }
 
+// ── Metrics handler ───────────────────────────────────────────────────────────
+
+async fn metrics_handler(prometheus_url: String) -> impl IntoResponse {
+    // Proxy request to Prometheus server
+    let client = reqwest::Client::new();
+    
+    match client.get(&prometheus_url).send().await {
+        Ok(response) => {
+            match response.status() {
+                reqwest::StatusCode::OK => {
+                    match response.text().await {
+                        Ok(body) => {
+                            let mut headers = HeaderMap::new();
+                            headers.insert(
+                                "Content-Type",
+                                HeaderValue::from_static("text/plain; version=0.0.4"),
+                            );
+                            (headers, body).into_response()
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to read metrics response: {}", e);
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to read metrics").into_response()
+                        }
+                    }
+                }
+                status => {
+                    tracing::warn!("Prometheus server returned: {}", status);
+                    (status, "Prometheus server error").into_response()
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to connect to Prometheus server: {}", e);
+            (axum::http::StatusCode::BAD_GATEWAY, "Failed to connect to Prometheus").into_response()
+        }
+    }
+}
+
 // ── WebSocket connection handler ──────────────────────────────────────────────
 
 async fn handle_socket(
@@ -181,7 +269,12 @@ async fn handle_socket(
     addr: SocketAddr,
     subscriptions: Arc<SubscriptionManager>,
     tx: broadcast::Sender<Arc<crate::event::Event>>,
+    connection_count: Arc<AtomicUsize>,
 ) {
+    // Increment connection count
+    connection_count.fetch_add(1, Ordering::Relaxed);
+    crate::metrics::ACTIVE_CONNECTIONS.inc();
+    
     tracing::info!(%addr, "client connected");
 
     // Per-connection subscription state: sub_id → filters
@@ -236,6 +329,8 @@ async fn handle_socket(
                                     {
                                         return;
                                     }
+                                    // Track events output
+                                    crate::metrics::inc_events_output();
                                     break; // only send once per subscription even if multiple filters match
                                 }
                             }
@@ -254,6 +349,11 @@ async fn handle_socket(
     for sub_id in conn_subs.keys() {
         subscriptions.remove_subscription(sub_id);
     }
+    
+    // Decrement connection count
+    connection_count.fetch_sub(1, Ordering::Relaxed);
+    crate::metrics::ACTIVE_CONNECTIONS.dec();
+    
     tracing::info!(%addr, "client disconnected");
 }
 
@@ -316,6 +416,9 @@ async fn handle_text(
         }
 
         Ok(NostrMessage::Request { id, filters }) => {
+            // Track subscription start time for TTEOSE metric
+            let sub_start = std::time::Instant::now();
+            
             // Register subscription
             subscriptions.add_subscription(Subscription {
                 id: id.clone(),
@@ -338,8 +441,13 @@ async fn handle_text(
                     {
                         return;
                     }
+                    // Track events output
+                    crate::metrics::inc_events_output();
                 }
             }
+
+            // Record TTEOSE (Time To End Of Stored Events)
+            crate::metrics::observe_tteose(sub_start.elapsed());
 
             let eose = NostrMessage::EndOfStoredEvents { id };
             let _ = socket

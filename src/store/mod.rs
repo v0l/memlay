@@ -217,6 +217,7 @@ impl EventStore {
     /// - Stored: event was stored, with any replaced events (for replaceable events)
     pub fn insert(&self, event: Arc<Event>) -> InsertResult {
         let event_id = event.id;
+        let start = std::time::Instant::now();
 
         // Ephemeral events should never be stored
         if event.is_ephemeral() {
@@ -230,6 +231,10 @@ impl EventStore {
         
         // Insert and get replaced events (for replaceable events)
         let replaced = self.index.insert(event.clone());
+        
+        // Record write delay metric
+        crate::metrics::observe_write_delay(start.elapsed());
+        crate::metrics::inc_events_saved();
         
         InsertResult::Stored {
             event,
@@ -335,6 +340,7 @@ impl EventStore {
             return Ok(());
         };
 
+        let start = std::time::Instant::now();
         let data_dir = Path::new(path);
         
         // Create data directory if it doesn't exist
@@ -362,6 +368,9 @@ impl EventStore {
 
         // Atomic rename
         fs::rename(&temp_file, &events_file)?;
+
+        // Record disk persistence time metric
+        crate::metrics::observe_disk_persistence(start.elapsed());
 
         tracing::info!(path = %events_file.display(), count, "saved events to disk");
         Ok(())
