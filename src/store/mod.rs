@@ -6,8 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod index;
+mod wal;
 
 pub use index::{EventIndex, EventRef};
+pub use wal::{WalOp, WriteAheadLog};
 
 use crate::event::Event;
 
@@ -17,8 +19,12 @@ pub struct StoreConfig {
     /// Maximum memory usage in bytes (0 = unlimited)
     pub max_bytes: usize,
     /// Path to persist events to disk (None = disabled)
-    /// Events are saved as JSONL (one JSON event per line)
+    /// With WAL enabled, operations are appended incrementally
+    /// Without WAL, full snapshots are written periodically
     pub persistence_path: Option<String>,
+    /// Enable Write-Ahead Logging (default: true)
+    /// When enabled, only changes are written to disk instead of full snapshots
+    pub use_wal: bool,
 }
 
 /// Get total system memory respecting cgroup limits for cloud-native deployments.
@@ -81,6 +87,7 @@ pub struct EventStore {
     index: EventIndex,
     config: StoreConfig,
     state: EvictionState,
+    wal: Option<Arc<WriteAheadLog>>,
 }
 
 impl StoreConfig {
@@ -91,6 +98,7 @@ impl StoreConfig {
             return Self {
                 max_bytes: 0,
                 persistence_path: None,
+                use_wal: true,
             };
         }
 
@@ -100,6 +108,7 @@ impl StoreConfig {
         Self {
             max_bytes: target_bytes,
             persistence_path: None,
+            use_wal: true,
         }
     }
 
@@ -109,6 +118,7 @@ impl StoreConfig {
             return Self {
                 max_bytes: 0,
                 persistence_path: Some(path),
+                use_wal: true,
             };
         }
 
@@ -118,6 +128,7 @@ impl StoreConfig {
         Self {
             max_bytes: target_bytes,
             persistence_path: Some(path),
+            use_wal: true,
         }
     }
 }
@@ -127,12 +138,26 @@ impl Default for StoreConfig {
         Self {
             max_bytes: 0, // unlimited by default
             persistence_path: None,
+            use_wal: true, // WAL enabled by default
         }
     }
 }
 
 impl EventStore {
     pub fn new(config: StoreConfig) -> Self {
+        // Initialize WAL if persistence is enabled and WAL is requested
+        let wal = if config.persistence_path.is_some() && config.use_wal {
+            match WriteAheadLog::open(config.persistence_path.as_ref().unwrap()) {
+                Ok(wal) => Some(Arc::new(wal)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to open WAL, disabling WAL");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             index: EventIndex::new(),
             config,
@@ -140,6 +165,7 @@ impl EventStore {
                 interval_seconds: AtomicUsize::new(10),
                 consecutive_evictions: AtomicUsize::new(0),
             },
+            wal,
         }
     }
 
@@ -229,8 +255,22 @@ impl EventStore {
             return InsertResult::Duplicate;
         }
         
-        // Insert and get replaced events (for replaceable events)
+        // Insert the event and get replaced events (for replaceable events)
         let replaced = self.index.insert(event.clone());
+        
+        // Write to WAL if available
+        if let Some(ref wal) = self.wal {
+            if let Err(e) = wal.insert(&event) {
+                tracing::error!(error = %e, "failed to write insert to WAL");
+            }
+            
+            // If this event replaced another, write delete for the old one
+            if let Some(replaced_event) = &replaced {
+                if let Err(e) = wal.delete(&replaced_event.id) {
+                    tracing::error!(error = %e, "failed to write delete to WAL");
+                }
+            }
+        }
         
         // Record write delay metric
         crate::metrics::observe_write_delay(start.elapsed());
@@ -265,6 +305,19 @@ impl EventStore {
             
             let old = self.index.insert(event.clone());
             inserted += 1;
+            
+            // Write to WAL if available
+            if let Some(ref wal) = self.wal {
+                if let Err(e) = wal.insert(&event) {
+                    tracing::error!(error = %e, "failed to write batch insert to WAL");
+                }
+                
+                if let Some(old_event) = &old {
+                    if let Err(e) = wal.delete(&old_event.id) {
+                        tracing::error!(error = %e, "failed to write batch delete to WAL");
+                    }
+                }
+            }
             
             if let Some(old_event) = old {
                 replaced.push(old_event);
@@ -334,7 +387,10 @@ impl EventStore {
         &self.config
     }
 
-    /// Save all events to disk
+    /// Save all events to disk (checkpoint with WAL)
+    /// 
+    /// With WAL enabled: creates a snapshot and truncates the WAL
+    /// Without WAL: writes all events to the snapshot file
     pub fn save_to_disk(&self) -> anyhow::Result<()> {
         let Some(ref path) = self.config.persistence_path else {
             return Ok(());
@@ -369,6 +425,15 @@ impl EventStore {
         // Atomic rename
         fs::rename(&temp_file, &events_file)?;
 
+        // If WAL is enabled, truncate it after checkpoint
+        if let Some(ref wal) = self.wal {
+            if let Err(e) = wal.truncate() {
+                tracing::warn!(error = %e, "failed to truncate WAL after checkpoint");
+            } else {
+                tracing::debug!("WAL truncated after checkpoint");
+            }
+        }
+
         // Record disk persistence time metric
         crate::metrics::observe_disk_persistence(start.elapsed());
 
@@ -376,7 +441,7 @@ impl EventStore {
         Ok(())
     }
 
-    /// Load events from disk
+    /// Load events from disk (snapshot + WAL replay)
     pub fn load_from_disk(&self) -> anyhow::Result<usize> {
         let Some(ref path) = self.config.persistence_path else {
             return Ok(0);
@@ -384,43 +449,88 @@ impl EventStore {
 
         let data_dir = Path::new(path);
         let events_file = data_dir.join("events.jsonl");
+        let mut total_count = 0;
 
-        if !events_file.exists() {
-            tracing::debug!(path = %events_file.display(), "no events file found");
-            return Ok(0);
-        }
+        // Load snapshot if it exists
+        if events_file.exists() {
+            let file = File::open(&events_file)?;
+            let reader = BufReader::new(file);
 
-        let file = File::open(&events_file)?;
-        let reader = BufReader::new(file);
+            let mut snapshot_count = 0;
+            let mut errors = 0;
 
-        let mut count = 0;
-        let mut errors = 0;
+            for line_result in reader.lines() {
+                let line = line_result?;
+                if line.trim().is_empty() {
+                    continue;
+                }
 
-        for line_result in reader.lines() {
-            let line = line_result?;
-            if line.trim().is_empty() {
-                continue;
+                match Event::from_json(line.as_bytes()) {
+                    Ok(event) => {
+                        let event = Arc::new(event);
+                        self.index.insert(event);
+                        snapshot_count += 1;
+                    }
+                    Err(e) => {
+                        errors += 1;
+                        tracing::warn!(error = %e, "failed to parse event from snapshot");
+                    }
+                }
             }
 
-            match Event::from_json(line.as_bytes()) {
-                Ok(event) => {
-                    let event = Arc::new(event);
-                    self.index.insert(event);
-                    count += 1;
+            total_count += snapshot_count;
+
+            if errors > 0 {
+                tracing::warn!(errors, "some events failed to load from snapshot");
+            }
+
+            tracing::info!(path = %events_file.display(), loaded = snapshot_count, errors, "loaded snapshot from disk");
+        } else {
+            tracing::debug!(path = %events_file.display(), "no snapshot file found");
+        }
+
+        // Replay WAL if available
+        if let Some(ref wal) = self.wal {
+            let wal_path = wal.path();
+            let mut wal_count = 0;
+            let mut errors = 0;
+
+            match wal.replay(|op| {
+                match op {
+                    WalOp::Insert(data) => {
+                        match Event::from_json(&data) {
+                            Ok(event) => {
+                                self.index.insert(Arc::new(event));
+                                wal_count += 1;
+                            }
+                            Err(e) => {
+                                errors += 1;
+                                tracing::warn!(error = %e, "failed to parse event from WAL");
+                            }
+                        }
+                    }
+                    WalOp::Delete(id) => {
+                        // Remove event from index
+                        self.index.remove(&id);
+                        wal_count += 1;
+                    }
+                }
+            }) {
+                Ok(_) => {
+                    if wal_count > 0 {
+                        tracing::info!(path = wal_path, replayed = wal_count, errors, "replayed WAL operations");
+                    }
                 }
                 Err(e) => {
-                    errors += 1;
-                    tracing::warn!(error = %e, "failed to parse event from disk");
+                    tracing::error!(error = %e, "failed to replay WAL");
                 }
             }
+            
+            total_count += wal_count;
         }
 
-        if errors > 0 {
-            tracing::warn!(errors, "some events failed to load from disk");
-        }
-
-        tracing::info!(path = %events_file.display(), loaded = count, errors, "loaded events from disk");
-        Ok(count)
+        tracing::info!(total = total_count, "total events loaded from disk");
+        Ok(total_count)
     }
 
     /// Start background persistence task (call from relay startup)
