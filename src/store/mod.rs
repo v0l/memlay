@@ -562,10 +562,10 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{EventBuilder, Tag};
+    use crate::event::EventBuilder;
     use tempfile::TempDir;
 
-    fn make_event(id: u8, pubkey: u8, kind: u32, created_at: u64) -> Arc<Event> {
+    fn make_event(_id: u8, pubkey: u8, kind: u32, created_at: u64) -> Arc<Event> {
         Arc::new(EventBuilder::new()
             .pubkey(set_byte([0u8; 32], pubkey))
             .kind(kind)
@@ -575,7 +575,7 @@ mod tests {
     }
 
     fn make_event_with_d_tag(
-        id: u8,
+        _id: u8,
         pubkey: u8,
         kind: u32,
         created_at: u64,
@@ -715,7 +715,6 @@ mod tests {
         let store = EventStore::new(StoreConfig::default());
         
         let event = make_event(1, 1, 1, 1000);
-        let event_id = event.id;
         
         store.insert(event.clone());
         assert_eq!(store.len(), 1);
@@ -810,5 +809,205 @@ mod tests {
         // Should return Ok(0) when no file exists
         let loaded = store.load_from_disk().unwrap();
         assert_eq!(loaded, 0);
+    }
+
+    #[test]
+    fn test_wal_checkpoint_replay_integration() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        
+        // Phase 1: Create store, insert events, and checkpoint
+        let config = StoreConfig::with_persistence(0, path.clone());
+        let store = EventStore::new(config);
+        
+        let event1 = make_event(1, 1, 1, 1000);
+        let event1_id = event1.id;
+        let event2 = make_event(2, 1, 1, 2000);
+        let event2_id = event2.id;
+        
+        store.insert(event1.clone());
+        store.insert(event2.clone());
+        assert_eq!(store.len(), 2);
+        
+        // Checkpoint (snapshot + WAL truncate)
+        store.save_to_disk().unwrap();
+        
+        // Verify snapshot exists
+        let events_file = std::path::Path::new(&path).join("events.jsonl");
+        assert!(events_file.exists());
+        
+        // Verify WAL was truncated
+        let wal_file = std::path::Path::new(&path).join("wal.log");
+        let wal_size_before = wal_file.metadata().map(|m| m.len()).unwrap_or(0);
+        assert_eq!(wal_size_before, 0, "WAL should be empty after checkpoint");
+        
+        // Phase 2: Add more events (goes to WAL only)
+        let event3 = make_event(3, 1, 1, 3000);
+        let event3_id = event3.id;
+        store.insert(event3.clone());
+        assert_eq!(store.len(), 3);
+        
+        // Verify WAL has content
+        let wal_size_after = wal_file.metadata().map(|m| m.len()).unwrap_or(0);
+        assert!(wal_size_after > 0, "WAL should have content after insert");
+        
+        // Phase 3: Create new store instance and load from disk
+        // This should load snapshot + replay WAL
+        // Use from_json_unchecked for test events that don't have valid signatures
+        let config2 = StoreConfig::with_persistence(0, path.clone());
+        let store2 = EventStore::new(config2);
+        
+        // Load snapshot using unchecked parse (test events don't have valid signatures)
+        if events_file.exists() {
+            let file = std::fs::File::open(&events_file).unwrap();
+            let reader = std::io::BufReader::new(file);
+            for line_result in reader.lines() {
+                let line = line_result.unwrap();
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let event = Event::from_json_unchecked(line.as_bytes()).unwrap();
+                store2.index.insert(Arc::new(event));
+            }
+        }
+        
+        // Replay WAL using unchecked parse
+        if let Some(ref wal) = store2.wal {
+            wal.replay(|op| {
+                if let WalOp::Insert(data) = op {
+                    let event = Event::from_json_unchecked(&data).unwrap();
+                    store2.index.insert(Arc::new(event));
+                }
+            }).unwrap();
+        }
+        
+        assert_eq!(store2.len(), 3, "Should have loaded 3 events");
+        
+        // Verify all events are present
+        assert!(store2.get(&event1_id).is_some());
+        assert!(store2.get(&event2_id).is_some());
+        assert!(store2.get(&event3_id).is_some());
+    }
+
+    #[test]
+    fn test_wal_delete_replay() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        
+        // Phase 1: Create store, insert events, and checkpoint
+        let config = StoreConfig::with_persistence(0, path.clone());
+        let store = EventStore::new(config);
+        
+        let event1 = make_event(1, 1, 1, 1000);
+        let event1_id = event1.id;
+        let event2 = make_event(2, 1, 1, 2000);
+        let event2_id = event2.id;
+        
+        store.insert(event1.clone());
+        store.insert(event2.clone());
+        assert_eq!(store.len(), 2);
+        
+        // Checkpoint
+        store.save_to_disk().unwrap();
+        
+        // Phase 2: Delete event1 from WAL (simulate delete operation)
+        if let Some(ref wal) = store.wal {
+            wal.delete(&event1_id).unwrap();
+        }
+        
+        // Phase 3: Create new store instance and load
+        let config2 = StoreConfig::with_persistence(0, path.clone());
+        let store2 = EventStore::new(config2);
+        
+        // Load snapshot using unchecked parse (test events don't have valid signatures)
+        let events_file = std::path::Path::new(&path).join("events.jsonl");
+        if events_file.exists() {
+            let file = std::fs::File::open(&events_file).unwrap();
+            let reader = std::io::BufReader::new(file);
+            for line_result in reader.lines() {
+                let line = line_result.unwrap();
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let event = Event::from_json_unchecked(line.as_bytes()).unwrap();
+                store2.index.insert(Arc::new(event));
+            }
+        }
+        
+        // Replay WAL to process delete
+        if let Some(ref wal) = store2.wal {
+            wal.replay(|op| {
+                if let WalOp::Delete(id) = op {
+                    store2.index.remove(&id);
+                }
+            }).unwrap();
+        }
+        
+        assert_eq!(store2.len(), 1, "Should have loaded 1 event after delete replay");
+        
+        // Event1 should be gone (deleted via WAL replay)
+        assert!(store2.get(&event1_id).is_none());
+        // Event2 should still be there
+        assert!(store2.get(&event2_id).is_some());
+    }
+
+    #[test]
+    fn test_wal_truncation_after_checkpoint() {
+        use crate::store::WriteAheadLog;
+        use crate::event::EventBuilder;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        
+        // Create WAL and add some operations
+        let wal = WriteAheadLog::open(&path).unwrap();
+        
+        let event = Arc::new(EventBuilder::new()
+            .pubkey([1u8; 32])
+            .kind(1)
+            .created_at(1000)
+            .content("test")
+            .build());
+        
+        wal.insert(&event).unwrap();
+        
+        // Verify WAL has content
+        let wal_path = std::path::Path::new(&path).join("wal.log");
+        let size_before = wal_path.metadata().unwrap().len();
+        assert!(size_before > 0);
+        
+        // Truncate WAL
+        wal.truncate().unwrap();
+        
+        // Verify WAL is empty
+        let size_after = wal_path.metadata().unwrap().len();
+        assert_eq!(size_after, 0);
+    }
+
+    #[test]
+    fn test_wal_replay_max_size_validation() {
+        use std::io::Write;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        
+        // Create a malformed WAL with an oversized length prefix
+        let wal_path = std::path::Path::new(&path).join("wal.log");
+        let mut file = std::fs::File::create(&wal_path).unwrap();
+        
+        // Write insert op type
+        file.write_all(&[0u8]).unwrap();
+        // Write a huge length (1GB) - should trigger validation error
+        let huge_len: u32 = 1024 * 1024 * 1024;
+        file.write_all(&huge_len.to_le_bytes()).unwrap();
+        file.flush().unwrap();
+        
+        // Try to replay - should fail with size validation error
+        let wal = WriteAheadLog::open(&path).unwrap();
+        let result = wal.replay(|_| {});
+        
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("exceeds maximum"));
     }
 }

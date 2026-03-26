@@ -3,7 +3,11 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::event::Event;
+use crate::event::{Event, EventBuilder};
+
+/// Maximum size for a single WAL record (16MB)
+/// This prevents OOM from corrupted/malicious WAL files
+const MAX_WAL_RECORD_SIZE: usize = 16 * 1024 * 1024;
 
 /// WAL operation types
 #[derive(Debug, Clone)]
@@ -73,8 +77,9 @@ impl WriteAheadLog {
             }
         }
 
-        // Flush to ensure durability
+        // Flush and sync to disk to ensure durability
         file.flush()?;
+        file.get_ref().sync_data()?;
         
         Ok(())
     }
@@ -119,6 +124,20 @@ impl WriteAheadLog {
                     reader.read_exact(&mut len_buf)?;
                     let len = u32::from_le_bytes(len_buf) as usize;
                     
+                    // Validate record size to prevent OOM from corrupted WAL
+                    if len > MAX_WAL_RECORD_SIZE {
+                        tracing::error!(
+                            len = len,
+                            max = MAX_WAL_RECORD_SIZE,
+                            "WAL record exceeds maximum size, possible corruption"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "WAL record size {} exceeds maximum {}",
+                            len,
+                            MAX_WAL_RECORD_SIZE
+                        ));
+                    }
+                    
                     let mut data = vec![0u8; len];
                     reader.read_exact(&mut data)?;
                     
@@ -154,6 +173,7 @@ impl WriteAheadLog {
         {
             let mut file = self.write_file.lock().unwrap();
             file.flush()?;
+            file.get_ref().sync_data()?;
             drop(file);
         }
         
@@ -162,6 +182,7 @@ impl WriteAheadLog {
             .write(true)
             .open(&self.read_path)?;
         file.set_len(0)?;
+        file.sync_data()?;
         
         Ok(())
     }
@@ -180,7 +201,7 @@ mod tests {
         let wal = WriteAheadLog::open(&path).unwrap();
         
         // Create a test event
-        let event = Arc::new(Event::builder()
+        let event = Arc::new(EventBuilder::new()
             .pubkey([1u8; 32])
             .kind(1)
             .created_at(1000)
@@ -218,7 +239,7 @@ mod tests {
         // Create WAL and add data
         {
             let wal = WriteAheadLog::open(&path).unwrap();
-            let event = Arc::new(Event::builder()
+            let event = Arc::new(EventBuilder::new()
                 .pubkey([1u8; 32])
                 .kind(1)
                 .created_at(1000)
