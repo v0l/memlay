@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use hex::FromHex;
-use secp256k1::{schnorr::Signature, Message, XOnlyPublicKey};
+use secp256k1::{Message, XOnlyPublicKey, schnorr::Signature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -41,8 +41,9 @@ pub struct Event {
 
 impl Event {
     /// Parse an event from JSON bytes, skipping id/signature verification.
-    /// Only for internal tests and benchmarks — do not use on untrusted input.
-    #[cfg(any(test, feature = "unchecked"))]
+    /// Only for internal tests, benchmarks, and WAL replay — do not use on untrusted input.
+    /// WAL replay is safe because we're reading our own persisted data.
+    #[cfg(any(test, feature = "unchecked", feature = "wal"))]
     pub fn from_json_unchecked(json: &[u8]) -> Result<Self, EventParseError> {
         let raw_event: RawEvent = serde_json::from_slice(json)?;
         let id = parse_hex_32(&raw_event.id).ok_or(EventParseError::InvalidId)?;

@@ -1,8 +1,8 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 mod index;
@@ -31,11 +31,11 @@ pub struct StoreConfig {
 fn get_total_memory() -> u64 {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
-    
+
     if let Some(limits) = sys.cgroup_limits() {
         return limits.total_memory;
     }
-    
+
     sys.total_memory()
 }
 
@@ -43,11 +43,8 @@ fn get_total_memory() -> u64 {
 /// Uses sysinfo for cross-platform compatibility (Windows, macOS, Linux).
 pub fn get_process_memory() -> u64 {
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes(
-        sysinfo::ProcessesToUpdate::All,
-        true,
-    );
-    
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
     match sysinfo::get_current_pid() {
         Ok(pid) => {
             if let Some(process) = sys.process(pid) {
@@ -56,7 +53,7 @@ pub fn get_process_memory() -> u64 {
         }
         Err(_e) => {}
     }
-    
+
     0
 }
 
@@ -174,7 +171,9 @@ impl EventStore {
         let store = self.clone();
         tokio::spawn(async move {
             loop {
-                let interval = Duration::from_secs(store.state.interval_seconds.load(Ordering::Relaxed) as u64);
+                let interval = Duration::from_secs(
+                    store.state.interval_seconds.load(Ordering::Relaxed) as u64,
+                );
                 tokio::time::sleep(interval).await;
                 store.maybe_evict();
             }
@@ -185,41 +184,47 @@ impl EventStore {
     fn maybe_evict(&self) {
         let current_mem = get_process_memory();
         let max_bytes = self.config.max_bytes;
-        
+
         if max_bytes == 0 || current_mem == 0 {
             self.state.consecutive_evictions.store(0, Ordering::Relaxed);
             return;
         }
-        
+
         let threshold = max_bytes as u64 * 70 / 100;
         let target = max_bytes as u64 * 50 / 100;
-        
+
         // Adaptive interval: evict more frequently when close to limit
         let new_interval = if current_mem >= threshold {
-            1  // 1s when over 70% for high input rates
+            1 // 1s when over 70% for high input rates
         } else if current_mem >= max_bytes as u64 * 50 / 100 {
-            2  // 2s when 50-70% of limit
+            2 // 2s when 50-70% of limit
         } else {
-            5  // 5s when under 50% of limit
+            5 // 5s when under 50% of limit
         };
-        self.state.interval_seconds.store(new_interval, Ordering::Relaxed);
-        
+        self.state
+            .interval_seconds
+            .store(new_interval, Ordering::Relaxed);
+
         // Evict in batch if over threshold - remove up to 1000 events at once
         if current_mem > target {
             let batch_size = 1000;
             let mut removed = 0;
-            
+
             // Get batch of oldest events
             let oldest = self.index.get_oldest(batch_size);
-            
+
             // Remove all without re-checking memory
             for event_ref in oldest.iter() {
                 self.index.remove(&event_ref.id);
                 removed += 1;
             }
-            
+
             if removed > 0 {
-                let evictions = self.state.consecutive_evictions.fetch_add(1, Ordering::Relaxed) + 1;
+                let evictions = self
+                    .state
+                    .consecutive_evictions
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
                 tracing::debug!(
                     evicted = removed,
                     evictions_streak = evictions,
@@ -236,7 +241,7 @@ impl EventStore {
     }
 
     /// Insert a single event
-    /// 
+    ///
     /// Returns InsertResult indicating:
     /// - Ephemeral: event was not stored (ephemeral events are not persisted)
     /// - Duplicate: event already exists
@@ -254,16 +259,16 @@ impl EventStore {
         if self.index.get(&event_id).is_some() {
             return InsertResult::Duplicate;
         }
-        
+
         // Insert the event and get replaced events (for replaceable events)
         let replaced = self.index.insert(event.clone());
-        
+
         // Write to WAL if available
         if let Some(ref wal) = self.wal {
             if let Err(e) = wal.insert(&event) {
                 tracing::error!(error = %e, "failed to write insert to WAL");
             }
-            
+
             // If this event replaced another, write delete for the old one
             if let Some(replaced_event) = &replaced {
                 if let Err(e) = wal.delete(&replaced_event.id) {
@@ -271,11 +276,11 @@ impl EventStore {
                 }
             }
         }
-        
+
         // Record write delay metric
         crate::metrics::observe_write_delay(start.elapsed());
         crate::metrics::inc_events_saved();
-        
+
         InsertResult::Stored {
             event,
             replaced: replaced.map(|e| vec![e]).unwrap_or_default(),
@@ -283,47 +288,47 @@ impl EventStore {
     }
 
     /// Batch insert events (more efficient for bulk operations)
-    /// 
+    ///
     /// Returns (inserted_count, replaced_events) where:
     /// - inserted_count: number of new events stored (excluding ephemeral and duplicates)
     /// - replaced_events: events that were replaced by new replaceable events
     pub fn insert_batch(&self, events: Vec<Arc<Event>>) -> (usize, Vec<Arc<Event>>) {
         let mut inserted = 0;
         let mut replaced = Vec::new();
-        
+
         for event in events {
             // Skip ephemeral events
             if event.is_ephemeral() {
                 continue;
             }
-            
+
             let event_id = event.id;
-            
+
             if self.index.get(&event_id).is_some() {
                 continue;
             }
-            
+
             let old = self.index.insert(event.clone());
             inserted += 1;
-            
+
             // Write to WAL if available
             if let Some(ref wal) = self.wal {
                 if let Err(e) = wal.insert(&event) {
                     tracing::error!(error = %e, "failed to write batch insert to WAL");
                 }
-                
+
                 if let Some(old_event) = &old {
                     if let Err(e) = wal.delete(&old_event.id) {
                         tracing::error!(error = %e, "failed to write batch delete to WAL");
                     }
                 }
             }
-            
+
             if let Some(old_event) = old {
                 replaced.push(old_event);
             }
         }
-        
+
         (inserted, replaced)
     }
 
@@ -387,10 +392,13 @@ impl EventStore {
         &self.config
     }
 
-    /// Save all events to disk (checkpoint with WAL)
-    /// 
-    /// With WAL enabled: creates a snapshot and truncates the WAL
-    /// Without WAL: writes all events to the snapshot file
+    /// Save all events to disk (WAL flush)
+    ///
+    /// With WAL enabled: flushes and syncs the WAL to ensure durability.
+    /// The WAL is the sole persistence mechanism - events are written
+    /// incrementally via insert/delete operations.
+    ///
+    /// Without WAL: falls back to writing a snapshot of current events to events.jsonl
     pub fn save_to_disk(&self) -> anyhow::Result<()> {
         let Some(ref path) = self.config.persistence_path else {
             return Ok(());
@@ -398,12 +406,23 @@ impl EventStore {
 
         let start = std::time::Instant::now();
         let data_dir = Path::new(path);
-        
+
         // Create data directory if it doesn't exist
         if !data_dir.exists() {
             fs::create_dir_all(data_dir)?;
         }
 
+        // If WAL is enabled, flush it (ensure durability)
+        if let Some(ref wal) = self.wal {
+            wal.flush()?;
+
+            // Record disk persistence time metric
+            crate::metrics::observe_disk_persistence(start.elapsed());
+            tracing::debug!("WAL flushed to disk");
+            return Ok(());
+        }
+
+        // WAL not enabled - fall back to snapshot persistence
         let events_file = data_dir.join("events.jsonl");
         let temp_file = data_dir.join("events.jsonl.tmp");
 
@@ -412,7 +431,6 @@ impl EventStore {
         let mut writer = BufWriter::new(file);
 
         let mut count = 0;
-        // Iterate through all events in the index
         for event in self.index.iter_all() {
             writer.write_all(&event.raw)?;
             writer.write_all(b"\n")?;
@@ -425,71 +443,26 @@ impl EventStore {
         // Atomic rename
         fs::rename(&temp_file, &events_file)?;
 
-        // If WAL is enabled, truncate it after checkpoint
-        if let Some(ref wal) = self.wal {
-            if let Err(e) = wal.truncate() {
-                tracing::warn!(error = %e, "failed to truncate WAL after checkpoint");
-            } else {
-                tracing::debug!("WAL truncated after checkpoint");
-            }
-        }
-
         // Record disk persistence time metric
         crate::metrics::observe_disk_persistence(start.elapsed());
 
-        tracing::info!(path = %events_file.display(), count, "saved events to disk");
+        tracing::info!(path = %events_file.display(), count, "saved events snapshot to disk");
         Ok(())
     }
 
-    /// Load events from disk (snapshot + WAL replay)
+    /// Load events from disk (WAL replay only)
+    ///
+    /// When WAL is enabled, loads events by replaying the WAL file.
+    /// When WAL is disabled, loads from events.jsonl snapshot.
     pub fn load_from_disk(&self) -> anyhow::Result<usize> {
         let Some(ref path) = self.config.persistence_path else {
             return Ok(0);
         };
 
         let data_dir = Path::new(path);
-        let events_file = data_dir.join("events.jsonl");
         let mut total_count = 0;
 
-        // Load snapshot if it exists
-        if events_file.exists() {
-            let file = File::open(&events_file)?;
-            let reader = BufReader::new(file);
-
-            let mut snapshot_count = 0;
-            let mut errors = 0;
-
-            for line_result in reader.lines() {
-                let line = line_result?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                match Event::from_json(line.as_bytes()) {
-                    Ok(event) => {
-                        let event = Arc::new(event);
-                        self.index.insert(event);
-                        snapshot_count += 1;
-                    }
-                    Err(e) => {
-                        errors += 1;
-                        tracing::warn!(error = %e, "failed to parse event from snapshot");
-                    }
-                }
-            }
-
-            total_count += snapshot_count;
-
-            if errors > 0 {
-                tracing::warn!(errors, "some events failed to load from snapshot");
-            }
-
-            tracing::info!(path = %events_file.display(), loaded = snapshot_count, errors, "loaded snapshot from disk");
-        } else {
-            tracing::debug!(path = %events_file.display(), "no snapshot file found");
-        }
-
-        // Replay WAL if available
+        // If WAL is enabled, replay it (WAL is the sole persistence mechanism)
         if let Some(ref wal) = self.wal {
             let wal_path = wal.path();
             let mut wal_count = 0;
@@ -498,7 +471,9 @@ impl EventStore {
             match wal.replay(|op| {
                 match op {
                     WalOp::Insert(data) => {
-                        match Event::from_json(&data) {
+                        // Use from_json_unchecked since we trust WAL data (we wrote it)
+                        // and signature verification was done when the event was first received
+                        match Event::from_json_unchecked(&data) {
                             Ok(event) => {
                                 self.index.insert(Arc::new(event));
                                 wal_count += 1;
@@ -510,26 +485,66 @@ impl EventStore {
                         }
                     }
                     WalOp::Delete(id) => {
-                        // Remove event from index
                         self.index.remove(&id);
                         wal_count += 1;
                     }
                 }
             }) {
                 Ok(_) => {
-                    if wal_count > 0 {
-                        tracing::info!(path = wal_path, replayed = wal_count, errors, "replayed WAL operations");
+                    if errors > 0 {
+                        tracing::warn!(errors, "some events failed to load from WAL");
                     }
+                    tracing::info!(path = %wal_path, loaded = wal_count, errors, "loaded events from WAL");
+                    total_count += wal_count;
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "failed to replay WAL");
+                    tracing::warn!(error = %e, "failed to replay WAL");
                 }
             }
-            
-            total_count += wal_count;
+
+            return Ok(total_count);
         }
 
-        tracing::info!(total = total_count, "total events loaded from disk");
+        // WAL not enabled - load from snapshot
+        let events_file = data_dir.join("events.jsonl");
+
+        if !events_file.exists() {
+            tracing::debug!(path = %events_file.display(), "no snapshot file found");
+            return Ok(0);
+        }
+
+        let file = File::open(&events_file)?;
+        let reader = BufReader::new(file);
+
+        let mut snapshot_count = 0;
+        let mut errors = 0;
+
+        for line_result in reader.lines() {
+            let line = line_result?;
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            match Event::from_json(line.as_bytes()) {
+                Ok(event) => {
+                    let event = Arc::new(event);
+                    self.index.insert(event);
+                    snapshot_count += 1;
+                }
+                Err(e) => {
+                    errors += 1;
+                    tracing::warn!(error = %e, "failed to parse event from snapshot");
+                }
+            }
+        }
+
+        total_count += snapshot_count;
+
+        if errors > 0 {
+            tracing::warn!(errors, "some events failed to load from snapshot");
+        }
+
+        tracing::info!(path = %events_file.display(), loaded = snapshot_count, errors, "loaded snapshot from disk");
         Ok(total_count)
     }
 
@@ -541,11 +556,11 @@ impl EventStore {
 
         let store = self.clone();
         let path = path.clone();
-        
+
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(interval_seconds)).await;
-                
+
                 match store.save_to_disk() {
                     Ok(_) => {
                         tracing::debug!(path, "background persistence completed");
@@ -566,12 +581,14 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_event(_id: u8, pubkey: u8, kind: u32, created_at: u64) -> Arc<Event> {
-        Arc::new(EventBuilder::new()
-            .pubkey(set_byte([0u8; 32], pubkey))
-            .kind(kind)
-            .created_at(created_at)
-            .content("test")
-            .build())
+        Arc::new(
+            EventBuilder::new()
+                .pubkey(set_byte([0u8; 32], pubkey))
+                .kind(kind)
+                .created_at(created_at)
+                .content("test")
+                .build(),
+        )
     }
 
     fn make_event_with_d_tag(
@@ -581,13 +598,15 @@ mod tests {
         created_at: u64,
         d_tag: &str,
     ) -> Arc<Event> {
-        Arc::new(EventBuilder::new()
-            .pubkey(set_byte([0u8; 32], pubkey))
-            .kind(kind)
-            .created_at(created_at)
-            .content("test")
-            .tag("d", d_tag)
-            .build())
+        Arc::new(
+            EventBuilder::new()
+                .pubkey(set_byte([0u8; 32], pubkey))
+                .kind(kind)
+                .created_at(created_at)
+                .content("test")
+                .tag("d", d_tag)
+                .build(),
+        )
     }
 
     fn set_byte(mut arr: [u8; 32], byte: u8) -> [u8; 32] {
@@ -607,13 +626,13 @@ mod tests {
         assert_eq!(retrieved.id, id);
     }
 
-#[test]
+    #[test]
     fn test_insert_ephemeral_event() {
         let store = EventStore::new(StoreConfig::default());
-        
+
         // Create ephemeral event (kind 20001)
         let ephemeral = make_event(1, 1, 20001, 1000);
-        
+
         // Ephemeral events should not be stored
         let result = store.insert(ephemeral);
         assert!(matches!(result, InsertResult::Ephemeral));
@@ -623,19 +642,19 @@ mod tests {
     #[test]
     fn test_insert_replaceable_event_replaces_old() {
         let store = EventStore::new(StoreConfig::default());
-        
+
         let pubkey = 1u8;
-        
+
         // Insert first replaceable event (kind 10000)
         let event1 = make_event(1, pubkey, 10000, 1000);
         let result1 = store.insert(event1.clone());
         assert!(matches!(result1, InsertResult::Stored { .. }));
         assert_eq!(store.len(), 1);
-        
+
         // Insert new replaceable event (should replace old)
         let event2 = make_event(2, pubkey, 10000, 2000);
         let result2 = store.insert(event2.clone());
-        
+
         match result2 {
             InsertResult::Stored { replaced, .. } => {
                 assert_eq!(replaced.len(), 1);
@@ -643,14 +662,14 @@ mod tests {
             }
             _ => panic!("Expected Stored with replaced events"),
         }
-        
+
         // Should still have only 1 event
         assert_eq!(store.len(), 1);
-        
+
         // Should have the new event
         let retrieved = store.get(&event2.id).unwrap();
         assert_eq!(retrieved.id, event2.id);
-        
+
         // Old event should be gone
         assert!(store.get(&event1.id).is_none());
     }
@@ -658,19 +677,19 @@ mod tests {
     #[test]
     fn test_insert_addressable_event_replaces_by_d_tag() {
         let store = EventStore::new(StoreConfig::default());
-        
+
         let pubkey = 1u8;
-        
+
         // Insert first addressable event with d-tag "profile"
         let event1 = make_event_with_d_tag(1, pubkey, 30000, 1000, "profile");
         let result1 = store.insert(event1.clone());
         assert!(matches!(result1, InsertResult::Stored { .. }));
         assert_eq!(store.len(), 1);
-        
+
         // Insert new addressable event with same d-tag (should replace)
         let event2 = make_event_with_d_tag(2, pubkey, 30000, 2000, "profile");
         let result2 = store.insert(event2.clone());
-        
+
         match result2 {
             InsertResult::Stored { replaced, .. } => {
                 assert_eq!(replaced.len(), 1);
@@ -678,15 +697,15 @@ mod tests {
             }
             _ => panic!("Expected Stored with replaced events"),
         }
-        
+
         // Should still have only 1 event
         assert_eq!(store.len(), 1);
-        
+
         // Insert addressable event with different d-tag (should NOT replace)
         let event3 = make_event_with_d_tag(3, pubkey, 30000, 3000, "settings");
         let result3 = store.insert(event3.clone());
         assert!(matches!(result3, InsertResult::Stored { replaced, .. } if replaced.is_empty()));
-        
+
         // Should now have 2 events
         assert_eq!(store.len(), 2);
     }
@@ -694,15 +713,15 @@ mod tests {
     #[test]
     fn test_insert_regular_event_no_replacement() {
         let store = EventStore::new(StoreConfig::default());
-        
+
         let pubkey = 1u8;
-        
+
         // Insert regular note (kind 1)
         let event1 = make_event(1, pubkey, 1, 1000);
         let result1 = store.insert(event1.clone());
         assert!(matches!(result1, InsertResult::Stored { replaced, .. } if replaced.is_empty()));
         assert_eq!(store.len(), 1);
-        
+
         // Insert another note from same author (should NOT replace)
         let event2 = make_event(2, pubkey, 1, 2000);
         let result2 = store.insert(event2.clone());
@@ -713,12 +732,12 @@ mod tests {
     #[test]
     fn test_insert_duplicate_event() {
         let store = EventStore::new(StoreConfig::default());
-        
+
         let event = make_event(1, 1, 1, 1000);
-        
+
         store.insert(event.clone());
         assert_eq!(store.len(), 1);
-        
+
         // Insert same event again
         let result = store.insert(event.clone());
         assert!(matches!(result, InsertResult::Duplicate));
@@ -728,9 +747,9 @@ mod tests {
     #[test]
     fn test_batch_insert_with_ephemeral_and_replaceable() {
         let store = EventStore::new(StoreConfig::default());
-        
+
         let pubkey = 1u8;
-        
+
         let events = vec![
             // Regular event
             make_event(1, pubkey, 1, 1000),
@@ -741,13 +760,13 @@ mod tests {
             // Another regular event
             make_event(4, pubkey, 1, 1003),
         ];
-        
+
         let (inserted, replaced) = store.insert_batch(events);
-        
+
         assert_eq!(inserted, 3); // ephemeral skipped
         assert_eq!(replaced.len(), 0);
         assert_eq!(store.len(), 3);
-        
+
         // Ephemeral should not be stored
         let ephemeral_id = make_event(2, pubkey, 20001, 1001).id;
         assert!(store.get(&ephemeral_id).is_none());
@@ -757,42 +776,64 @@ mod tests {
     fn test_get_total_memory() {
         let memory = get_total_memory();
         assert!(memory > 0, "Total memory should be greater than 0");
-        assert!(memory <= u64::MAX, "Total memory should not exceed u64::MAX");
+        assert!(
+            memory <= u64::MAX,
+            "Total memory should not exceed u64::MAX"
+        );
     }
 
     #[test]
     fn test_persistence_save_and_load() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_str().unwrap().to_string();
-        
+
         let config = StoreConfig::with_persistence(0, path.clone());
         let store = EventStore::new(config);
-        
+
         // Insert some events
         store.insert(make_event(1, 1, 1, 1000));
         store.insert(make_event(2, 1, 1, 2000));
         store.insert(make_event(3, 1, 1, 3000));
         assert_eq!(store.len(), 3);
-        
-        // Save to disk
+
+        // Verify WAL file exists before save
+        let wal_file = std::path::Path::new(&path).join("wal.log");
+        assert!(
+            wal_file.exists(),
+            "WAL file should exist before save_to_disk"
+        );
+
+        // Save to disk (flushes WAL)
         store.save_to_disk().unwrap();
-        
-        // Verify file exists
+
+        // Verify WAL file exists after save and events.jsonl does NOT exist
+        assert!(
+            wal_file.exists(),
+            "WAL file should exist after save_to_disk"
+        );
+        let meta = std::fs::metadata(&wal_file).unwrap();
+        assert!(meta.len() > 0, "WAL file should have content");
+
+        // Verify events.jsonl is NOT created when WAL is enabled
         let events_file = std::path::Path::new(&path).join("events.jsonl");
-        assert!(events_file.exists());
-        
-        // Verify file has content
-        let content = std::fs::read_to_string(&events_file).unwrap();
-        assert_eq!(content.lines().count(), 3);
+        assert!(
+            !events_file.exists(),
+            "events.jsonl should NOT exist when WAL is enabled - WAL is the sole persistence mechanism"
+        );
+
+        // Verify events can be loaded from WAL
+        let store2 = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        let loaded = store2.load_from_disk().unwrap();
+        assert_eq!(loaded, 3, "Should load 3 events from WAL");
     }
 
     #[test]
     fn test_persistence_no_file_when_disabled() {
         let config = StoreConfig::default();
         let store = EventStore::new(config);
-        
+
         store.insert(make_event(1, 1, 1, 1000));
-        
+
         // Should return Ok(()) when persistence is disabled
         let result = store.save_to_disk();
         assert!(result.is_ok());
@@ -802,149 +843,96 @@ mod tests {
     fn test_persistence_load_when_no_file() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_str().unwrap().to_string();
-        
+
         let config = StoreConfig::with_persistence(0, path);
         let store = EventStore::new(config);
-        
+
         // Should return Ok(0) when no file exists
         let loaded = store.load_from_disk().unwrap();
         assert_eq!(loaded, 0);
     }
 
     #[test]
-    fn test_wal_checkpoint_replay_integration() {
+    fn test_wal_persistence_and_replay() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_str().unwrap().to_string();
-        
-        // Phase 1: Create store, insert events, and checkpoint
+
+        // Phase 1: Create store, insert events, and persist to WAL
         let config = StoreConfig::with_persistence(0, path.clone());
         let store = EventStore::new(config);
-        
+
         let event1 = make_event(1, 1, 1, 1000);
         let event1_id = event1.id;
         let event2 = make_event(2, 1, 1, 2000);
         let event2_id = event2.id;
-        
+
         store.insert(event1.clone());
         store.insert(event2.clone());
         assert_eq!(store.len(), 2);
-        
-        // Checkpoint (snapshot + WAL truncate)
+
+        // Persist to WAL
         store.save_to_disk().unwrap();
-        
-        // Verify snapshot exists
-        let events_file = std::path::Path::new(&path).join("events.jsonl");
-        assert!(events_file.exists());
-        
-        // Verify WAL was truncated
+
+        // Verify WAL file exists (no events.jsonl should be created)
         let wal_file = std::path::Path::new(&path).join("wal.log");
-        let wal_size_before = wal_file.metadata().map(|m| m.len()).unwrap_or(0);
-        assert_eq!(wal_size_before, 0, "WAL should be empty after checkpoint");
-        
-        // Phase 2: Add more events (goes to WAL only)
-        let event3 = make_event(3, 1, 1, 3000);
-        let event3_id = event3.id;
-        store.insert(event3.clone());
-        assert_eq!(store.len(), 3);
-        
-        // Verify WAL has content
-        let wal_size_after = wal_file.metadata().map(|m| m.len()).unwrap_or(0);
-        assert!(wal_size_after > 0, "WAL should have content after insert");
-        
-        // Phase 3: Create new store instance and load from disk
-        // This should load snapshot + replay WAL
-        // Use from_json_unchecked for test events that don't have valid signatures
+        assert!(wal_file.exists(), "WAL file should exist");
+
+        let events_file = std::path::Path::new(&path).join("events.jsonl");
+        assert!(
+            !events_file.exists(),
+            "events.jsonl should NOT exist when WAL is enabled"
+        );
+
+        // Phase 2: Create new store instance and load from WAL
         let config2 = StoreConfig::with_persistence(0, path.clone());
         let store2 = EventStore::new(config2);
-        
-        // Load snapshot using unchecked parse (test events don't have valid signatures)
-        if events_file.exists() {
-            let file = std::fs::File::open(&events_file).unwrap();
-            let reader = std::io::BufReader::new(file);
-            for line_result in reader.lines() {
-                let line = line_result.unwrap();
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let event = Event::from_json_unchecked(line.as_bytes()).unwrap();
-                store2.index.insert(Arc::new(event));
-            }
-        }
-        
-        // Replay WAL using unchecked parse
-        if let Some(ref wal) = store2.wal {
-            wal.replay(|op| {
-                if let WalOp::Insert(data) = op {
-                    let event = Event::from_json_unchecked(&data).unwrap();
-                    store2.index.insert(Arc::new(event));
-                }
-            }).unwrap();
-        }
-        
-        assert_eq!(store2.len(), 3, "Should have loaded 3 events");
-        
+
+        // Load events from WAL
+        let loaded = store2.load_from_disk().unwrap();
+        assert_eq!(loaded, 2, "Should load 2 events from WAL");
+
         // Verify all events are present
         assert!(store2.get(&event1_id).is_some());
         assert!(store2.get(&event2_id).is_some());
-        assert!(store2.get(&event3_id).is_some());
     }
 
     #[test]
     fn test_wal_delete_replay() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_str().unwrap().to_string();
-        
-        // Phase 1: Create store, insert events, and checkpoint
+
+        // Phase 1: Create store, insert events, and persist to WAL
         let config = StoreConfig::with_persistence(0, path.clone());
         let store = EventStore::new(config);
-        
+
         let event1 = make_event(1, 1, 1, 1000);
         let event1_id = event1.id;
         let event2 = make_event(2, 1, 1, 2000);
         let event2_id = event2.id;
-        
+
         store.insert(event1.clone());
         store.insert(event2.clone());
         assert_eq!(store.len(), 2);
-        
-        // Checkpoint
+
+        // Persist to WAL
         store.save_to_disk().unwrap();
-        
-        // Phase 2: Delete event1 from WAL (simulate delete operation)
+
+        // Phase 2: Delete event1 directly in WAL
         if let Some(ref wal) = store.wal {
             wal.delete(&event1_id).unwrap();
         }
-        
-        // Phase 3: Create new store instance and load
+        store.save_to_disk().unwrap(); // Flush the delete operation
+
+        // Phase 3: Create new store instance and load from WAL
         let config2 = StoreConfig::with_persistence(0, path.clone());
         let store2 = EventStore::new(config2);
-        
-        // Load snapshot using unchecked parse (test events don't have valid signatures)
-        let events_file = std::path::Path::new(&path).join("events.jsonl");
-        if events_file.exists() {
-            let file = std::fs::File::open(&events_file).unwrap();
-            let reader = std::io::BufReader::new(file);
-            for line_result in reader.lines() {
-                let line = line_result.unwrap();
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let event = Event::from_json_unchecked(line.as_bytes()).unwrap();
-                store2.index.insert(Arc::new(event));
-            }
-        }
-        
-        // Replay WAL to process delete
-        if let Some(ref wal) = store2.wal {
-            wal.replay(|op| {
-                if let WalOp::Delete(id) = op {
-                    store2.index.remove(&id);
-                }
-            }).unwrap();
-        }
-        
-        assert_eq!(store2.len(), 1, "Should have loaded 1 event after delete replay");
-        
+
+        // Load events from WAL (includes both inserts and delete)
+        let loaded = store2.load_from_disk().unwrap();
+        assert_eq!(loaded, 3, "Should load 3 operations (2 inserts + 1 delete)");
+
+        assert_eq!(store2.len(), 1, "Should have 1 event after delete replay");
+
         // Event1 should be gone (deleted via WAL replay)
         assert!(store2.get(&event1_id).is_none());
         // Event2 should still be there
@@ -953,32 +941,34 @@ mod tests {
 
     #[test]
     fn test_wal_truncation_after_checkpoint() {
-        use crate::store::WriteAheadLog;
         use crate::event::EventBuilder;
-        
+        use crate::store::WriteAheadLog;
+
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_str().unwrap().to_string();
-        
+
         // Create WAL and add some operations
         let wal = WriteAheadLog::open(&path).unwrap();
-        
-        let event = Arc::new(EventBuilder::new()
-            .pubkey([1u8; 32])
-            .kind(1)
-            .created_at(1000)
-            .content("test")
-            .build());
-        
+
+        let event = Arc::new(
+            EventBuilder::new()
+                .pubkey([1u8; 32])
+                .kind(1)
+                .created_at(1000)
+                .content("test")
+                .build(),
+        );
+
         wal.insert(&event).unwrap();
-        
+
         // Verify WAL has content
         let wal_path = std::path::Path::new(&path).join("wal.log");
         let size_before = wal_path.metadata().unwrap().len();
         assert!(size_before > 0);
-        
+
         // Truncate WAL
         wal.truncate().unwrap();
-        
+
         // Verify WAL is empty
         let size_after = wal_path.metadata().unwrap().len();
         assert_eq!(size_after, 0);
@@ -987,25 +977,25 @@ mod tests {
     #[test]
     fn test_wal_replay_max_size_validation() {
         use std::io::Write;
-        
+
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_str().unwrap().to_string();
-        
+
         // Create a malformed WAL with an oversized length prefix
         let wal_path = std::path::Path::new(&path).join("wal.log");
         let mut file = std::fs::File::create(&wal_path).unwrap();
-        
+
         // Write insert op type
         file.write_all(&[0u8]).unwrap();
         // Write a huge length (1GB) - should trigger validation error
         let huge_len: u32 = 1024 * 1024 * 1024;
         file.write_all(&huge_len.to_le_bytes()).unwrap();
         file.flush().unwrap();
-        
+
         // Try to replay - should fail with size validation error
         let wal = WriteAheadLog::open(&path).unwrap();
         let result = wal.replay(|_| {});
-        
+
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("exceeds maximum"));

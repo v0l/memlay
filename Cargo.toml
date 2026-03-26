@@ -5,6 +5,8 @@ edition = "2024"
 
 [features]
 unchecked = []
+wal = ["unchecked"]
+default = ["wal"]
 
 [lib]
 name = "memlay"

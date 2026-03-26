@@ -39,7 +39,9 @@ impl Hex32 {
     }
 
     pub fn starts_with(&self, prefix: &str) -> bool {
-        if prefix.len() > 64 { return false; }
+        if prefix.len() > 64 {
+            return false;
+        }
         let hex = self.as_hex();
         hex.starts_with(prefix)
     }
@@ -140,7 +142,9 @@ impl Filter {
                 .iter()
                 .filter_map(|val| {
                     let bytes = hex::decode(val).ok()?;
-                    if bytes.len() != 32 { return None; }
+                    if bytes.len() != 32 {
+                        return None;
+                    }
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&bytes);
                     Some(Hex32(arr))
@@ -157,7 +161,9 @@ impl Filter {
                 .iter()
                 .filter_map(|val| {
                     let bytes = hex::decode(val).ok()?;
-                    if bytes.len() != 32 { return None; }
+                    if bytes.len() != 32 {
+                        return None;
+                    }
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&bytes);
                     Some(Hex32(arr))
@@ -291,12 +297,10 @@ impl CacheKey {
         let mut tag_filters: Vec<(char, String)> = filter
             .tag_filters
             .iter()
-            .flat_map(|(&letter, values)| {
-                values.iter().map(move |v| (letter, v.clone()))
-            })
+            .flat_map(|(&letter, values)| values.iter().map(move |v| (letter, v.clone())))
             .collect();
         tag_filters.sort();
-        
+
         Self {
             ids: filter.ids.clone(),
             kinds: filter.kinds.clone(),
@@ -404,15 +408,27 @@ impl SubscriptionManager {
         // Determine the best index to start with based on selectivity
         // Priority: ids (most selective) > e-tags > p-tags > generic tags > authors > kinds (least selective)
         let use_ids = filter.ids.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
-        let use_e_tags = filter.e_tags_bytes.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        let use_e_tags = filter
+            .e_tags_bytes
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
             || filter.e_tags().map(|v| !v.is_empty()).unwrap_or(false);
-        let use_p_tags = filter.p_tags_bytes.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        let use_p_tags = filter
+            .p_tags_bytes
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
             || filter.p_tags().map(|v| !v.is_empty()).unwrap_or(false);
         let has_generic_tags = filter
             .tag_filters
             .iter()
             .any(|(&l, v)| l != 'e' && l != 'p' && !v.is_empty());
-        let use_authors = filter.authors.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let use_authors = filter
+            .authors
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
         let use_kinds = filter
             .kinds
             .as_ref()
@@ -838,7 +854,10 @@ mod tests {
         author2[31] = 2;
 
         let filter = Filter {
-            authors: Some(vec![Hex32::from(hex::encode(author1)), Hex32::from(hex::encode(author2))]),
+            authors: Some(vec![
+                Hex32::from(hex::encode(author1)),
+                Hex32::from(hex::encode(author2)),
+            ]),
             ..Default::default()
         };
 

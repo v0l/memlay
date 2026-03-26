@@ -3,7 +3,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::event::{Event, EventBuilder};
+use crate::event::Event;
 
 /// Maximum size for a single WAL record (16MB)
 /// This prevents OOM from corrupted/malicious WAL files
@@ -19,7 +19,7 @@ pub enum WalOp {
 }
 
 /// Write-Ahead Log for persistent event storage
-/// 
+///
 /// Instead of writing the entire database snapshot, WAL only writes
 /// individual operations (inserts, deletes) as they happen.
 pub struct WriteAheadLog {
@@ -38,7 +38,7 @@ impl WriteAheadLog {
 
         let wal_path = data_dir.join("wal.log");
         let wal_path_str = wal_path.to_string_lossy().to_string();
-        
+
         // Open file for writing (appending)
         let write_file = OpenOptions::new()
             .create(true)
@@ -56,7 +56,7 @@ impl WriteAheadLog {
     /// Append an operation to the WAL
     pub fn append(&self, op: &WalOp) -> anyhow::Result<()> {
         let mut file = self.write_file.lock().unwrap();
-        
+
         // Write operation type (1 byte)
         match op {
             WalOp::Insert(_) => file.write_all(&[0u8])?,
@@ -80,7 +80,7 @@ impl WriteAheadLog {
         // Flush and sync to disk to ensure durability
         file.flush()?;
         file.get_ref().sync_data()?;
-        
+
         Ok(())
     }
 
@@ -103,7 +103,7 @@ impl WriteAheadLog {
         // Open file fresh for reading
         let file = File::open(&self.read_path)?;
         let mut reader = BufReader::new(file);
-        
+
         let mut count = 0;
         loop {
             // Read operation type
@@ -123,7 +123,7 @@ impl WriteAheadLog {
                     let mut len_buf = [0u8; 4];
                     reader.read_exact(&mut len_buf)?;
                     let len = u32::from_le_bytes(len_buf) as usize;
-                    
+
                     // Validate record size to prevent OOM from corrupted WAL
                     if len > MAX_WAL_RECORD_SIZE {
                         tracing::error!(
@@ -137,17 +137,17 @@ impl WriteAheadLog {
                             MAX_WAL_RECORD_SIZE
                         ));
                     }
-                    
+
                     let mut data = vec![0u8; len];
                     reader.read_exact(&mut data)?;
-                    
+
                     f(WalOp::Insert(data));
                 }
                 1 => {
                     // Delete operation
                     let mut id = [0u8; 32];
                     reader.read_exact(&mut id)?;
-                    
+
                     f(WalOp::Delete(id));
                 }
                 _ => {
@@ -155,7 +155,7 @@ impl WriteAheadLog {
                     break;
                 }
             }
-            
+
             count += 1;
         }
 
@@ -167,6 +167,14 @@ impl WriteAheadLog {
         &self.path
     }
 
+    /// Flush the WAL to disk (ensure durability)
+    pub fn flush(&self) -> anyhow::Result<()> {
+        let mut file = self.write_file.lock().unwrap();
+        file.flush()?;
+        file.get_ref().sync_data()?;
+        Ok(())
+    }
+
     /// Truncate the WAL (after checkpoint)
     pub fn truncate(&self) -> anyhow::Result<()> {
         // Close the write handle and truncate the file
@@ -176,14 +184,12 @@ impl WriteAheadLog {
             file.get_ref().sync_data()?;
             drop(file);
         }
-        
+
         // Truncate the file
-        let file = OpenOptions::new()
-            .write(true)
-            .open(&self.read_path)?;
+        let file = OpenOptions::new().write(true).open(&self.read_path)?;
         file.set_len(0)?;
         file.sync_data()?;
-        
+
         Ok(())
     }
 }
@@ -191,42 +197,44 @@ impl WriteAheadLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::EventBuilder;
     use tempfile::TempDir;
 
     #[test]
     fn test_wal_append_and_replay() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_str().unwrap().to_string();
-        
+
         let wal = WriteAheadLog::open(&path).unwrap();
-        
+
         // Create a test event
-        let event = Arc::new(EventBuilder::new()
-            .pubkey([1u8; 32])
-            .kind(1)
-            .created_at(1000)
-            .content("test")
-            .build());
-        
+        let event = Arc::new(
+            EventBuilder::new()
+                .pubkey([1u8; 32])
+                .kind(1)
+                .created_at(1000)
+                .content("test")
+                .build(),
+        );
+
         let event_id = event.id;
-        
+
         // Append insert
         wal.insert(&event).unwrap();
-        
+
         // Append delete
         wal.delete(&event_id).unwrap();
-        
+
         // Replay
         let mut inserts = 0;
         let mut deletes = 0;
-        
-        wal.replay(|op| {
-            match op {
-                WalOp::Insert(_) => inserts += 1,
-                WalOp::Delete(_) => deletes += 1,
-            }
-        }).unwrap();
-        
+
+        wal.replay(|op| match op {
+            WalOp::Insert(_) => inserts += 1,
+            WalOp::Delete(_) => deletes += 1,
+        })
+        .unwrap();
+
         assert_eq!(inserts, 1);
         assert_eq!(deletes, 1);
     }
@@ -235,30 +243,33 @@ mod tests {
     fn test_wal_persistence() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_str().unwrap().to_string();
-        
+
         // Create WAL and add data
         {
             let wal = WriteAheadLog::open(&path).unwrap();
-            let event = Arc::new(EventBuilder::new()
-                .pubkey([1u8; 32])
-                .kind(1)
-                .created_at(1000)
-                .content("test")
-                .build());
-            
+            let event = Arc::new(
+                EventBuilder::new()
+                    .pubkey([1u8; 32])
+                    .kind(1)
+                    .created_at(1000)
+                    .content("test")
+                    .build(),
+            );
+
             wal.insert(&event).unwrap();
         }
-        
+
         // Open new WAL instance and replay
         let wal2 = WriteAheadLog::open(&path).unwrap();
-        
+
         let mut count = 0;
         wal2.replay(|op| {
             if matches!(op, WalOp::Insert(_)) {
                 count += 1;
             }
-        }).unwrap();
-        
+        })
+        .unwrap();
+
         assert_eq!(count, 1);
     }
 }
