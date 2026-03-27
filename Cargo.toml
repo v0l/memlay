@@ -50,7 +50,7 @@ sysinfo = "0.38.4"
 
 # Metrics
 prometheus = "0.13"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 lazy_static = "1.4"
 
 [dev-dependencies]
