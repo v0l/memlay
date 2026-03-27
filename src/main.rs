@@ -23,7 +23,7 @@ async fn main() {
                 tracing::warn!("Failed to set file descriptor limit: {}", e);
             }
         }
-        
+
         let (soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap_or((soft, hard));
         tracing::info!("File descriptor limits: soft={}, hard={}", soft, hard);
     }
@@ -48,10 +48,10 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
         .expect("Failed to bind");
-    
+
     // Graceful shutdown with persistence
     let shutdown = tokio::signal::ctrl_c();
-    
+
     tokio::select! {
         res = axum::serve(
             listener,
@@ -65,7 +65,7 @@ async fn main() {
             tracing::info!("Received shutdown signal");
         }
     }
-    
+
     // Save events to disk on shutdown
     if let Some(ref path) = config.persistence_path {
         tracing::info!(path, "Saving events to disk before shutdown...");

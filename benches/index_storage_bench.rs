@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Bencher, Criterion};
+use criterion::{Bencher, Criterion, black_box, criterion_group, criterion_main};
 use memlay::event::Event;
 use memlay::store::EventRef;
 use parking_lot::RwLock;

@@ -14,8 +14,8 @@ use axum::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::broadcast;
 
 /// Capacity of the relay-wide new-event broadcast channel.
 const BROADCAST_CAP: usize = 8192;
@@ -38,26 +38,26 @@ impl Relay {
         } else {
             StoreConfig::from_target_ram_percent(config.target_ram_percent)
         };
-        
+
         let events = Arc::new(EventStore::new(store_config));
-        
+
         // Load events from disk if persistence is enabled
         if let Err(e) = events.load_from_disk() {
             tracing::warn!(error = %e, "failed to load events from disk");
         }
-        
+
         // Start background eviction task
         events.start_eviction_task();
-        
+
         // Start background persistence task if enabled
         if config.persistence_path.is_some() {
             events.start_persistence_task(config.persistence_interval);
         }
-        
+
         let subscriptions = Arc::new(SubscriptionManager::new(events.clone()));
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
         let connection_count = Arc::new(AtomicUsize::new(0));
-        
+
         // Always start metrics collection for active connections
         let conn_count = connection_count.clone();
         tokio::spawn(async move {
@@ -66,7 +66,7 @@ impl Relay {
                 crate::metrics::ACTIVE_CONNECTIONS.set(conn_count.load(Ordering::Relaxed) as f64);
             }
         });
-        
+
         Self {
             events,
             subscriptions,
@@ -83,7 +83,7 @@ impl Relay {
 
         let events_for_stats = self.events.clone();
         let connection_count = self.connection_count.clone();
-        
+
         let mut router = Router::new()
             .route(
                 "/stats",
@@ -128,13 +128,10 @@ impl Relay {
                     },
                 ),
             );
-        
+
         // Add metrics endpoint
-        router = router.route(
-            "/metrics",
-            get(metrics_handler),
-        );
-        
+        router = router.route("/metrics", get(metrics_handler));
+
         router
     }
 }
@@ -197,9 +194,8 @@ fn nip11_handler(config: &Config) -> impl IntoResponse {
 }
 
 fn landing_page(_config: &Config) -> impl IntoResponse {
-    let mut html = include_str!("index.html")
-        .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
-    
+    let mut html = include_str!("index.html").replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
+
     // Always show metrics section since /metrics is always available
     let metrics_section = r#"<section>
     <h2>Metrics</h2>
@@ -209,7 +205,7 @@ fn landing_page(_config: &Config) -> impl IntoResponse {
     </div>
   </section>"#;
     html = html.replace("{{METRICS_SECTION}}", metrics_section);
-    
+
     let mut headers = HeaderMap::new();
     headers.insert(
         "Content-Type",
@@ -234,7 +230,7 @@ async fn handle_socket(
     // Increment connection count
     connection_count.fetch_add(1, Ordering::Relaxed);
     crate::metrics::ACTIVE_CONNECTIONS.inc();
-    
+
     tracing::info!(%addr, "client connected");
 
     // Per-connection subscription state: sub_id → filters
@@ -309,11 +305,11 @@ async fn handle_socket(
     for sub_id in conn_subs.keys() {
         subscriptions.remove_subscription(sub_id);
     }
-    
+
     // Decrement connection count
     connection_count.fetch_sub(1, Ordering::Relaxed);
     crate::metrics::ACTIVE_CONNECTIONS.dec();
-    
+
     tracing::info!(%addr, "client disconnected");
 }
 
@@ -378,7 +374,7 @@ async fn handle_text(
         Ok(NostrMessage::Request { id, filters }) => {
             // Track subscription start time for TTEOSE metric
             let sub_start = std::time::Instant::now();
-            
+
             // Register subscription
             subscriptions.add_subscription(Subscription {
                 id: id.clone(),

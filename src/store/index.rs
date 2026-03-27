@@ -93,7 +93,7 @@ pub struct EventIndex {
     // Outer key: tag letter ('t', 'a', 'd', …)
     // Inner key: raw tag value string
     by_tag_other: RwLock<HashMap<TagLetter, HashMap<String, BTreeSet<EventRef>>>>,
-    
+
     // Oldest-first index for memory-based eviction
     by_oldest: RwLock<BTreeSet<EventRef>>,
 
@@ -197,7 +197,7 @@ impl EventIndex {
                 }
             }
         }
-        
+
         // Oldest-first index for eviction (newest first in EventRef ordering)
         {
             let mut by_oldest = self.by_oldest.write();
@@ -302,20 +302,21 @@ impl EventIndex {
                 }
             }
         }
-        
+
         // Remove from oldest index
         {
             let mut by_oldest = self.by_oldest.write();
             by_oldest.remove(&dummy_ref);
         }
-        
+
         Some(event)
     }
-    
+
     /// Get the oldest events for eviction (returns oldest first)
     pub fn get_oldest(&self, count: usize) -> Vec<EventRef> {
         // BTreeSet is sorted newest-first (EventRef ordering), so iterate from end
-        self.by_oldest.read()
+        self.by_oldest
+            .read()
             .iter()
             .rev()
             .take(count)
@@ -337,11 +338,7 @@ impl EventIndex {
 
     /// Get all events for persistence
     pub fn iter_all(&self) -> Vec<Arc<Event>> {
-        self.by_id
-            .read()
-            .values()
-            .cloned()
-            .collect()
+        self.by_id.read().values().cloned().collect()
     }
 
     /// Query by pubkey, returns events sorted by created_at DESC

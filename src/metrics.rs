@@ -1,6 +1,4 @@
-use prometheus::{
-    Histogram, Gauge, Counter, register_histogram, Encoder, TextEncoder,
-};
+use prometheus::{Counter, Encoder, Gauge, Histogram, TextEncoder, register_histogram};
 
 // Gauge: Number of active WebSocket connections
 lazy_static::lazy_static! {
@@ -68,8 +66,10 @@ pub fn gather_metrics() -> String {
     let encoder = TextEncoder::new();
     let metric_families = prometheus::gather();
     let mut buffer = Vec::new();
-    
-    encoder.encode(&metric_families, &mut buffer).unwrap_or_default();
-    
+
+    encoder
+        .encode(&metric_families, &mut buffer)
+        .unwrap_or_default();
+
     String::from_utf8(buffer).unwrap_or_default()
 }
