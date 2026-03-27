@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -450,19 +450,16 @@ impl EventStore {
         Ok(())
     }
 
-    /// Load events from disk (WAL replay only)
-    ///
-    /// When WAL is enabled, loads events by replaying the WAL file.
-    /// When WAL is disabled, loads from events.jsonl snapshot.
+    /// Load events from disk by replaying the WAL.
     pub fn load_from_disk(&self) -> anyhow::Result<usize> {
         let Some(ref path) = self.config.persistence_path else {
             return Ok(0);
         };
 
         let data_dir = Path::new(path);
-        let mut total_count = 0;
+        let _ = data_dir;
 
-        // If WAL is enabled, replay it (WAL is the sole persistence mechanism)
+        // If WAL is enabled, replay it
         if let Some(ref wal) = self.wal {
             let wal_path = wal.path();
             let mut wal_count = 0;
@@ -471,8 +468,6 @@ impl EventStore {
             match wal.replay(|op| {
                 match op {
                     WalOp::Insert(data) => {
-                        // Use from_json_unchecked since we trust WAL data (we wrote it)
-                        // and signature verification was done when the event was first received
                         match Event::from_json_unchecked(&data) {
                             Ok(event) => {
                                 self.index.insert(Arc::new(event));
@@ -495,57 +490,16 @@ impl EventStore {
                         tracing::warn!(errors, "some events failed to load from WAL");
                     }
                     tracing::info!(path = %wal_path, loaded = wal_count, errors, "loaded events from WAL");
-                    total_count += wal_count;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to replay WAL");
                 }
             }
 
-            return Ok(total_count);
+            return Ok(wal_count);
         }
 
-        // WAL not enabled - load from snapshot
-        let events_file = data_dir.join("events.jsonl");
-
-        if !events_file.exists() {
-            tracing::debug!(path = %events_file.display(), "no snapshot file found");
-            return Ok(0);
-        }
-
-        let file = File::open(&events_file)?;
-        let reader = BufReader::new(file);
-
-        let mut snapshot_count = 0;
-        let mut errors = 0;
-
-        for line_result in reader.lines() {
-            let line = line_result?;
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            match Event::from_json(line.as_bytes()) {
-                Ok(event) => {
-                    let event = Arc::new(event);
-                    self.index.insert(event);
-                    snapshot_count += 1;
-                }
-                Err(e) => {
-                    errors += 1;
-                    tracing::warn!(error = %e, "failed to parse event from snapshot");
-                }
-            }
-        }
-
-        total_count += snapshot_count;
-
-        if errors > 0 {
-            tracing::warn!(errors, "some events failed to load from snapshot");
-        }
-
-        tracing::info!(path = %events_file.display(), loaded = snapshot_count, errors, "loaded snapshot from disk");
-        Ok(total_count)
+        Ok(0)
     }
 
     /// Start background persistence task (call from relay startup)
