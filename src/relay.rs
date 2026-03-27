@@ -5,8 +5,8 @@ use crate::subscription::{Filter, Subscription, SubscriptionManager};
 use axum::{
     Router,
     extract::{
-        ConnectInfo,
-        ws::{WebSocket, WebSocketUpgrade},
+        ConnectInfo, State,
+        ws::{WebSocket},
     },
     http::{HeaderMap, HeaderValue},
     response::IntoResponse,
@@ -19,6 +19,15 @@ use tokio::sync::broadcast;
 
 /// Capacity of the relay-wide new-event broadcast channel.
 const BROADCAST_CAP: usize = 8192;
+
+/// Shared state threaded through axum via `State<Arc<AppState>>`.
+struct AppState {
+    events: Arc<EventStore>,
+    subscriptions: Arc<SubscriptionManager>,
+    tx: broadcast::Sender<Arc<crate::event::Event>>,
+    config: Config,
+    connection_count: Arc<AtomicUsize>,
+}
 
 pub struct Relay {
     pub events: Arc<EventStore>,
@@ -77,68 +86,59 @@ impl Relay {
     }
 
     pub fn router(self) -> Router {
-        let subscriptions = self.subscriptions.clone();
-        let tx = self.tx.clone();
-        let config = self.config.clone();
+        let app_state = Arc::new(AppState {
+            events: self.events.clone(),
+            subscriptions: self.subscriptions.clone(),
+            tx: self.tx.clone(),
+            config: self.config.clone(),
+            connection_count: self.connection_count.clone(),
+        });
 
-        let events_for_stats = self.events.clone();
-        let connection_count = self.connection_count.clone();
-
-        let mut router = Router::new()
-            .route(
-                "/stats",
-                get(move || {
-                    let events = events_for_stats.clone();
-                    async move { stats_handler(events) }
-                }),
-            )
-            .route(
-                "/",
-                get(
-                    move |ConnectInfo(addr): ConnectInfo<SocketAddr>,
-                          headers: HeaderMap,
-                          ws: Option<WebSocketUpgrade>| {
-                        let subscriptions = subscriptions.clone();
-                        let tx = tx.clone();
-                        let config = config.clone();
-                        let conn_count = connection_count.clone();
-                        async move {
-                            let wants_info = headers
-                                .get("accept")
-                                .and_then(|v| v.to_str().ok())
-                                .map(|v| v.contains("application/nostr+json"))
-                                .unwrap_or(false);
-
-                            if wants_info {
-                                return nip11_handler(&config).into_response();
-                            }
-
-                            match ws {
-                                Some(ws) => ws
-                                    .on_failed_upgrade(move |err| {
-                                        tracing::warn!(%addr, "WebSocket upgrade failed: {}", err);
-                                    })
-                                    .on_upgrade(move |socket| {
-                                        handle_socket(socket, addr, subscriptions, tx, conn_count)
-                                    })
-                                    .into_response(),
-                                None => landing_page(&config).into_response(),
-                            }
-                        }
-                    },
-                ),
-            );
-
-        // Add metrics endpoint
-        router = router.route("/metrics", get(metrics_handler));
-
-        router
+        Router::new()
+            .route("/stats", get(stats_handler))
+            .route("/", get(root_handler))
+            .route("/metrics", get(metrics_handler))
+            .with_state(app_state)
     }
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
-async fn metrics_handler() -> impl IntoResponse {
+#[axum::debug_handler]
+async fn root_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    ws: Result<axum::extract::ws::WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+) -> axum::response::Response {
+    let wants_info = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("application/nostr+json"))
+        .unwrap_or(false);
+
+    if wants_info {
+        return nip11_handler(&state.config).into_response();
+    }
+
+    match ws {
+        Ok(ws) => {
+            let subscriptions = state.subscriptions.clone();
+            let tx = state.tx.clone();
+            let conn_count = state.connection_count.clone();
+            ws.on_failed_upgrade(move |err| {
+                tracing::warn!(%addr, "WebSocket upgrade failed: {}", err);
+            })
+            .on_upgrade(move |socket| {
+                handle_socket(socket, addr, subscriptions, tx, conn_count)
+            })
+            .into_response()
+        }
+        Err(_) => landing_page(&state.config).into_response(),
+    }
+}
+
+async fn metrics_handler(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     let metrics = crate::metrics::gather_metrics();
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -148,7 +148,8 @@ async fn metrics_handler() -> impl IntoResponse {
     (headers, metrics)
 }
 
-fn stats_handler(events: Arc<crate::store::EventStore>) -> impl IntoResponse {
+async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let events = &state.events;
     let cfg = events.config();
     let process_memory = crate::store::get_process_memory();
     let body = serde_json::json!({
@@ -256,7 +257,7 @@ async fn handle_socket(
                         let notice = NostrMessage::Notification {
                             message: "binary messages are not supported".to_string(),
                         };
-                        let _ = socket.send(axum::extract::ws::Message::Text(notice.to_json())).await;
+                        let _ = socket.send(axum::extract::ws::Message::Text(notice.to_json().into())).await;
                     }
                     axum::extract::ws::Message::Ping(data) => {
                         let _ = socket.send(axum::extract::ws::Message::Pong(data)).await;
@@ -279,7 +280,7 @@ async fn handle_socket(
                                         event: (*event).clone(),
                                     };
                                     if socket
-                                        .send(axum::extract::ws::Message::Text(msg.to_json()))
+                                        .send(axum::extract::ws::Message::Text(msg.to_json().into()))
                                         .await
                                         .is_err()
                                     {
@@ -367,7 +368,7 @@ async fn handle_text(
                 }
             };
             let _ = socket
-                .send(axum::extract::ws::Message::Text(ok.to_json()))
+                .send(axum::extract::ws::Message::Text(ok.to_json().into()))
                 .await;
         }
 
@@ -391,7 +392,7 @@ async fn handle_text(
                         event: (*event).clone(),
                     };
                     if socket
-                        .send(axum::extract::ws::Message::Text(msg.to_json()))
+                        .send(axum::extract::ws::Message::Text(msg.to_json().into()))
                         .await
                         .is_err()
                     {
@@ -407,7 +408,7 @@ async fn handle_text(
 
             let eose = NostrMessage::EndOfStoredEvents { id };
             let _ = socket
-                .send(axum::extract::ws::Message::Text(eose.to_json()))
+                .send(axum::extract::ws::Message::Text(eose.to_json().into()))
                 .await;
         }
 
@@ -419,7 +420,7 @@ async fn handle_text(
         Err(e) => {
             let notice = NostrMessage::Notification { message: e };
             let _ = socket
-                .send(axum::extract::ws::Message::Text(notice.to_json()))
+                .send(axum::extract::ws::Message::Text(notice.to_json().into()))
                 .await;
         }
 

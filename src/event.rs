@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use hex::FromHex;
-use secp256k1::{Message, XOnlyPublicKey, schnorr::Signature};
+use secp256k1::{schnorr::Signature, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -113,12 +113,10 @@ impl Event {
 
         // Verify Schnorr signature
         let xonly =
-            XOnlyPublicKey::from_slice(&pubkey).map_err(|_| EventParseError::InvalidPubkey)?;
-        let schnorr_sig =
-            Signature::from_slice(&sig).map_err(|_| EventParseError::InvalidSignature)?;
-        let msg = Message::from_digest(id);
+            XOnlyPublicKey::from_byte_array(pubkey).map_err(|_| EventParseError::InvalidPubkey)?;
+        let schnorr_sig = Signature::from_byte_array(sig);
         secp256k1::global::SECP256K1
-            .verify_schnorr(&schnorr_sig, &msg, &xonly)
+            .verify_schnorr(&schnorr_sig, &id, &xonly)
             .map_err(|_| EventParseError::BadSignature)?;
 
         Ok(Event {
