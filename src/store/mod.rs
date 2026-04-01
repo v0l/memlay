@@ -182,7 +182,7 @@ impl EventStore {
 
     /// Background eviction check with adaptive interval and batch eviction
     fn maybe_evict(&self) {
-        let current_mem = get_process_memory();
+        let current_mem = self.index.memory_bytes();
         let max_bytes = self.config.max_bytes;
 
         if max_bytes == 0 || current_mem == 0 {
@@ -190,13 +190,13 @@ impl EventStore {
             return;
         }
 
-        let threshold = max_bytes as u64 * 70 / 100;
-        let target = max_bytes as u64 * 50 / 100;
+        let threshold = max_bytes * 70 / 100;
+        let target = max_bytes * 50 / 100;
 
         // Adaptive interval: evict more frequently when close to limit
         let new_interval = if current_mem >= threshold {
             1 // 1s when over 70% for high input rates
-        } else if current_mem >= max_bytes as u64 * 50 / 100 {
+        } else if current_mem >= max_bytes * 50 / 100 {
             2 // 2s when 50-70% of limit
         } else {
             5 // 5s when under 50% of limit
@@ -213,13 +213,14 @@ impl EventStore {
             // Get batch of oldest events
             let oldest = self.index.get_oldest(batch_size);
 
-            // Remove all without re-checking memory
+            // Remove all and track actual memory freed
             for event_ref in oldest.iter() {
                 self.index.remove(&event_ref.id);
                 removed += 1;
             }
 
             if removed > 0 {
+                let new_mem = self.index.memory_bytes();
                 let evictions = self
                     .state
                     .consecutive_evictions
@@ -228,7 +229,8 @@ impl EventStore {
                 tracing::debug!(
                     evicted = removed,
                     evictions_streak = evictions,
-                    mem_bytes = current_mem,
+                    mem_before = current_mem,
+                    mem_after = new_mem,
                     "batch eviction"
                 );
             }
@@ -382,9 +384,9 @@ impl EventStore {
         self.len() == 0
     }
 
-    /// Current bytes used (deprecated - use process RSS)
-    pub fn bytes_used(&self) -> usize {
-        0
+    /// Current store memory usage in bytes (raw JSON only)
+    pub fn memory_bytes(&self) -> usize {
+        self.index.memory_bytes()
     }
 
     /// Get store configuration

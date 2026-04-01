@@ -151,12 +151,12 @@ async fn metrics_handler(State(_state): State<Arc<AppState>>) -> impl IntoRespon
 async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let events = &state.events;
     let cfg = events.config();
-    let process_memory = crate::store::get_process_memory();
+    let store_memory = events.memory_bytes();
     let body = serde_json::json!({
         "events": events.len(),
-        "store_bytes": events.bytes_used(),
+        "store_bytes": store_memory,
         "max_bytes": cfg.max_bytes,
-        "process_memory": process_memory,
+        "process_memory": crate::store::get_process_memory(),
     });
     let mut headers = HeaderMap::new();
     headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));

@@ -3,6 +3,7 @@ use parking_lot::RwLock;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 /// Tag letter used as key in `by_tag_other`.
 type TagLetter = char;
@@ -99,6 +100,9 @@ pub struct EventIndex {
 
     // Replaceable events index: maps (pubkey, kind) or (pubkey, kind, d-tag) to latest event id
     by_replaceable: RwLock<HashMap<ReplacementKey, [u8; 32]>>,
+
+    // Track actual memory usage (bytes of raw event JSON)
+    memory_bytes: AtomicUsize,
 }
 
 impl EventIndex {
@@ -112,6 +116,7 @@ impl EventIndex {
             by_tag_other: RwLock::new(HashMap::new()),
             by_oldest: RwLock::new(BTreeSet::new()),
             by_replaceable: RwLock::new(HashMap::new()),
+            memory_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -138,6 +143,9 @@ impl EventIndex {
                 replaced = Some(old_event);
             }
         }
+
+        // Track memory usage (raw JSON bytes)
+        self.memory_bytes.fetch_add(event.raw.len(), AtomicOrdering::Relaxed);
 
         // Primary index
         self.by_id.write().insert(event.id, event.clone());
@@ -211,6 +219,10 @@ impl EventIndex {
     /// Remove an event from all indexes
     pub fn remove(&self, id: &[u8; 32]) -> Option<Arc<Event>> {
         let event = self.by_id.write().remove(id)?;
+
+        // Track memory usage (raw JSON bytes)
+        let event_size = event.raw.len();
+        self.memory_bytes.fetch_sub(event_size, AtomicOrdering::Relaxed);
 
         // Create a dummy EventRef for removal (only id matters for equality)
         let dummy_ref = EventRef {
@@ -322,6 +334,11 @@ impl EventIndex {
             .take(count)
             .cloned()
             .collect()
+    }
+
+    /// Get current memory usage in bytes (raw JSON only)
+    pub fn memory_bytes(&self) -> usize {
+        self.memory_bytes.load(AtomicOrdering::Relaxed)
     }
 }
 
@@ -457,6 +474,134 @@ mod tests {
             "0"
         );
         Arc::new(Event::from_json_unchecked(json.as_bytes()).unwrap())
+    }
+
+    fn make_event_with_content(id: u8, pubkey: u8, kind: u32, created_at: u64, content: &str) -> Arc<Event> {
+        let json = format!(
+            r#"{{"id":"{:0>64}","pubkey":"{:0>64}","created_at":{},"kind":{},"tags":[],"content":"{}","sig":"{:0>128}"}}"#,
+            format!("{:x}", id),
+            format!("{:x}", pubkey),
+            created_at,
+            kind,
+            content,
+            "0"
+        );
+        Arc::new(Event::from_json_unchecked(json.as_bytes()).unwrap())
+    }
+
+    #[test]
+    fn test_memory_tracking_on_insert() {
+        let index = EventIndex::new();
+        assert_eq!(index.memory_bytes(), 0);
+
+        let event = make_event(1, 1, 1, 1000);
+        let expected_size = event.raw.len();
+
+        index.insert(event);
+        
+        // Memory should equal the raw JSON size
+        assert_eq!(index.memory_bytes(), expected_size);
+    }
+
+    #[test]
+    fn test_memory_tracking_on_remove() {
+        let index = EventIndex::new();
+        
+        let event = make_event(1, 1, 1, 1000);
+        let event_size = event.raw.len();
+        
+        index.insert(event.clone());
+        let mem_after_insert = index.memory_bytes();
+        assert_eq!(mem_after_insert, event_size);
+
+        index.remove(&event.id);
+        let mem_after_remove = index.memory_bytes();
+        
+        // Memory should be back to 0
+        assert_eq!(mem_after_remove, 0);
+    }
+
+    #[test]
+    fn test_memory_tracking_multiple_events() {
+        let index = EventIndex::new();
+        
+        let mut total_size = 0;
+        for i in 0..10 {
+            let event = make_event(i, 1, 1, 1000 + i as u64);
+            total_size += event.raw.len();
+            index.insert(event);
+        }
+        
+        let mem_used = index.memory_bytes();
+        assert_eq!(mem_used, total_size);
+        assert_eq!(index.len(), 10);
+
+        // Remove half
+        for i in 0..5 {
+            let event = make_event(i, 1, 1, 1000 + i as u64);
+            let removed_size = event.raw.len();
+            total_size -= removed_size;
+            index.remove(&event.id);
+        }
+        
+        let mem_after_remove = index.memory_bytes();
+        assert_eq!(mem_after_remove, total_size);
+        assert_eq!(index.len(), 5);
+    }
+
+    #[test]
+    fn test_memory_tracking_with_large_content() {
+        let index = EventIndex::new();
+        
+        // Create events with different content sizes
+        let small_event = make_event_with_content(1, 1, 1, 1000, "small");
+        let large_content = "x".repeat(1000);
+        let large_event = make_event_with_content(2, 1, 1, 1001, &large_content);
+        
+        let small_size = small_event.raw.len();
+        let large_size = large_event.raw.len();
+        
+        index.insert(small_event.clone());
+        let mem_after_small = index.memory_bytes();
+        assert_eq!(mem_after_small, small_size);
+
+        index.insert(large_event.clone());
+        let mem_after_large = index.memory_bytes();
+        assert_eq!(mem_after_large, small_size + large_size);
+
+        // Remove small event
+        index.remove(&small_event.id);
+        let mem_after_remove = index.memory_bytes();
+        assert_eq!(mem_after_remove, large_size);
+
+        // Remove large event
+        index.remove(&large_event.id);
+        let mem_final = index.memory_bytes();
+        assert_eq!(mem_final, 0);
+    }
+
+    #[test]
+    fn test_memory_tracking_with_replaceable_events() {
+        let index = EventIndex::new();
+        
+        // Create two replaceable events (kind 10000) with same pubkey
+        let event1 = make_event(1, 1, 10000, 1000);
+        let size1 = event1.raw.len();
+        
+        index.insert(event1.clone());
+        let mem_after_first = index.memory_bytes();
+        assert_eq!(mem_after_first, size1);
+
+        let event2 = make_event(2, 1, 10000, 2000);
+        let size2 = event2.raw.len();
+        
+        // Insert second event (should replace first)
+        index.insert(event2.clone());
+        let mem_after_replace = index.memory_bytes();
+        
+        // Memory should be roughly the same (one removed, one added)
+        assert_eq!(mem_after_replace, size2);
+        assert_eq!(index.len(), 1);
     }
 
     #[test]
