@@ -157,6 +157,8 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         "store_bytes": store_memory,
         "max_bytes": cfg.max_bytes,
         "process_memory": crate::store::get_process_memory(),
+        "memory_limit": cfg.max_bytes,
+        "memory_used": store_memory,
     });
     let mut headers = HeaderMap::new();
     headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));

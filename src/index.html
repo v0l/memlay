@@ -84,9 +84,9 @@
       const s = await fetch('/stats').then(r => r.json());
       document.getElementById('stat-events').textContent = fmt(s.events);
       
-      // Show actual process memory usage (RSS) vs memory limit
-      const used = s.process_memory || s.store_bytes || 0;
-      const max = s.max_bytes || 0;
+      // Show store memory (used for culling) vs memory limit
+      const used = s.memory_used || s.store_bytes || 0;
+      const max = s.memory_limit || s.max_bytes || 0;
       
       if (max > 0) {
         document.getElementById('stat-bytes').textContent = fmtBytes(used) + ' / ' + fmtBytes(max);
@@ -94,8 +94,8 @@
         document.getElementById('stat-bytes').textContent = fmtBytes(used);
       }
       
-      // Capacity percentage (process memory vs limit)
-      document.getElementById('stat-capacity').textContent = fmtCapacity(s.process_memory || 0, s.max_bytes);
+      // Capacity percentage (store memory vs limit)
+      document.getElementById('stat-capacity').textContent = fmtCapacity(s.memory_used || 0, s.memory_limit || s.max_bytes);
     } catch (_) {}
   }
 
