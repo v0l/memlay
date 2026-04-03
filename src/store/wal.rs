@@ -192,6 +192,167 @@ impl WriteAheadLog {
 
         Ok(())
     }
+
+    /// Compact the WAL by removing old entries that exceed the memory limit.
+    ///
+    /// This reads all operations, keeps only the most recent ones that fit
+    /// within max_bytes, and rewrites the WAL. Returns the number of operations removed.
+    pub fn compact(&self, max_bytes: usize, current_mem: usize) -> anyhow::Result<usize> {
+        // If we're already under the limit, no need to compact
+        if current_mem <= max_bytes {
+            return Ok(0);
+        }
+
+        // Open file fresh for reading
+        let file = File::open(&self.read_path)?;
+        let mut reader = BufReader::new(&file);
+
+        // Read all operations into memory
+        let mut operations: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut total_size = 0;
+
+        loop {
+            let mut op_type = [0u8; 1];
+            match reader.read(&mut op_type) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+
+            match op_type[0] {
+                0 => {
+                    // Insert operation
+                    let mut len_buf = [0u8; 4];
+                    if reader.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
+                    let len = u32::from_le_bytes(len_buf) as usize;
+
+                    if len > MAX_WAL_RECORD_SIZE {
+                        tracing::error!(
+                            len,
+                            max = MAX_WAL_RECORD_SIZE,
+                            "WAL record exceeds maximum during compact"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "WAL record size {} exceeds maximum {}",
+                            len,
+                            MAX_WAL_RECORD_SIZE
+                        ));
+                    }
+
+                    let mut data = vec![0u8; len];
+                    if reader.read_exact(&mut data).is_err() {
+                        break;
+                    }
+
+                    let record_size = 1 + 4 + len; // op_type + length + data
+                    operations.push((0, data));
+                    total_size += record_size;
+                }
+                1 => {
+                    // Delete operation
+                    let mut id = [0u8; 32];
+                    if reader.read_exact(&mut id).is_err() {
+                        break;
+                    }
+
+                    let record_size = 1 + 32; // op_type + id
+                    operations.push((1, id.to_vec()));
+                    total_size += record_size;
+                }
+                _ => {
+                    tracing::warn!(
+                        op_type = op_type[0],
+                        "unknown WAL operation type during compact"
+                    );
+                    break;
+                }
+            }
+        }
+
+        if operations.is_empty() {
+            return Ok(0);
+        }
+
+        // Count how many operations we need to remove from the beginning
+        // to get under the limit
+        let mut removed = 0;
+        let mut removed_size = 0;
+
+        for (op_type, data) in operations.iter() {
+            let record_size = if *op_type == 0 {
+                1 + 4 + data.len() // insert
+            } else {
+                1 + 32 // delete
+            };
+
+            // Stop removing when we'd be at 80% of the limit
+            if total_size - removed_size <= (max_bytes * 80 / 100) {
+                break;
+            }
+
+            removed_size += record_size;
+            removed += 1;
+        }
+
+        // If nothing to remove, we're done
+        if removed == 0 {
+            return Ok(0);
+        }
+
+        tracing::info!(
+            removed,
+            removed_bytes = removed_size,
+            total_ops = operations.len(),
+            "compacting WAL to respect memory limit"
+        );
+
+        // Write compacted WAL to temp file
+        let temp_path = format!("{}.tmp", self.read_path);
+        {
+            let temp_file = File::create(&temp_path)?;
+            let mut writer = BufWriter::new(temp_file);
+
+            for (op_type, data) in operations.iter().skip(removed) {
+                writer.write_all(&[*op_type])?;
+
+                if *op_type == 0 {
+                    // Insert
+                    let len = data.len() as u32;
+                    writer.write_all(&len.to_le_bytes())?;
+                    writer.write_all(data)?;
+                } else {
+                    // Delete
+                    writer.write_all(data)?;
+                }
+            }
+
+            writer.flush()?;
+            writer.get_ref().sync_data()?;
+        }
+
+        // Close the current write handle before renaming
+        {
+            let mut file = self.write_file.lock().unwrap();
+            file.flush()?;
+            drop(file);
+        }
+
+        // Replace the old WAL with the compacted one
+        std::fs::rename(&temp_path, &self.read_path)?;
+
+        // Reopen the write handle
+        let new_write_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(&self.read_path)?;
+
+        *self.write_file.lock().unwrap() = BufWriter::new(new_write_file);
+
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
@@ -271,5 +432,60 @@ mod tests {
         .unwrap();
 
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_wal_compact_removes_old_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+
+        // Create WAL and add many events
+        let wal = WriteAheadLog::open(&path).unwrap();
+
+        let mut event_ids = Vec::new();
+        for i in 0..50 {
+            let event = Arc::new(
+                EventBuilder::new()
+                    .pubkey([i as u8; 32])
+                    .kind(1)
+                    .created_at(i as u64)
+                    .content("test event data that adds some size")
+                    .build(),
+            );
+            wal.insert(&event).unwrap();
+            event_ids.push(event.id);
+        }
+
+        // Verify WAL has content
+        let wal_path = std::path::Path::new(&path).join("wal.log");
+        let size_before = wal_path.metadata().unwrap().len();
+        assert!(size_before > 0);
+
+        // Estimate size per record: 1 (op) + 4 (len) + ~70 (event data) = ~75 bytes
+        // Compact to keep about 20 events (20 * 75 = 1500 bytes target)
+        let target_size = 1500;
+        let removed = wal.compact(target_size, 10000).unwrap();
+
+        // Should have removed some entries but not all
+        assert!(removed > 0, "Should have removed some WAL entries");
+        assert!(removed < 50, "Should not have removed all entries");
+
+        // Verify WAL is smaller
+        let size_after = wal_path.metadata().unwrap().len();
+        assert!(
+            size_after < size_before,
+            "WAL should be smaller after compaction"
+        );
+
+        // Verify we can still replay the remaining entries
+        let mut count = 0;
+        wal.replay(|_| {
+            count += 1;
+        })
+        .unwrap();
+
+        // Should have fewer entries than before but at least some
+        assert!(count < 50, "Should have fewer entries after compaction");
+        assert!(count > 0, "Should still have some entries");
     }
 }

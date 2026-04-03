@@ -453,6 +453,8 @@ impl EventStore {
     }
 
     /// Load events from disk by replaying the WAL.
+    /// After loading, evicts old events to respect memory limits.
+    /// Compacts the WAL to remove entries for evicted events.
     pub fn load_from_disk(&self) -> anyhow::Result<usize> {
         let Some(ref path) = self.config.persistence_path else {
             return Ok(0);
@@ -466,6 +468,7 @@ impl EventStore {
             let wal_path = wal.path();
             let mut wal_count = 0;
             let mut errors = 0;
+            let max_bytes = self.config.max_bytes;
 
             match wal.replay(|op| {
                 match op {
@@ -495,6 +498,55 @@ impl EventStore {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to replay WAL");
+                }
+            }
+
+            // If we have a memory limit and are over it, evict old events
+            if max_bytes > 0 {
+                let current_mem = self.index.memory_bytes();
+                if current_mem > max_bytes {
+                    tracing::info!(
+                        current_mem,
+                        max_bytes,
+                        loaded = wal_count,
+                        "loaded events exceed memory limit, evicting old events"
+                    );
+                    
+                    // Evict oldest events one at a time until under limit
+                    // Target 80% of max_bytes to provide headroom
+                    let target = max_bytes * 80 / 100;
+                    let mut evicted = 0;
+                    
+                    while self.index.memory_bytes() > target {
+                        let oldest = self.index.get_oldest(1);
+                        
+                        if oldest.is_empty() {
+                            break;
+                        }
+                        
+                        self.index.remove(&oldest[0].id);
+                        evicted += 1;
+                    }
+                    
+                    tracing::info!(
+                        evicted,
+                        remaining = self.index.len(),
+                        current_mem = self.index.memory_bytes(),
+                        "evicted old events after WAL replay"
+                    );
+                }
+                
+                // Compact the WAL to remove entries for evicted events
+                // This prevents the WAL from growing unbounded and wasting disk space
+                match wal.compact(max_bytes, self.index.memory_bytes()) {
+                    Ok(removed) => {
+                        if removed > 0 {
+                            tracing::info!(removed, "compacted WAL after eviction");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to compact WAL");
+                    }
                 }
             }
 
@@ -955,5 +1007,57 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn test_wal_replay_respects_memory_limit() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+
+        // Phase 1: Create store, insert and persist events
+        let config = StoreConfig::with_persistence(0, path.clone());
+        let store = EventStore::new(config);
+
+        // Insert many small events
+        let mut event_ids = Vec::new();
+        for i in 0..100 {
+            let event = make_event(i as u8, 1, 1, i as u64);
+            let id = event.id;
+            store.insert(event);
+            event_ids.push(id);
+        }
+        assert_eq!(store.len(), 100);
+
+        // Persist to WAL
+        store.save_to_disk().unwrap();
+
+        // Phase 2: Create new store with a tiny memory limit (1KB)
+        // This simulates the prod scenario where WAL has more data than we can store
+        let config2 = StoreConfig {
+            max_bytes: 1024, // Only 1KB limit
+            persistence_path: Some(path.clone()),
+            use_wal: true,
+        };
+        let store2 = EventStore::new(config2);
+
+        // Load from disk - loads all events then evicts old ones
+        let loaded = store2.load_from_disk().unwrap();
+
+        // Should have loaded all events from WAL
+        assert_eq!(loaded, 100, "Should load all events from WAL");
+        
+        // But store should have fewer events after eviction
+        assert!(store2.len() < 100, "Store should have fewer than 100 events after eviction");
+        
+        // Should have the newest events (highest created_at), not the oldest
+        // The oldest events (created_at 0, 1, 2...) should have been evicted
+        let newest_event_id = make_event(99, 1, 1, 99).id;
+        let oldest_event_id = make_event(0, 1, 1, 0).id;
+        
+        // Verify newest event is kept
+        assert!(store2.get(&newest_event_id).is_some(), "Should keep newest event (created_at=99)");
+        
+        // Verify oldest event is evicted
+        assert!(store2.get(&oldest_event_id).is_none(), "Should evict oldest event (created_at=0)");
     }
 }
