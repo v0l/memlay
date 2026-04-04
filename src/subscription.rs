@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// Trait for filter matching against an event
 pub trait FilterMatch {
@@ -275,7 +275,7 @@ pub struct SubscriptionManager {
     subscriptions: parking_lot::RwLock<HashMap<String, Subscription>>,
     pub store: Arc<EventStore>,
     /// LRU cache for query results (max 1000 entries by default)
-    cache: Arc<DashMap<CacheKey, Vec<Arc<Event>>>>,
+    cache: Arc<DashMap<CacheKey, Vec<Weak<Event>>>>,
     cache_max_entries: usize,
 }
 
@@ -385,13 +385,25 @@ impl SubscriptionManager {
         let cache_key = CacheKey::from_filter(filter);
 
         if let Some(cached) = self.cache.get(&cache_key) {
-            return (*cached).clone();
+            let upgraded: Vec<Arc<Event>> = cached
+                .value()
+                .iter()
+                .filter_map(|weak| weak.upgrade())
+                .collect();
+            
+            if upgraded.len() == cached.len() {
+                return upgraded;
+            }
         }
 
         let results = self.query_filter_internal(filter);
 
         if !results.is_empty() {
-            self.cache.insert(cache_key, results.clone());
+            let weak_results: Vec<Weak<Event>> = results
+                .iter()
+                .map(|arc| Arc::downgrade(arc))
+                .collect();
+            self.cache.insert(cache_key, weak_results);
         }
 
         results
@@ -594,7 +606,7 @@ mod tests {
     use super::*;
     use crate::event::Event;
     use crate::store::StoreConfig;
-    use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
     fn make_event(id: u8, pubkey: u8, kind: u32, created_at: u64) -> Arc<Event> {
         let json = format!(

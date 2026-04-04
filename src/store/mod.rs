@@ -185,17 +185,16 @@ impl EventStore {
         let current_mem = self.index.memory_bytes();
         let max_bytes = self.config.max_bytes;
 
-        if max_bytes == 0 || current_mem == 0 {
+        if max_bytes == 0 {
             self.state.consecutive_evictions.store(0, Ordering::Relaxed);
             return;
         }
 
-        let threshold = max_bytes * 70 / 100;
-        let target = max_bytes * 50 / 100;
+        let process_mem = get_process_memory();
 
         // Adaptive interval: evict more frequently when close to limit
-        let new_interval = if current_mem >= threshold {
-            1 // 1s when over 70% for high input rates
+        let new_interval = if current_mem >= max_bytes * 70 / 100 || process_mem >= max_bytes as u64 {
+            1 // 1s when over 70% or RSS over limit
         } else if current_mem >= max_bytes * 50 / 100 {
             2 // 2s when 50-70% of limit
         } else {
@@ -205,15 +204,15 @@ impl EventStore {
             .interval_seconds
             .store(new_interval, Ordering::Relaxed);
 
-        // Evict in batch if over threshold - remove up to 1000 events at once
-        if current_mem > target {
-            let batch_size = 1000;
+        let target = max_bytes * 50 / 100;
+        
+        // Evict if tracked memory is over target OR if actual process memory exceeds limit
+        if current_mem > target || process_mem > max_bytes as u64 {
+            let batch_size = if process_mem > max_bytes as u64 { 5000 } else { 1000 };
             let mut removed = 0;
 
-            // Get batch of oldest events
             let oldest = self.index.get_oldest(batch_size);
 
-            // Remove all and track actual memory freed
             for event_ref in oldest.iter() {
                 self.index.remove(&event_ref.id);
                 removed += 1;
@@ -231,6 +230,7 @@ impl EventStore {
                     evictions_streak = evictions,
                     mem_before = current_mem,
                     mem_after = new_mem,
+                    process_mem = process_mem,
                     "batch eviction"
                 );
             }
