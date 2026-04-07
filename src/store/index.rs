@@ -253,8 +253,8 @@ impl EventIndex {
         // Delete from pubkey index - need to find by ID since Ord is by created_at
         {
             let pubkey_hash = TagIdHash::from_id(&event.pubkey);
+            let mut should_remove_key = false;
             if let Some(set_lock) = self.by_pubkey.get(&pubkey_hash) {
-                // Find the event by ID (not by created_at)
                 let to_remove = {
                     let set = set_lock.read();
                     set.iter()
@@ -265,18 +265,18 @@ impl EventIndex {
                 if let Some(ref er) = to_remove {
                     let mut set = set_lock.write();
                     set.remove(er);
-                    if set.is_empty() {
-                        drop(set);
-                        self.by_pubkey.remove(&pubkey_hash);
-                    }
+                    should_remove_key = set.is_empty();
                 }
+            }
+            if should_remove_key {
+                self.by_pubkey.remove(&pubkey_hash);
             }
         }
 
         // Delete from kind index
         {
+            let mut should_remove_key = false;
             if let Some(set_lock) = self.by_kind.get(&event.kind) {
-                // Find the event by ID
                 let to_remove = {
                     let set = set_lock.read();
                     set.iter()
@@ -287,11 +287,11 @@ impl EventIndex {
                 if let Some(ref er) = to_remove {
                     let mut set = set_lock.write();
                     set.remove(er);
-                    if set.is_empty() {
-                        drop(set);
-                        self.by_kind.remove(&event.kind);
-                    }
+                    should_remove_key = set.is_empty();
                 }
+            }
+            if should_remove_key {
+                self.by_kind.remove(&event.kind);
             }
         }
 
@@ -299,6 +299,7 @@ impl EventIndex {
         {
             for e_tag in event.e_tags() {
                 let e_tag_hash = TagIdHash::from_id(&e_tag);
+                let mut should_remove_key = false;
                 if let Some(set_lock) = self.by_tag_e.get(&e_tag_hash) {
                     let to_remove = {
                         let set = set_lock.read();
@@ -310,11 +311,11 @@ impl EventIndex {
                     if let Some(ref er) = to_remove {
                         let mut set = set_lock.write();
                         set.remove(er);
-                        if set.is_empty() {
-                            drop(set);
-                            self.by_tag_e.remove(&e_tag_hash);
-                        }
+                        should_remove_key = set.is_empty();
                     }
+                }
+                if should_remove_key {
+                    self.by_tag_e.remove(&e_tag_hash);
                 }
             }
         }
@@ -323,6 +324,7 @@ impl EventIndex {
         {
             for p_tag in event.p_tags() {
                 let p_tag_hash = TagIdHash::from_id(&p_tag);
+                let mut should_remove_key = false;
                 if let Some(set_lock) = self.by_tag_p.get(&p_tag_hash) {
                     let to_remove = {
                         let set = set_lock.read();
@@ -334,11 +336,11 @@ impl EventIndex {
                     if let Some(ref er) = to_remove {
                         let mut set = set_lock.write();
                         set.remove(er);
-                        if set.is_empty() {
-                            drop(set);
-                            self.by_tag_p.remove(&p_tag_hash);
-                        }
+                        should_remove_key = set.is_empty();
                     }
+                }
+                if should_remove_key {
+                    self.by_tag_p.remove(&p_tag_hash);
                 }
             }
         }
@@ -352,6 +354,8 @@ impl EventIndex {
                     && letter != 'p'
                     && let Some(value) = tag.value()
                 {
+                    let mut should_remove_value = false;
+                    let mut should_remove_letter = false;
                     if let Some(inner_map) = self.by_tag_other.get(&letter) {
                         if let Some(set_lock) = inner_map.get(value) {
                             let to_remove = {
@@ -364,15 +368,16 @@ impl EventIndex {
                             if let Some(ref er) = to_remove {
                                 let mut set = set_lock.write();
                                 set.remove(er);
-                                if set.is_empty() {
-                                    drop(set);
-                                    inner_map.remove(value);
-                                }
+                                should_remove_value = set.is_empty();
                             }
                         }
-                        if inner_map.is_empty() {
-                            self.by_tag_other.remove(&letter);
+                        if should_remove_value {
+                            inner_map.remove(value);
                         }
+                        should_remove_letter = inner_map.is_empty();
+                    }
+                    if should_remove_letter {
+                        self.by_tag_other.remove(&letter);
                     }
                 }
             }
@@ -436,6 +441,11 @@ impl EventIndex {
     /// Get all events for persistence
     pub fn iter_all(&self) -> Vec<Arc<Event>> {
         self.by_id.iter().map(|r| Arc::clone(r.value())).collect()
+    }
+
+    /// Get all live event IDs
+    pub fn all_ids(&self) -> std::collections::HashSet<[u8; 32]> {
+        self.by_id.iter().map(|r| *r.key()).collect()
     }
 
     /// Query by pubkey, returns events sorted by created_at DESC

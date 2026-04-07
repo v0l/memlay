@@ -471,107 +471,91 @@ impl EventStore {
     }
 
     /// Load events from disk by replaying the WAL.
-    /// After loading, evicts old events to respect memory limits.
-    /// Compacts the WAL to remove entries for evicted events.
+    /// Evicts old events during replay to stay within memory limits.
+    /// Compacts the WAL afterwards to remove stale entries.
     pub fn load_from_disk(&self) -> anyhow::Result<usize> {
-        let Some(ref path) = self.config.persistence_path else {
+        let Some(ref _path) = self.config.persistence_path else {
             return Ok(0);
         };
 
-        let data_dir = Path::new(path);
-        let _ = data_dir;
+        let Some(ref wal) = self.wal else {
+            return Ok(0);
+        };
 
-        // If WAL is enabled, replay it
-        if let Some(ref wal) = self.wal {
-            let wal_path = wal.path();
-            let mut wal_count = 0;
-            let mut errors = 0;
-            let max_bytes = self.config.max_bytes;
+        let wal_path = wal.path();
+        let mut wal_count = 0usize;
+        let mut errors = 0usize;
+        let mut evicted = 0usize;
+        let max_bytes = self.config.max_bytes;
+        let eviction_threshold = if max_bytes > 0 { max_bytes * 90 / 100 } else { 0 };
+        let eviction_target = if max_bytes > 0 { max_bytes * 70 / 100 } else { 0 };
 
-            match wal.replay(|op| {
-                match op {
-                    WalOp::Insert(data) => {
-                        match Event::from_json_unchecked(&data) {
-                            Ok(event) => {
-                                self.index.insert(Arc::new(event));
-                                wal_count += 1;
-                            }
-                            Err(e) => {
-                                errors += 1;
-                                tracing::warn!(error = %e, "failed to parse event from WAL");
+        match wal.replay(|op| {
+            match op {
+                WalOp::Insert(data) => {
+                    match Event::from_json_unchecked(&data) {
+                        Ok(event) => {
+                            self.index.insert(Arc::new(event));
+                            wal_count += 1;
+
+                            if eviction_threshold > 0 && self.index.memory_bytes() > eviction_threshold {
+                                while self.index.memory_bytes() > eviction_target {
+                                    let oldest = self.index.get_oldest(1);
+                                    if oldest.is_empty() {
+                                        break;
+                                    }
+                                    self.index.remove(&oldest[0].id);
+                                    evicted += 1;
+                                }
                             }
                         }
-                    }
-                    WalOp::Delete(id) => {
-                        self.index.remove(&id);
-                        wal_count += 1;
+                        Err(e) => {
+                            errors += 1;
+                            tracing::warn!(error = %e, "failed to parse event from WAL");
+                        }
                     }
                 }
-            }) {
-                Ok(_) => {
-                    if errors > 0 {
-                        tracing::warn!(errors, "some events failed to load from WAL");
-                    }
-                    tracing::info!(path = %wal_path, loaded = wal_count, errors, "loaded events from WAL");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to replay WAL");
+                WalOp::Delete(id) => {
+                    self.index.remove(&id);
+                    wal_count += 1;
                 }
             }
-
-            // If we have a memory limit and are over it, evict old events
-            if max_bytes > 0 {
-                let current_mem = self.index.memory_bytes();
-                if current_mem > max_bytes {
-                    tracing::info!(
-                        current_mem,
-                        max_bytes,
-                        loaded = wal_count,
-                        "loaded events exceed memory limit, evicting old events"
-                    );
-                    
-                    // Evict oldest events one at a time until under limit
-                    // Target 80% of max_bytes to provide headroom
-                    let target = max_bytes * 80 / 100;
-                    let mut evicted = 0;
-                    
-                    while self.index.memory_bytes() > target {
-                        let oldest = self.index.get_oldest(1);
-                        
-                        if oldest.is_empty() {
-                            break;
-                        }
-                        
-                        self.index.remove(&oldest[0].id);
-                        evicted += 1;
-                    }
-                    
-                    tracing::info!(
-                        evicted,
-                        remaining = self.index.len(),
-                        current_mem = self.index.memory_bytes(),
-                        "evicted old events after WAL replay"
-                    );
+        }) {
+            Ok(_) => {
+                if errors > 0 {
+                    tracing::warn!(errors, "some events failed to load from WAL");
                 }
-                
-                // Compact the WAL to remove entries for evicted events
-                // This prevents the WAL from growing unbounded and wasting disk space
-                match wal.compact(max_bytes, self.index.memory_bytes()) {
-                    Ok(removed) => {
-                        if removed > 0 {
-                            tracing::info!(removed, "compacted WAL after eviction");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to compact WAL");
-                    }
-                }
+                tracing::info!(
+                    path = %wal_path,
+                    loaded = wal_count,
+                    evicted,
+                    errors,
+                    remaining = self.index.len(),
+                    memory = self.index.memory_bytes(),
+                    "loaded events from WAL"
+                );
             }
-
-            return Ok(wal_count);
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to replay WAL");
+            }
         }
 
-        Ok(0)
+        // Compact the WAL to only contain live events
+        if wal_count > 0 {
+            let live_ids = self.index.all_ids();
+            match wal.compact(&live_ids) {
+                Ok(removed) => {
+                    if removed > 0 {
+                        tracing::info!(removed, kept = live_ids.len(), "compacted WAL");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to compact WAL");
+                }
+            }
+        }
+
+        Ok(wal_count)
     }
 
     /// Start background persistence task (call from relay startup)
