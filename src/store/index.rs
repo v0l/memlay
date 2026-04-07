@@ -104,6 +104,9 @@ pub struct EventIndex {
 
     // Track actual memory usage (bytes of raw event JSON)
     memory_bytes: AtomicUsize,
+    
+    // Track event count for lock-free stats
+    event_count: AtomicUsize,
 }
 
 impl EventIndex {
@@ -118,6 +121,7 @@ impl EventIndex {
             by_oldest: RwLock::new(BTreeSet::new()),
             by_replaceable: DashMap::new(),
             memory_bytes: AtomicUsize::new(0),
+            event_count: AtomicUsize::new(0),
         }
     }
 
@@ -147,6 +151,7 @@ impl EventIndex {
 
         // Track memory usage (raw JSON bytes)
         self.memory_bytes.fetch_add(event.raw.len(), AtomicOrdering::Relaxed);
+        self.event_count.fetch_add(1, AtomicOrdering::Relaxed);
 
         // Primary index
         self.by_id.insert(event.id, event.clone());
@@ -235,6 +240,7 @@ impl EventIndex {
         // Track memory usage (raw JSON bytes)
         let event_size = event.raw.len();
         self.memory_bytes.fetch_sub(event_size, AtomicOrdering::Relaxed);
+        self.event_count.fetch_sub(1, AtomicOrdering::Relaxed);
 
         // Delete from replaceable index if this is a replaceable event
         if !skip_replaceable && event.is_replaceable() {
@@ -394,18 +400,25 @@ impl EventIndex {
     /// Get the oldest events for eviction (returns oldest first)
     pub fn get_oldest(&self, count: usize) -> Vec<EventRef> {
         // BTreeSet is sorted newest-first (EventRef ordering), so iterate from end
-        self.by_oldest
-            .read()
+        let by_oldest = self.by_oldest.read();
+        let oldest: Vec<EventRef> = by_oldest
             .iter()
             .rev()
             .take(count)
             .cloned()
-            .collect()
+            .collect();
+        
+        oldest
     }
 
     /// Get current memory usage in bytes (raw JSON only)
     pub fn memory_bytes(&self) -> usize {
         self.memory_bytes.load(AtomicOrdering::Relaxed)
+    }
+    
+    /// Get event count (lock-free)
+    pub fn event_count(&self) -> usize {
+        self.event_count.load(AtomicOrdering::Relaxed)
     }
 }
 
@@ -428,30 +441,39 @@ impl EventIndex {
     /// Query by pubkey, returns events sorted by created_at DESC
     pub fn query_by_pubkey(&self, pubkey: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         let pubkey_hash = TagIdHash::from_id(pubkey);
-        self.by_pubkey
-            .get(&pubkey_hash)
-            .map(|set_lock| {
-                set_lock.read()
-                    .iter()
-                    .take(limit)
-                    .map(|r| Arc::clone(&r.event))
-                    .collect()
-            })
-            .unwrap_or_default()
+        
+        // Fast path: check if entry exists without holding lock
+        let Some(set_lock) = self.by_pubkey.get(&pubkey_hash) else {
+            return Vec::new();
+        };
+        
+        // Clone Arcs quickly while holding read lock, then return
+        let events: Vec<Arc<Event>> = {
+            let set = set_lock.read();
+            set.iter()
+                .take(limit)
+                .map(|r| Arc::clone(&r.event))
+                .collect()
+        };
+        
+        events
     }
 
     /// Query by kind, returns events sorted by created_at DESC
     pub fn query_by_kind(&self, kind: u32, limit: usize) -> Vec<Arc<Event>> {
-        self.by_kind
-            .get(&kind)
-            .map(|set_lock| {
-                set_lock.read()
-                    .iter()
-                    .take(limit)
-                    .map(|r| Arc::clone(&r.event))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Some(set_lock) = self.by_kind.get(&kind) else {
+            return Vec::new();
+        };
+        
+        let events: Vec<Arc<Event>> = {
+            let set = set_lock.read();
+            set.iter()
+                .take(limit)
+                .map(|r| Arc::clone(&r.event))
+                .collect()
+        };
+        
+        events
     }
 
     /// Query by pubkey with since filter, returns events sorted by created_at DESC
@@ -462,66 +484,80 @@ impl EventIndex {
         limit: usize,
     ) -> Vec<Arc<Event>> {
         let pubkey_hash = TagIdHash::from_id(pubkey);
-        self.by_pubkey
-            .get(&pubkey_hash)
-            .map(|set_lock| {
-                set_lock.read()
-                    .iter()
-                    .filter(|r| r.created_at >= since)
-                    .take(limit)
-                    .map(|r| Arc::clone(&r.event))
-                    .collect()
-            })
-            .unwrap_or_default()
+        
+        let Some(set_lock) = self.by_pubkey.get(&pubkey_hash) else {
+            return Vec::new();
+        };
+        
+        let events: Vec<Arc<Event>> = {
+            let set = set_lock.read();
+            set.iter()
+                .filter(|r| r.created_at >= since)
+                .take(limit)
+                .map(|r| Arc::clone(&r.event))
+                .collect()
+        };
+        
+        events
     }
 
     /// Query by e-tag (events referencing this event ID)
     pub fn query_by_e_tag(&self, event_id: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         let e_tag_hash = TagIdHash::from_id(event_id);
-        self.by_tag_e
-            .get(&e_tag_hash)
-            .map(|set_lock| {
-                set_lock.read()
-                    .iter()
-                    .take(limit)
-                    .map(|r| Arc::clone(&r.event))
-                    .collect()
-            })
-            .unwrap_or_default()
+        
+        let Some(set_lock) = self.by_tag_e.get(&e_tag_hash) else {
+            return Vec::new();
+        };
+        
+        let events: Vec<Arc<Event>> = {
+            let set = set_lock.read();
+            set.iter()
+                .take(limit)
+                .map(|r| Arc::clone(&r.event))
+                .collect()
+        };
+        
+        events
     }
 
     /// Query by p-tag (events mentioning this pubkey)
     pub fn query_by_p_tag(&self, pubkey: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         let p_tag_hash = TagIdHash::from_id(pubkey);
-        self.by_tag_p
-            .get(&p_tag_hash)
-            .map(|set_lock| {
-                set_lock.read()
-                    .iter()
-                    .take(limit)
-                    .map(|r| Arc::clone(&r.event))
-                    .collect()
-            })
-            .unwrap_or_default()
+        
+        let Some(set_lock) = self.by_tag_p.get(&p_tag_hash) else {
+            return Vec::new();
+        };
+        
+        let events: Vec<Arc<Event>> = {
+            let set = set_lock.read();
+            set.iter()
+                .take(limit)
+                .map(|r| Arc::clone(&r.event))
+                .collect()
+        };
+        
+        events
     }
 
     /// Query by any other single-letter tag value (events with `["x", "<value>"]`).
     pub fn query_by_tag(&self, letter: char, value: &str, limit: usize) -> Vec<Arc<Event>> {
-        let result = if let Some(inner_map) = self.by_tag_other.get(&letter) {
-            inner_map
-                .get(value)
-                .map(|set_lock| {
-                    set_lock.read()
-                        .iter()
-                        .take(limit)
-                        .map(|r| Arc::clone(&r.event))
-                        .collect()
-                })
-        } else {
-            None
+        let Some(inner_map) = self.by_tag_other.get(&letter) else {
+            return Vec::new();
         };
-
-        result.unwrap_or_default()
+        
+        let Some(set_lock) = inner_map.get(value) else {
+            return Vec::new();
+        };
+        
+        let events: Vec<Arc<Event>> = {
+            let set = set_lock.read();
+            set.iter()
+                .take(limit)
+                .map(|r| Arc::clone(&r.event))
+                .collect()
+        };
+        
+        events
     }
 }
 

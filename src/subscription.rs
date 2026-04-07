@@ -399,8 +399,12 @@ impl SubscriptionManager {
         let results = self.query_filter_internal(filter);
 
         if !results.is_empty() {
+            // Evict oldest cache entry if at capacity instead of clearing all
             if self.cache.len() >= self.cache_max_entries {
-                self.cache.clear();
+                // Remove one random entry to make room (DashMap doesn't have LRU built-in)
+                if let Some(random_key) = self.cache.iter().next().map(|r| r.key().clone()) {
+                    self.cache.remove(&random_key);
+                }
             }
             let weak_results: Vec<Weak<Event>> = results
                 .iter()

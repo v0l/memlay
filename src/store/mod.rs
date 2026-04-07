@@ -394,7 +394,7 @@ impl EventStore {
 
     /// Number of events in the store
     pub fn len(&self) -> usize {
-        self.index.len()
+        self.index.event_count()
     }
 
     /// Check if store is empty
