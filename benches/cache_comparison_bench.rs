@@ -1,7 +1,8 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion};
 use memlay::event::Event;
 use memlay::store::{EventStore, StoreConfig};
 use memlay::subscription::{Filter, SubscriptionManager};
+use std::hint::black_box;
 use std::sync::Arc;
 
 fn make_event(id: u64, kind: u32) -> Arc<Event> {
@@ -41,10 +42,7 @@ fn bench_cache_hit_vs_miss(c: &mut Criterion) {
 
     c.bench_function("cache_miss", &mut |b: &mut criterion::Bencher| {
         b.iter(|| {
-            let store = EventStore::new(StoreConfig {
-                max_events: 200_000,
-                max_bytes: 0,
-            });
+            let store = EventStore::new(StoreConfig::default());
             let sub_mgr = SubscriptionManager::new(Arc::new(store));
 
             for event in &events {
@@ -63,10 +61,7 @@ fn bench_cache_hit_vs_miss(c: &mut Criterion) {
 
     c.bench_function("cache_hit", &mut |b: &mut criterion::Bencher| {
         b.iter(|| {
-            let store = EventStore::new(StoreConfig {
-                max_events: 200_000,
-                max_bytes: 0,
-            });
+            let store = EventStore::new(StoreConfig::default());
             let sub_mgr = SubscriptionManager::new(Arc::new(store));
 
             for event in &events {

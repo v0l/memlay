@@ -3,6 +3,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 mod index;
@@ -85,6 +86,7 @@ pub struct EventStore {
     config: StoreConfig,
     state: EvictionState,
     wal: Option<Arc<WriteAheadLog>>,
+    sys: Mutex<sysinfo::System>,
 }
 
 impl StoreConfig {
@@ -163,6 +165,7 @@ impl EventStore {
                 consecutive_evictions: AtomicUsize::new(0),
             },
             wal,
+            sys: Mutex::new(sysinfo::System::new()),
         }
     }
 
@@ -190,7 +193,22 @@ impl EventStore {
             return;
         }
 
-        let process_mem = get_process_memory();
+        // Reuse sysinfo::System instance to avoid expensive process refresh
+        let process_mem = {
+            let mut sys = self.sys.lock().unwrap();
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            
+            match sysinfo::get_current_pid() {
+                Ok(pid) => {
+                    if let Some(process) = sys.process(pid) {
+                        process.memory()
+                    } else {
+                        0
+                    }
+                }
+                Err(_) => 0,
+            }
+        };
 
         // Adaptive interval: evict more frequently when close to limit
         let new_interval = if current_mem >= max_bytes * 70 / 100 || process_mem >= max_bytes as u64 {

@@ -399,6 +399,9 @@ impl SubscriptionManager {
         let results = self.query_filter_internal(filter);
 
         if !results.is_empty() {
+            if self.cache.len() >= self.cache_max_entries {
+                self.cache.clear();
+            }
             let weak_results: Vec<Weak<Event>> = results
                 .iter()
                 .map(|arc| Arc::downgrade(arc))
@@ -606,7 +609,7 @@ mod tests {
     use super::*;
     use crate::event::Event;
     use crate::store::StoreConfig;
-use std::sync::{Arc, Weak};
+    use std::sync::Arc;
 
     fn make_event(id: u8, pubkey: u8, kind: u32, created_at: u64) -> Arc<Event> {
         let json = format!(

@@ -1,8 +1,8 @@
-use criterion::{Bencher, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, Bencher, Criterion};
 use memlay::event::Event;
 use memlay::store::EventRef;
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 fn make_event(id: u8, pubkey: u8, kind: u32, created_at: u64) -> Arc<Event> {

@@ -1,12 +1,12 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion};
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 fn benchmark_concurrent_map_operations(c: &mut Criterion) {
     let num_threads = num_cpus::get();
 
-    c.bench_function("RwLock_HashMap_concurrent_rw", &mut |b| {
+    c.bench_function("RwLock_HashMap_concurrent_rw", |b| {
         b.iter(|| {
             let map: Arc<RwLock<HashMap<u32, u32>>> = Arc::new(RwLock::new(HashMap::new()));
             let handles: Vec<_> = (0..num_threads)
@@ -19,7 +19,7 @@ fn benchmark_concurrent_map_operations(c: &mut Criterion) {
                                 guard.insert((tid * 1000 + i) as u32, (tid * 1000 + i) as u32);
                             } else {
                                 let guard = map.read();
-                                let _val = guard.get(&(0));
+                                let _val: Option<&u32> = guard.get(&0);
                             }
                         }
                     })
@@ -32,7 +32,7 @@ fn benchmark_concurrent_map_operations(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("DashMap_concurrent_rw", &mut |b| {
+    c.bench_function("DashMap_concurrent_rw", |b| {
         b.iter(|| {
             let map: dashmap::DashMap<u32, u32> = dashmap::DashMap::new();
             let handles: Vec<_> = (0..num_threads)

@@ -1,7 +1,8 @@
 use crate::event::{Event, ReplacementKey};
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -80,26 +81,26 @@ impl std::hash::Hash for EventRef {
 /// Each index has its own RwLock for fine-grained concurrency.
 pub struct EventIndex {
     // Primary index: O(1) lookup by id
-    by_id: RwLock<HashMap<[u8; 32], Arc<Event>>>,
+    by_id: DashMap<[u8; 32], Arc<Event>>,
 
     // Pubkey index: all events from a pubkey (64-bit hash of pubkey)
-    by_pubkey: RwLock<HashMap<TagIdHash, BTreeSet<EventRef>>>,
-    by_kind: RwLock<HashMap<u32, BTreeSet<EventRef>>>,
+    by_pubkey: DashMap<TagIdHash, RwLock<BTreeSet<EventRef>>>,
+    by_kind: DashMap<u32, RwLock<BTreeSet<EventRef>>>,
 
     // Dedicated fast indexes for the two most-common tag types (64-bit hash)
-    by_tag_e: RwLock<HashMap<TagIdHash, BTreeSet<EventRef>>>,
-    by_tag_p: RwLock<HashMap<TagIdHash, BTreeSet<EventRef>>>,
+    by_tag_e: DashMap<TagIdHash, RwLock<BTreeSet<EventRef>>>,
+    by_tag_p: DashMap<TagIdHash, RwLock<BTreeSet<EventRef>>>,
 
     // Generic index for every other single-letter tag (NIP-01 §tags)
     // Outer key: tag letter ('t', 'a', 'd', …)
     // Inner key: raw tag value string
-    by_tag_other: RwLock<HashMap<TagLetter, HashMap<String, BTreeSet<EventRef>>>>,
+    by_tag_other: DashMap<TagLetter, DashMap<String, RwLock<BTreeSet<EventRef>>>>,
 
     // Oldest-first index for memory-based eviction
     by_oldest: RwLock<BTreeSet<EventRef>>,
 
     // Replaceable events index: maps (pubkey, kind) or (pubkey, kind, d-tag) to latest event id
-    by_replaceable: RwLock<HashMap<ReplacementKey, [u8; 32]>>,
+    by_replaceable: DashMap<ReplacementKey, [u8; 32]>,
 
     // Track actual memory usage (bytes of raw event JSON)
     memory_bytes: AtomicUsize,
@@ -108,14 +109,14 @@ pub struct EventIndex {
 impl EventIndex {
     pub fn new() -> Self {
         Self {
-            by_id: RwLock::new(HashMap::new()),
-            by_pubkey: RwLock::new(HashMap::new()),
-            by_kind: RwLock::new(HashMap::new()),
-            by_tag_e: RwLock::new(HashMap::new()),
-            by_tag_p: RwLock::new(HashMap::new()),
-            by_tag_other: RwLock::new(HashMap::new()),
+            by_id: DashMap::new(),
+            by_pubkey: DashMap::new(),
+            by_kind: DashMap::new(),
+            by_tag_e: DashMap::new(),
+            by_tag_p: DashMap::new(),
+            by_tag_other: DashMap::new(),
             by_oldest: RwLock::new(BTreeSet::new()),
-            by_replaceable: RwLock::new(HashMap::new()),
+            by_replaceable: DashMap::new(),
             memory_bytes: AtomicUsize::new(0),
         }
     }
@@ -130,8 +131,7 @@ impl EventIndex {
         if event.is_replaceable() {
             let key = event.replacement_key();
             if let ReplacementKey::Replaceable { .. } | ReplacementKey::Addressable { .. } = &key {
-                let mut replaceable = self.by_replaceable.write();
-                if let Some(old_id) = replaceable.insert(key.clone(), event.id) {
+                if let Some(old_id) = self.by_replaceable.insert(key.clone(), event.id) {
                     old_id_to_remove = Some(old_id);
                 }
             }
@@ -139,7 +139,8 @@ impl EventIndex {
 
         // Remove old event outside of replaceable lock to avoid deadlock
         if let Some(old_id) = old_id_to_remove {
-            if let Some(old_event) = self.remove(&old_id) {
+            // Use internal_remove to avoid recursive by_replaceable removal
+            if let Some(old_event) = self.internal_remove(&old_id, false) {
                 replaced = Some(old_event);
             }
         }
@@ -148,46 +149,53 @@ impl EventIndex {
         self.memory_bytes.fetch_add(event.raw.len(), AtomicOrdering::Relaxed);
 
         // Primary index
-        self.by_id.write().insert(event.id, event.clone());
+        self.by_id.insert(event.id, event.clone());
 
         // Pubkey index
         {
-            let mut by_pubkey = self.by_pubkey.write();
-            let event_ref = EventRef::new(event.clone());
             let pubkey_hash = TagIdHash::from_id(&event.pubkey);
-            by_pubkey.entry(pubkey_hash).or_default().insert(event_ref);
+            self.by_pubkey
+                .entry(pubkey_hash)
+                .or_insert_with(|| RwLock::new(BTreeSet::new()))
+                .write()
+                .insert(EventRef::new(event.clone()));
         }
 
         // Kind index
         {
-            let mut by_kind = self.by_kind.write();
-            let event_ref = EventRef::new(event.clone());
-            by_kind.entry(event.kind).or_default().insert(event_ref);
+            self.by_kind
+                .entry(event.kind)
+                .or_insert_with(|| RwLock::new(BTreeSet::new()))
+                .write()
+                .insert(EventRef::new(event.clone()));
         }
 
         // E-tag index
         {
-            let mut by_tag_e = self.by_tag_e.write();
             for e_tag in event.e_tags() {
-                let event_ref = EventRef::new(event.clone());
                 let e_tag_hash = TagIdHash::from_id(&e_tag);
-                by_tag_e.entry(e_tag_hash).or_default().insert(event_ref);
+                self.by_tag_e
+                    .entry(e_tag_hash)
+                    .or_insert_with(|| RwLock::new(BTreeSet::new()))
+                    .write()
+                    .insert(EventRef::new(event.clone()));
             }
         }
 
         // P-tag index
         {
-            let mut by_tag_p = self.by_tag_p.write();
             for p_tag in event.p_tags() {
-                let event_ref = EventRef::new(event.clone());
                 let p_tag_hash = TagIdHash::from_id(&p_tag);
-                by_tag_p.entry(p_tag_hash).or_default().insert(event_ref);
+                self.by_tag_p
+                    .entry(p_tag_hash)
+                    .or_insert_with(|| RwLock::new(BTreeSet::new()))
+                    .write()
+                    .insert(EventRef::new(event.clone()));
             }
         }
 
         // Generic tag index for all other single-letter tags
         {
-            let mut by_tag_other = self.by_tag_other.write();
             for tag in &event.tags {
                 let mut chars = tag.name.chars();
                 if let (Some(letter), None) = (chars.next(), chars.next())
@@ -195,13 +203,12 @@ impl EventIndex {
                     && letter != 'p'
                     && let Some(value) = tag.value()
                 {
-                    let event_ref = EventRef::new(event.clone());
-                    by_tag_other
-                        .entry(letter)
-                        .or_default()
+                    let inner_map = self.by_tag_other.entry(letter).or_insert_with(DashMap::new);
+                    inner_map
                         .entry(value.to_string())
-                        .or_default()
-                        .insert(event_ref);
+                        .or_insert_with(|| RwLock::new(BTreeSet::new()))
+                        .write()
+                        .insert(EventRef::new(event.clone()));
                 }
             }
         }
@@ -209,69 +216,98 @@ impl EventIndex {
         // Oldest-first index for eviction (newest first in EventRef ordering)
         {
             let mut by_oldest = self.by_oldest.write();
-            let event_ref = EventRef::new(event);
-            by_oldest.insert(event_ref);
+            by_oldest.insert(EventRef::new(event));
         }
 
         replaced
     }
 
-    /// Remove an event from all indexes
+/// Remove an event from all indexes
+    /// If skip_replaceable is true, skip removing from the replaceable index (used during insert to avoid deadlock)
     pub fn remove(&self, id: &[u8; 32]) -> Option<Arc<Event>> {
-        let event = self.by_id.write().remove(id)?;
+        self.internal_remove(id, true)
+    }
+
+    /// Internal remove method with control over replaceable index removal
+    fn internal_remove(&self, id: &[u8; 32], skip_replaceable: bool) -> Option<Arc<Event>> {
+        let (_, event) = self.by_id.remove(id)?;
 
         // Track memory usage (raw JSON bytes)
         let event_size = event.raw.len();
         self.memory_bytes.fetch_sub(event_size, AtomicOrdering::Relaxed);
 
-        // Create a dummy EventRef for removal (only id matters for equality)
-        let dummy_ref = EventRef {
-            created_at: event.created_at,
-            id: event.id,
-            event: Arc::clone(&event),
-        };
-
         // Delete from replaceable index if this is a replaceable event
-        if event.is_replaceable() {
+        if !skip_replaceable && event.is_replaceable() {
             let key = event.replacement_key();
             if let ReplacementKey::Replaceable { .. } | ReplacementKey::Addressable { .. } = &key {
-                let mut replaceable = self.by_replaceable.write();
-                replaceable.remove(&key);
+                self.by_replaceable.remove(&key);
             }
         }
 
-        // Delete from pubkey index
+        // Delete from pubkey index - need to find by ID since Ord is by created_at
         {
-            let mut by_pubkey = self.by_pubkey.write();
             let pubkey_hash = TagIdHash::from_id(&event.pubkey);
-            if let Some(set) = by_pubkey.get_mut(&pubkey_hash) {
-                set.remove(&dummy_ref);
-                if set.is_empty() {
-                    by_pubkey.remove(&pubkey_hash);
+            if let Some(set_lock) = self.by_pubkey.get(&pubkey_hash) {
+                // Find the event by ID (not by created_at)
+                let to_remove = {
+                    let set = set_lock.read();
+                    set.iter()
+                        .find(|er| er.id == event.id)
+                        .cloned()
+                };
+                
+                if let Some(ref er) = to_remove {
+                    let mut set = set_lock.write();
+                    set.remove(er);
+                    if set.is_empty() {
+                        drop(set);
+                        self.by_pubkey.remove(&pubkey_hash);
+                    }
                 }
             }
         }
 
         // Delete from kind index
         {
-            let mut by_kind = self.by_kind.write();
-            if let Some(set) = by_kind.get_mut(&event.kind) {
-                set.remove(&dummy_ref);
-                if set.is_empty() {
-                    by_kind.remove(&event.kind);
+            if let Some(set_lock) = self.by_kind.get(&event.kind) {
+                // Find the event by ID
+                let to_remove = {
+                    let set = set_lock.read();
+                    set.iter()
+                        .find(|er| er.id == event.id)
+                        .cloned()
+                };
+                
+                if let Some(ref er) = to_remove {
+                    let mut set = set_lock.write();
+                    set.remove(er);
+                    if set.is_empty() {
+                        drop(set);
+                        self.by_kind.remove(&event.kind);
+                    }
                 }
             }
         }
 
         // Remove from e-tag index
         {
-            let mut by_tag_e = self.by_tag_e.write();
             for e_tag in event.e_tags() {
                 let e_tag_hash = TagIdHash::from_id(&e_tag);
-                if let Some(set) = by_tag_e.get_mut(&e_tag_hash) {
-                    set.remove(&dummy_ref);
-                    if set.is_empty() {
-                        by_tag_e.remove(&e_tag_hash);
+                if let Some(set_lock) = self.by_tag_e.get(&e_tag_hash) {
+                    let to_remove = {
+                        let set = set_lock.read();
+                        set.iter()
+                            .find(|er| er.id == event.id)
+                            .cloned()
+                    };
+                    
+                    if let Some(ref er) = to_remove {
+                        let mut set = set_lock.write();
+                        set.remove(er);
+                        if set.is_empty() {
+                            drop(set);
+                            self.by_tag_e.remove(&e_tag_hash);
+                        }
                     }
                 }
             }
@@ -279,13 +315,23 @@ impl EventIndex {
 
         // Remove from p-tag index
         {
-            let mut by_tag_p = self.by_tag_p.write();
             for p_tag in event.p_tags() {
                 let p_tag_hash = TagIdHash::from_id(&p_tag);
-                if let Some(set) = by_tag_p.get_mut(&p_tag_hash) {
-                    set.remove(&dummy_ref);
-                    if set.is_empty() {
-                        by_tag_p.remove(&p_tag_hash);
+                if let Some(set_lock) = self.by_tag_p.get(&p_tag_hash) {
+                    let to_remove = {
+                        let set = set_lock.read();
+                        set.iter()
+                            .find(|er| er.id == event.id)
+                            .cloned()
+                    };
+                    
+                    if let Some(ref er) = to_remove {
+                        let mut set = set_lock.write();
+                        set.remove(er);
+                        if set.is_empty() {
+                            drop(set);
+                            self.by_tag_p.remove(&p_tag_hash);
+                        }
                     }
                 }
             }
@@ -293,23 +339,34 @@ impl EventIndex {
 
         // Remove from generic tag index
         {
-            let mut by_tag_other = self.by_tag_other.write();
             for tag in &event.tags {
                 let mut chars = tag.name.chars();
                 if let (Some(letter), None) = (chars.next(), chars.next())
                     && letter != 'e'
                     && letter != 'p'
                     && let Some(value) = tag.value()
-                    && let Some(inner) = by_tag_other.get_mut(&letter)
                 {
-                    if let Some(set) = inner.get_mut(value) {
-                        set.remove(&dummy_ref);
-                        if set.is_empty() {
-                            inner.remove(value);
+                    if let Some(inner_map) = self.by_tag_other.get(&letter) {
+                        if let Some(set_lock) = inner_map.get(value) {
+                            let to_remove = {
+                                let set = set_lock.read();
+                                set.iter()
+                                    .find(|er| er.id == event.id)
+                                    .cloned()
+                            };
+                            
+                            if let Some(ref er) = to_remove {
+                                let mut set = set_lock.write();
+                                set.remove(er);
+                                if set.is_empty() {
+                                    drop(set);
+                                    inner_map.remove(value);
+                                }
+                            }
                         }
-                    }
-                    if inner.is_empty() {
-                        by_tag_other.remove(&letter);
+                        if inner_map.is_empty() {
+                            self.by_tag_other.remove(&letter);
+                        }
                     }
                 }
             }
@@ -317,8 +374,18 @@ impl EventIndex {
 
         // Remove from oldest index
         {
-            let mut by_oldest = self.by_oldest.write();
-            by_oldest.remove(&dummy_ref);
+            // Find the event by ID
+            let to_remove = {
+                let by_oldest = self.by_oldest.read();
+                by_oldest.iter()
+                    .find(|er| er.id == event.id)
+                    .cloned()
+            };
+            
+            if let Some(ref er) = to_remove {
+                let mut by_oldest = self.by_oldest.write();
+                by_oldest.remove(er);
+            }
         }
 
         Some(event)
@@ -345,27 +412,27 @@ impl EventIndex {
 impl EventIndex {
     /// Get an event by ID
     pub fn get(&self, id: &[u8; 32]) -> Option<Arc<Event>> {
-        self.by_id.read().get(id).cloned()
+        self.by_id.get(id).map(|r| Arc::clone(r.value()))
     }
 
     /// Number of events in the index
     pub fn len(&self) -> usize {
-        self.by_id.read().len()
+        self.by_id.len()
     }
 
     /// Get all events for persistence
     pub fn iter_all(&self) -> Vec<Arc<Event>> {
-        self.by_id.read().values().cloned().collect()
+        self.by_id.iter().map(|r| Arc::clone(r.value())).collect()
     }
 
     /// Query by pubkey, returns events sorted by created_at DESC
     pub fn query_by_pubkey(&self, pubkey: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         let pubkey_hash = TagIdHash::from_id(pubkey);
         self.by_pubkey
-            .read()
             .get(&pubkey_hash)
-            .map(|set| {
-                set.iter()
+            .map(|set_lock| {
+                set_lock.read()
+                    .iter()
                     .take(limit)
                     .map(|r| Arc::clone(&r.event))
                     .collect()
@@ -376,10 +443,10 @@ impl EventIndex {
     /// Query by kind, returns events sorted by created_at DESC
     pub fn query_by_kind(&self, kind: u32, limit: usize) -> Vec<Arc<Event>> {
         self.by_kind
-            .read()
             .get(&kind)
-            .map(|set| {
-                set.iter()
+            .map(|set_lock| {
+                set_lock.read()
+                    .iter()
                     .take(limit)
                     .map(|r| Arc::clone(&r.event))
                     .collect()
@@ -396,10 +463,10 @@ impl EventIndex {
     ) -> Vec<Arc<Event>> {
         let pubkey_hash = TagIdHash::from_id(pubkey);
         self.by_pubkey
-            .read()
             .get(&pubkey_hash)
-            .map(|set| {
-                set.iter()
+            .map(|set_lock| {
+                set_lock.read()
+                    .iter()
                     .filter(|r| r.created_at >= since)
                     .take(limit)
                     .map(|r| Arc::clone(&r.event))
@@ -412,10 +479,10 @@ impl EventIndex {
     pub fn query_by_e_tag(&self, event_id: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         let e_tag_hash = TagIdHash::from_id(event_id);
         self.by_tag_e
-            .read()
             .get(&e_tag_hash)
-            .map(|set| {
-                set.iter()
+            .map(|set_lock| {
+                set_lock.read()
+                    .iter()
                     .take(limit)
                     .map(|r| Arc::clone(&r.event))
                     .collect()
@@ -427,10 +494,10 @@ impl EventIndex {
     pub fn query_by_p_tag(&self, pubkey: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         let p_tag_hash = TagIdHash::from_id(pubkey);
         self.by_tag_p
-            .read()
             .get(&p_tag_hash)
-            .map(|set| {
-                set.iter()
+            .map(|set_lock| {
+                set_lock.read()
+                    .iter()
                     .take(limit)
                     .map(|r| Arc::clone(&r.event))
                     .collect()
@@ -440,17 +507,21 @@ impl EventIndex {
 
     /// Query by any other single-letter tag value (events with `["x", "<value>"]`).
     pub fn query_by_tag(&self, letter: char, value: &str, limit: usize) -> Vec<Arc<Event>> {
-        self.by_tag_other
-            .read()
-            .get(&letter)
-            .and_then(|inner| inner.get(value))
-            .map(|set| {
-                set.iter()
-                    .take(limit)
-                    .map(|r| Arc::clone(&r.event))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let result = if let Some(inner_map) = self.by_tag_other.get(&letter) {
+            inner_map
+                .get(value)
+                .map(|set_lock| {
+                    set_lock.read()
+                        .iter()
+                        .take(limit)
+                        .map(|r| Arc::clone(&r.event))
+                        .collect()
+                })
+        } else {
+            None
+        };
+
+        result.unwrap_or_default()
     }
 }
 
