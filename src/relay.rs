@@ -12,6 +12,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use futures_util::{stream::StreamExt, SinkExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,6 +20,9 @@ use tokio::sync::broadcast;
 
 /// Capacity of the relay-wide new-event broadcast channel.
 const BROADCAST_CAP: usize = 8192;
+
+/// Capacity of per-connection send channels (backpressure for slow clients).
+const CONN_SEND_CAP: usize = 256;
 
 /// Shared state threaded through axum via `State<Arc<AppState>>`.
 struct AppState {
@@ -224,7 +228,7 @@ fn landing_page(_config: &Config) -> impl IntoResponse {
 // ── WebSocket connection handler ──────────────────────────────────────────────
 
 async fn handle_socket(
-    mut socket: WebSocket,
+    socket: WebSocket,
     addr: SocketAddr,
     subscriptions: Arc<SubscriptionManager>,
     tx: broadcast::Sender<Arc<crate::event::Event>>,
@@ -236,16 +240,31 @@ async fn handle_socket(
 
     tracing::info!(%addr, "client connected");
 
+    // Split socket into send/receive parts
+    let (mut ws_send, mut ws_recv) = socket.split();
+
     // Per-connection subscription state: sub_id → filters
     let mut conn_subs: std::collections::HashMap<String, Vec<Filter>> =
         std::collections::HashMap::new();
 
+    // Per-connection send channel for async event delivery (prevents slow clients from blocking)
+    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<String>(CONN_SEND_CAP);
+
     let mut rx = tx.subscribe();
+
+    // Spawn sender task - drains from send_rx and sends to socket
+    let mut sender_handle = tokio::spawn(async move {
+        while let Some(msg) = send_rx.recv().await {
+            if ws_send.send(axum::extract::ws::Message::Text(msg.into())).await.is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
         tokio::select! {
             // ── inbound message from client ───────────────────────────────
-            msg = socket.recv() => {
+            msg = ws_recv.next() => {
                 let msg = match msg {
                     Some(Ok(m)) => m,
                     _ => break,
@@ -253,16 +272,16 @@ async fn handle_socket(
 
                 match msg {
                     axum::extract::ws::Message::Text(text) => {
-                        handle_text(&text, addr, &mut socket, &subscriptions, &tx, &mut conn_subs).await;
+                        handle_text(&text, addr, &send_tx, &subscriptions, &tx, &mut conn_subs).await;
                     }
                     axum::extract::ws::Message::Binary(_) => {
                         let notice = NostrMessage::Notification {
                             message: "binary messages are not supported".to_string(),
                         };
-                        let _ = socket.send(axum::extract::ws::Message::Text(notice.to_json().into())).await;
+                        let _ = send_tx.send(notice.to_json()).await;
                     }
-                    axum::extract::ws::Message::Ping(data) => {
-                        let _ = socket.send(axum::extract::ws::Message::Pong(data)).await;
+                    axum::extract::ws::Message::Ping(_) => {
+                        // axum automatically responds to pings
                     }
                     axum::extract::ws::Message::Pong(_) => {}
                     axum::extract::ws::Message::Close(_) => break,
@@ -276,17 +295,14 @@ async fn handle_socket(
                         // Check every active subscription on this connection
                         for (sub_id, filters) in &conn_subs {
                             for filter in filters {
-                                if filter_matches(filter, &event) {
+                                if filter_matches(filter, &*event) {
                                     let msg = NostrMessage::Event {
                                         sub_id: Some(sub_id.clone()),
                                         event: (*event).clone(),
                                     };
-                                    if socket
-                                        .send(axum::extract::ws::Message::Text(msg.to_json().into()))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
+                                    // Send asynchronously via channel (non-blocking)
+                                    if send_tx.try_send(msg.to_json()).is_err() {
+                                        tracing::warn!(%addr, sub_id, "send channel full, dropping event");
                                     }
                                     // Track events output
                                     crate::metrics::inc_events_output();
@@ -301,6 +317,12 @@ async fn handle_socket(
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+
+            // ── sender task failure ───────────────────────────────────────
+            res = &mut sender_handle => {
+                let _ = res;
+                break; // Sender task failed
+            }
         }
     }
 
@@ -308,6 +330,9 @@ async fn handle_socket(
     for sub_id in conn_subs.keys() {
         subscriptions.remove_subscription(sub_id);
     }
+
+    // Abort sender task
+    sender_handle.abort();
 
     // Decrement connection count
     connection_count.fetch_sub(1, Ordering::Relaxed);
@@ -319,7 +344,7 @@ async fn handle_socket(
 async fn handle_text(
     text: &str,
     addr: SocketAddr,
-    socket: &mut WebSocket,
+    send_tx: &tokio::sync::mpsc::Sender<String>,
     subscriptions: &Arc<SubscriptionManager>,
     tx: &broadcast::Sender<Arc<crate::event::Event>>,
     conn_subs: &mut std::collections::HashMap<String, Vec<Filter>>,
@@ -369,9 +394,7 @@ async fn handle_text(
                     }
                 }
             };
-            let _ = socket
-                .send(axum::extract::ws::Message::Text(ok.to_json().into()))
-                .await;
+            let _ = send_tx.send(ok.to_json()).await;
         }
 
         Ok(NostrMessage::Request { id, filters }) => {
@@ -391,14 +414,10 @@ async fn handle_text(
                 for event in events {
                     let msg = NostrMessage::Event {
                         sub_id: Some(id.clone()),
-                        event: (*event).clone(),
+                        event: event.as_ref().clone(),
                     };
-                    if socket
-                        .send(axum::extract::ws::Message::Text(msg.to_json().into()))
-                        .await
-                        .is_err()
-                    {
-                        return;
+                    if send_tx.try_send(msg.to_json()).is_err() {
+                        tracing::warn!(%addr, id, "send channel full, dropping event");
                     }
                     // Track events output
                     crate::metrics::inc_events_output();
@@ -409,9 +428,7 @@ async fn handle_text(
             crate::metrics::observe_tteose(sub_start.elapsed());
 
             let eose = NostrMessage::EndOfStoredEvents { id };
-            let _ = socket
-                .send(axum::extract::ws::Message::Text(eose.to_json().into()))
-                .await;
+            let _ = send_tx.send(eose.to_json()).await;
         }
 
         Ok(NostrMessage::Close { id }) => {
@@ -421,9 +438,7 @@ async fn handle_text(
 
         Err(e) => {
             let notice = NostrMessage::Notification { message: e };
-            let _ = socket
-                .send(axum::extract::ws::Message::Text(notice.to_json().into()))
-                .await;
+            let _ = send_tx.send(notice.to_json()).await;
         }
 
         _ => {} // client-side messages (OK, EOSE, NOTICE) — ignore
