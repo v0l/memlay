@@ -178,7 +178,8 @@ impl EventStore {
                     store.state.interval_seconds.load(Ordering::Relaxed) as u64,
                 );
                 tokio::time::sleep(interval).await;
-                store.maybe_evict();
+                let store = store.clone();
+                tokio::task::spawn_blocking(move || store.maybe_evict()).await.ok();
             }
         });
     }
@@ -571,14 +572,20 @@ impl EventStore {
             loop {
                 tokio::time::sleep(Duration::from_secs(interval_seconds)).await;
 
-                match store.save_to_disk() {
-                    Ok(_) => {
-                        tracing::debug!(path, "background persistence completed");
+                let store = store.clone();
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || {
+                    match store.save_to_disk() {
+                        Ok(_) => {
+                            tracing::debug!(path, "background persistence completed");
+                        }
+                        Err(e) => {
+                            tracing::error!(path, error = %e, "background persistence failed");
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(path, error = %e, "background persistence failed");
-                    }
-                }
+                })
+                .await
+                .ok();
             }
         });
     }
