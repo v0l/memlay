@@ -82,7 +82,7 @@ pub enum InsertResult {
 
 /// High-performance in-memory event store with memory-based eviction
 pub struct EventStore {
-    index: EventIndex,
+    pub index: EventIndex,
     config: StoreConfig,
     state: EvictionState,
     wal: Option<Arc<WriteAheadLog>>,

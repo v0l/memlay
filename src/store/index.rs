@@ -129,23 +129,18 @@ impl EventIndex {
     /// Returns the old event if this is a replaceable event that replaces an existing one
     pub fn insert(&self, event: Arc<Event>) -> Option<Arc<Event>> {
         let mut replaced = None;
-        let mut old_id_to_remove = None;
 
-        // Handle replaceable events: remove old version if exists
+        // Handle replaceable events: atomically get and remove old version
         if event.is_replaceable() {
             let key = event.replacement_key();
             if let ReplacementKey::Replaceable { .. } | ReplacementKey::Addressable { .. } = &key {
+                // Atomically swap the old ID and get it
                 if let Some(old_id) = self.by_replaceable.insert(key.clone(), event.id) {
-                    old_id_to_remove = Some(old_id);
+                    // Remove old event from all indexes except by_replaceable (already updated)
+                    if let Some(old_event) = self.internal_remove(&old_id, true) {
+                        replaced = Some(old_event);
+                    }
                 }
-            }
-        }
-
-        // Remove old event outside of replaceable lock to avoid deadlock
-        if let Some(old_id) = old_id_to_remove {
-            // Use internal_remove to avoid recursive by_replaceable removal
-            if let Some(old_event) = self.internal_remove(&old_id, false) {
-                replaced = Some(old_event);
             }
         }
 

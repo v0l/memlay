@@ -1,20 +1,21 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use memlay::event::{Event, Tag};
 use memlay::message::NostrMessage;
 use memlay::store::{EventStore, StoreConfig};
 use memlay::subscription::{Filter, FilterMatch, Subscription, SubscriptionManager};
 use rand::prelude::*;
+use std::hint::black_box;
 use std::sync::Arc;
 
 /// Generate a random event for benchmarking
-fn generate_random_event(rng: &mut impl Rng, id: u64, pubkey_pool: &[[u8; 32]]) -> Event {
+fn generate_random_event(rng: &mut StdRng, id: u64, pubkey_pool: &[[u8; 32]]) -> Event {
     let mut id_bytes = [0u8; 32];
     id_bytes[..8].copy_from_slice(&id.to_be_bytes());
     rng.fill_bytes(&mut id_bytes[8..]);
 
-    let pubkey = pubkey_pool[rng.gen_range(0..pubkey_pool.len())];
+    let pubkey = pubkey_pool[rng.random_range(0..pubkey_pool.len())];
     let kind = *[0, 1, 3, 4, 7, 1984, 30023].choose(rng).unwrap();
-    let created_at = rng.gen_range(1700000000u64..1710000000u64);
+    let created_at = rng.random_range(1700000000u64..1710000000u64);
 
     let mut sig = [0u8; 64];
     rng.fill_bytes(&mut sig);
@@ -32,6 +33,10 @@ fn generate_random_event(rng: &mut impl Rng, id: u64, pubkey_pool: &[[u8; 32]]) 
     ).unwrap()
 }
 
+fn new_rng(seed: u64) -> StdRng {
+    StdRng::seed_from_u64(seed)
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -42,7 +47,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn generate_pubkey_pool(rng: &mut impl Rng, size: usize) -> Vec<[u8; 32]> {
+fn generate_pubkey_pool(rng: &mut StdRng, size: usize) -> Vec<[u8; 32]> {
     (0..size)
         .map(|_| {
             let mut pk = [0u8; 32];
@@ -55,12 +60,12 @@ fn generate_pubkey_pool(rng: &mut impl Rng, size: usize) -> Vec<[u8; 32]> {
 // ── Message Parsing Benchmarks ────────────────────────────────────────────────
 
 fn bench_message_parse_event(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let events: Vec<String> = (0..1000)
         .map(|i| {
-            let event = generate_random_event(&mut rng.clone(), i, &pubkey_pool);
+            let event = generate_random_event(&mut new_rng(42 + i), i, &pubkey_pool);
             let json = String::from_utf8(event.raw.to_vec()).unwrap();
             format!(r#"["EVENT",{}]"#, json)
         })
@@ -76,24 +81,25 @@ fn bench_message_parse_event(c: &mut Criterion) {
 }
 
 fn bench_message_parse_req(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let store = EventStore::new(StoreConfig {
-        max_events: 10_000,
         max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
     });
 
     for i in 0..10_000 {
-        let event = generate_random_event(&mut rng.clone(), i, &pubkey_pool);
+        let event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
         store.insert(std::sync::Arc::new(event));
     }
 
     let filter = Filter {
         kinds: Some(vec![1, 2, 3]),
         authors: Some(vec![
-            hex_encode(&pubkey_pool[0]),
-            hex_encode(&pubkey_pool[1]),
+            hex_encode(&pubkey_pool[0]).into(),
+            hex_encode(&pubkey_pool[1]).into(),
         ]),
         limit: Some(100),
         ..Default::default()
@@ -110,14 +116,14 @@ fn bench_message_parse_req(c: &mut Criterion) {
 }
 
 fn bench_message_parse_req_complex(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let filters_json: Vec<String> = (0..10)
         .map(|i| {
             let filter = Filter {
                 kinds: Some(vec![i as u32, (i + 1) as u32]),
-                authors: Some(vec![hex_encode(&pubkey_pool[(i % 50) as usize])]),
+                authors: Some(vec![hex_encode(&pubkey_pool[(i % 50) as usize]).into()]),
                 since: Some(1700000000 + i as u64 * 1000),
                 limit: Some(50),
                 ..Default::default()
@@ -192,14 +198,14 @@ fn bench_filter_deserialize(c: &mut Criterion) {
 }
 
 fn bench_filter_match_event(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let event = generate_random_event(&mut rng, 1, &pubkey_pool);
 
     let filter = Filter {
         kinds: Some(vec![event.kind]),
-        authors: Some(vec![hex_encode(&event.pubkey)]),
+        authors: Some(vec![hex_encode(&event.pubkey).into()]),
         since: Some(event.created_at - 1000),
         until: Some(event.created_at + 1000),
         ..Default::default()
@@ -226,16 +232,17 @@ fn bench_filter_match_event(c: &mut Criterion) {
 // ── Store Query Benchmarks ────────────────────────────────────────────────────
 
 fn bench_store_query_by_kind(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let store = EventStore::new(StoreConfig {
-        max_events: 100_000,
         max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
     });
 
     for i in 0..100_000 {
-        let event = generate_random_event(&mut rng.clone(), i, &pubkey_pool);
+        let event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
         store.insert(std::sync::Arc::new(event));
     }
 
@@ -253,16 +260,17 @@ fn bench_store_query_by_kind(c: &mut Criterion) {
 }
 
 fn bench_store_query_by_pubkey(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let store = EventStore::new(StoreConfig {
-        max_events: 100_000,
         max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
     });
 
     for i in 0..100_000 {
-        let event = generate_random_event(&mut rng.clone(), i, &pubkey_pool);
+        let event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
         store.insert(std::sync::Arc::new(event));
     }
 
@@ -282,20 +290,25 @@ fn bench_store_query_by_pubkey(c: &mut Criterion) {
 }
 
 fn bench_store_query_by_e_tag(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let store = EventStore::new(StoreConfig {
-        max_events: 100_000,
         max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
     });
 
     // Create events with e-tags
     let mut e_tag_events: Vec<Arc<Event>> = Vec::new();
     for i in 0..10_000 {
-        let mut event = generate_random_event(&mut rng.clone(), i, &pubkey_pool);
+        let mut event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
         // Add an e-tag referencing a specific event
-        let e_tag_event = generate_random_event(&mut rng.clone(), 99999 - i, &pubkey_pool);
+        let e_tag_event = generate_random_event(
+            &mut new_rng((42 + i as u64) * 2 + 100000),
+            99999 - i,
+            &pubkey_pool,
+        );
         event.tags.push(Tag {
             name: "e".to_string(),
             values: vec![hex_encode(&e_tag_event.id)],
@@ -327,16 +340,17 @@ fn bench_store_query_by_e_tag(c: &mut Criterion) {
 }
 
 fn bench_store_query_by_p_tag(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let store = EventStore::new(StoreConfig {
-        max_events: 100_000,
         max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
     });
 
     for i in 0..100_000 {
-        let mut event = generate_random_event(&mut rng.clone(), i, &pubkey_pool);
+        let mut event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
         // Add p-tags
         event.tags.push(Tag {
             name: "p".to_string(),
@@ -361,18 +375,19 @@ fn bench_store_query_by_p_tag(c: &mut Criterion) {
 }
 
 fn bench_store_query_by_tag(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let store = EventStore::new(StoreConfig {
-        max_events: 100_000,
         max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
     });
 
     let tag_values: [&str; 5] = ["nostr", "bitcoin", "lightning", "defi", "crypto"];
 
     for i in 0..100_000 {
-        let mut event = generate_random_event(&mut rng.clone(), i, &pubkey_pool);
+        let mut event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
         event.tags.push(Tag {
             name: "t".to_string(),
             values: vec![tag_values[(i % 5) as usize].to_string()],
@@ -396,17 +411,18 @@ fn bench_store_query_by_tag(c: &mut Criterion) {
 }
 
 fn bench_store_get_by_id(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let store = EventStore::new(StoreConfig {
-        max_events: 100_000,
         max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
     });
 
     let mut ids = Vec::new();
     for i in 0..100_000 {
-        let event = generate_random_event(&mut rng.clone(), i, &pubkey_pool);
+        let event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
         ids.push(event.id);
         store.insert(std::sync::Arc::new(event));
     }
@@ -424,8 +440,9 @@ fn bench_store_get_by_id(c: &mut Criterion) {
 
 fn bench_subscription_add_remove(c: &mut Criterion) {
     let store = Arc::new(EventStore::new(StoreConfig {
-        max_events: 10_000,
         max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
     }));
     let sm = SubscriptionManager::new(store);
 
@@ -447,16 +464,17 @@ fn bench_subscription_add_remove(c: &mut Criterion) {
 }
 
 fn bench_subscription_query_filter(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let store = Arc::new(EventStore::new(StoreConfig {
-        max_events: 50_000,
         max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
     }));
 
     for i in 0..50_000 {
-        let event = generate_random_event(&mut rng.clone(), i, &pubkey_pool);
+        let event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
         store.insert(std::sync::Arc::new(event));
     }
 
@@ -464,7 +482,7 @@ fn bench_subscription_query_filter(c: &mut Criterion) {
 
     let filter = Filter {
         kinds: Some(vec![1, 2]),
-        authors: Some(vec![hex_encode(&pubkey_pool[0])]),
+        authors: Some(vec![hex_encode(&pubkey_pool[0]).into()]),
         since: Some(1700000000),
         limit: Some(100),
         ..Default::default()
@@ -478,16 +496,17 @@ fn bench_subscription_query_filter(c: &mut Criterion) {
 }
 
 fn bench_subscription_query_multiple_filters(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let store = Arc::new(EventStore::new(StoreConfig {
-        max_events: 50_000,
         max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
     }));
 
     for i in 0..50_000 {
-        let event = generate_random_event(&mut rng.clone(), i, &pubkey_pool);
+        let event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
         store.insert(std::sync::Arc::new(event));
     }
 
@@ -516,16 +535,17 @@ fn bench_subscription_query_multiple_filters(c: &mut Criterion) {
 // ── End-to-End Pipeline Benchmarks ────────────────────────────────────────────
 
 fn bench_full_request_pipeline(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let store = Arc::new(EventStore::new(StoreConfig {
-        max_events: 10_000,
         max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
     }));
 
     for i in 0..10_000 {
-        let event = generate_random_event(&mut rng.clone(), i, &pubkey_pool);
+        let event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
         store.insert(std::sync::Arc::new(event));
     }
 
@@ -572,20 +592,21 @@ fn bench_full_request_pipeline(c: &mut Criterion) {
 }
 
 fn bench_full_event_ingest_pipeline(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
     let events: Vec<String> = (0..1000)
         .map(|i| {
-            let event = generate_random_event(&mut rng.clone(), i, &pubkey_pool);
+            let event = generate_random_event(&mut new_rng(42 + i), i, &pubkey_pool);
             let json = String::from_utf8(event.raw.to_vec()).unwrap();
             format!(r#"["EVENT",{}]"#, json)
         })
         .collect();
 
     let store = Arc::new(EventStore::new(StoreConfig {
-        max_events: 10_000,
         max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
     }));
 
     c.bench_function("full_event_ingest_pipeline", |b| {

@@ -1,16 +1,22 @@
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use memlay::event::Event;
+use memlay::store::{EventStore, StoreConfig};
 use rand::prelude::*;
+use std::hint::black_box;
+use std::sync::Arc;
 
-/// Generate a random event for benchmarking
-fn generate_random_event(rng: &mut impl Rng, id: u64, pubkey_pool: &[[u8; 32]]) -> Event {
+fn new_rng(seed: u64) -> StdRng {
+    StdRng::seed_from_u64(seed)
+}
+
+fn generate_random_event(rng: &mut StdRng, id: u64, pubkey_pool: &[[u8; 32]]) -> Event {
     let mut id_bytes = [0u8; 32];
     id_bytes[..8].copy_from_slice(&id.to_be_bytes());
     rng.fill_bytes(&mut id_bytes[8..]);
 
-    let pubkey = pubkey_pool[rng.gen_range(0..pubkey_pool.len())];
+    let pubkey = pubkey_pool[rng.random_range(0..pubkey_pool.len())];
     let kind = *[0, 1, 3, 4, 7, 1984, 30023].choose(rng).unwrap();
-    let created_at = rng.gen_range(1700000000u64..1710000000u64);
+    let created_at = rng.random_range(1700000000u64..1710000000u64);
 
     let mut sig = [0u8; 64];
     rng.fill_bytes(&mut sig);
@@ -38,7 +44,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn generate_pubkey_pool(rng: &mut impl Rng, size: usize) -> Vec<[u8; 32]> {
+fn generate_pubkey_pool(rng: &mut StdRng, size: usize) -> Vec<[u8; 32]> {
     (0..size)
         .map(|_| {
             let mut pk = [0u8; 32];
@@ -48,23 +54,25 @@ fn generate_pubkey_pool(rng: &mut impl Rng, size: usize) -> Vec<[u8; 32]> {
         .collect()
 }
 
-/// Benchmark filter query performance using EventStore methods
+fn make_config() -> StoreConfig {
+    StoreConfig {
+        max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
+    }
+}
+
 fn bench_filter_queries(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
-    // Pre-create events in store
-    let store = memlay::store::EventStore::new(memlay::store::StoreConfig {
-        max_events: 100_000,
-        max_bytes: 0,
-    });
+    let store = EventStore::new(make_config());
 
     for i in 0..100_000u64 {
         let event = generate_random_event(&mut rng, i, &pubkey_pool);
-        store.insert(std::sync::Arc::new(event));
+        store.insert(Arc::new(event));
     }
 
-    // Test different filter types
     c.bench_function("query_by_kind", |b| {
         b.iter(|| black_box(store.query_by_kind(1, 100)));
     });
@@ -98,22 +106,17 @@ fn bench_filter_queries(c: &mut Criterion) {
     });
 }
 
-/// Benchmark multi-filter queries
 fn bench_multi_filters(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
-    let store = memlay::store::EventStore::new(memlay::store::StoreConfig {
-        max_events: 100_000,
-        max_bytes: 0,
-    });
+    let store = EventStore::new(make_config());
 
     for i in 0..100_000u64 {
         let event = generate_random_event(&mut rng, i, &pubkey_pool);
-        store.insert(std::sync::Arc::new(event));
+        store.insert(Arc::new(event));
     }
 
-    // Test multiple queries
     let filter_counts = [1, 5, 10, 20];
 
     for num_filters in filter_counts {
@@ -134,19 +137,15 @@ fn bench_multi_filters(c: &mut Criterion) {
     }
 }
 
-/// Benchmark concurrent queries on shared store
 fn bench_concurrent_queries(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
-    let store = std::sync::Arc::new(memlay::store::EventStore::new(memlay::store::StoreConfig {
-        max_events: 100_000,
-        max_bytes: 0,
-    }));
+    let store = Arc::new(EventStore::new(make_config()));
 
     for i in 0..100_000u64 {
         let event = generate_random_event(&mut rng, i, &pubkey_pool);
-        store.insert(std::sync::Arc::new(event));
+        store.insert(Arc::new(event));
     }
 
     let sample_pubkey = pubkey_pool[0];
@@ -159,7 +158,7 @@ fn bench_concurrent_queries(c: &mut Criterion) {
                 b.iter(|| {
                     std::thread::scope(|s| {
                         for _ in 0..n {
-                            let store = std::sync::Arc::clone(&store);
+                            let store = Arc::clone(&store);
                             let pubkey = sample_pubkey;
                             s.spawn(move || {
                                 black_box(store.query_by_kind(1, 50));
@@ -173,7 +172,6 @@ fn bench_concurrent_queries(c: &mut Criterion) {
     }
 }
 
-/// Benchmark event insertion with various load sizes
 fn bench_insertion(c: &mut Criterion) {
     for load in [1_000, 10_000, 50_000] {
         let mut group = c.benchmark_group(format!("insert_load_{}", load));
@@ -181,19 +179,14 @@ fn bench_insertion(c: &mut Criterion) {
 
         group.bench_function("sequential_insert", |b| {
             b.iter_with_setup(
-                || {
-                    memlay::store::EventStore::new(memlay::store::StoreConfig {
-                        max_events: load,
-                        max_bytes: 0,
-                    })
-                },
+                || EventStore::new(make_config()),
                 |store| {
-                    let mut rng = StdRng::seed_from_u64(42);
+                    let mut rng = new_rng(42);
                     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
                     for i in 0..load as u64 {
                         let event = generate_random_event(&mut rng, i, &pubkey_pool);
-                        store.insert(std::sync::Arc::new(event));
+                        store.insert(Arc::new(event));
                     }
                 },
             );

@@ -1,18 +1,22 @@
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use memlay::event::Event;
 use memlay::store::{EventStore, StoreConfig};
 use memlay::subscription::{Filter, SubscriptionManager};
 use rand::prelude::*;
+use std::hint::black_box;
 use std::sync::Arc;
 
-/// Generate a random event for benchmarking
-fn random_event(rng: &mut impl Rng, id: u64, pubkey_pool: &[[u8; 32]], kind: u32) -> Arc<Event> {
+fn new_rng(seed: u64) -> StdRng {
+    StdRng::seed_from_u64(seed)
+}
+
+fn random_event(rng: &mut StdRng, id: u64, pubkey_pool: &[[u8; 32]], kind: u32) -> Arc<Event> {
     let mut id_bytes = [0u8; 32];
     id_bytes[..8].copy_from_slice(&id.to_be_bytes());
     rng.fill_bytes(&mut id_bytes[8..]);
 
-    let pubkey = pubkey_pool[rng.gen_range(0..pubkey_pool.len())];
-    let created_at = rng.gen_range(1700000000u64..1710000000u64);
+    let pubkey = pubkey_pool[rng.random_range(0..pubkey_pool.len())];
+    let created_at = rng.random_range(1700000000u64..1710000000u64);
 
     let mut sig = [0u8; 64];
     rng.fill_bytes(&mut sig);
@@ -39,8 +43,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Generate a pool of pubkeys for realistic distribution
-fn generate_pubkey_pool(rng: &mut impl Rng, size: usize) -> Vec<[u8; 32]> {
+fn generate_pubkey_pool(rng: &mut StdRng, size: usize) -> Vec<[u8; 32]> {
     (0..size)
         .map(|_| {
             let mut pk = [0u8; 32];
@@ -50,28 +53,23 @@ fn generate_pubkey_pool(rng: &mut impl Rng, size: usize) -> Vec<[u8; 32]> {
         .collect()
 }
 
-/// Generate a pool of event IDs for e-tag references
-fn generate_event_id_pool(rng: &mut impl Rng, size: usize) -> Vec<[u8; 32]> {
-    (0..size)
-        .map(|_| {
-            let mut id = [0u8; 32];
-            rng.fill_bytes(&mut id);
-            id
-        })
-        .collect()
+fn make_config() -> StoreConfig {
+    StoreConfig {
+        max_bytes: 0,
+        persistence_path: None,
+        use_wal: true,
+    }
 }
 
 fn bench_query_without_cache(c: &mut Criterion) {
     let mut group = c.benchmark_group("subscription_query");
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 1000);
 
-    // Pre-generate events
     let events: Vec<Arc<Event>> = (0..100_000u64)
-        .map(|i| random_event(&mut rng.clone(), i, &pubkey_pool, 1))
+        .map(|i| random_event(&mut new_rng(42 + i), i, &pubkey_pool, 1))
         .collect();
 
-    // Test different query sizes
     for size in [10, 100, 1000] {
         group.throughput(Throughput::Elements(size as u64));
 
@@ -80,13 +78,9 @@ fn bench_query_without_cache(c: &mut Criterion) {
             &size,
             |b, &size| {
                 b.iter(|| {
-                    let store = EventStore::new(StoreConfig {
-                        max_events: 200_000,
-                        max_bytes: 0,
-                    });
+                    let store = EventStore::new(make_config());
                     let sub_mgr = SubscriptionManager::new(Arc::new(store));
 
-                    // Pre-fill store
                     for event in &events {
                         sub_mgr.store.insert(Arc::clone(event));
                     }
@@ -97,7 +91,6 @@ fn bench_query_without_cache(c: &mut Criterion) {
                         ..Default::default()
                     };
 
-                    // Query multiple times without cache
                     for _ in 0..size {
                         black_box(sub_mgr.query_filter(&filter));
                     }
@@ -111,12 +104,11 @@ fn bench_query_without_cache(c: &mut Criterion) {
 
 fn bench_query_with_cache(c: &mut Criterion) {
     let mut group = c.benchmark_group("subscription_query");
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 1000);
 
-    // Pre-generate events
     let events: Vec<Arc<Event>> = (0..100_000u64)
-        .map(|i| random_event(&mut rng.clone(), i, &pubkey_pool, 1))
+        .map(|i| random_event(&mut new_rng(42 + i), i, &pubkey_pool, 1))
         .collect();
 
     for size in [10, 100, 1000] {
@@ -127,13 +119,9 @@ fn bench_query_with_cache(c: &mut Criterion) {
             &size,
             |b, &size| {
                 b.iter(|| {
-                    let store = EventStore::new(StoreConfig {
-                        max_events: 200_000,
-                        max_bytes: 0,
-                    });
+                    let store = EventStore::new(make_config());
                     let sub_mgr = SubscriptionManager::new(Arc::new(store));
 
-                    // Pre-fill store
                     for event in &events {
                         sub_mgr.store.insert(Arc::clone(event));
                     }
@@ -144,10 +132,8 @@ fn bench_query_with_cache(c: &mut Criterion) {
                         ..Default::default()
                     };
 
-                    // First query populates cache
                     let results = sub_mgr.query_filter(&filter);
 
-                    // Subsequent queries use cache
                     for _ in 0..size {
                         black_box(sub_mgr.query_filter(&filter));
                     }
@@ -163,16 +149,14 @@ fn bench_query_with_cache(c: &mut Criterion) {
 
 fn bench_query_cache_hit_vs_miss(c: &mut Criterion) {
     let mut group = c.benchmark_group("cache_hit_vs_miss");
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 1000);
-    let _event_id_pool = generate_event_id_pool(&mut rng, 1000);
 
-    // Pre-generate events with various filter patterns
     let kind1_events: Vec<Arc<Event>> = (0..50_000u64)
-        .map(|i| random_event(&mut rng.clone(), i, &pubkey_pool, 1))
+        .map(|i| random_event(&mut new_rng(42 + i), i, &pubkey_pool, 1))
         .collect();
     let _kind7_events: Vec<Arc<Event>> = (0..50_000u64)
-        .map(|i| random_event(&mut rng.clone(), i + 50_000, &pubkey_pool, 7))
+        .map(|i| random_event(&mut new_rng(42 + i + 50_000), i + 50_000, &pubkey_pool, 7))
         .collect();
 
     group.throughput(Throughput::Elements(1000));
@@ -180,13 +164,9 @@ fn bench_query_cache_hit_vs_miss(c: &mut Criterion) {
     group.bench_with_input(BenchmarkId::new("cache_hit", 1000), &1000, |b, _| {
         b.iter_with_setup(
             || {
-                let store = EventStore::new(StoreConfig {
-                    max_events: 200_000,
-                    max_bytes: 0,
-                });
+                let store = EventStore::new(make_config());
                 let sub_mgr = SubscriptionManager::new(Arc::new(store));
 
-                // Pre-fill
                 for event in &kind1_events {
                     sub_mgr.store.insert(Arc::clone(event));
                 }
@@ -197,7 +177,6 @@ fn bench_query_cache_hit_vs_miss(c: &mut Criterion) {
                     ..Default::default()
                 };
 
-                // Prime cache
                 sub_mgr.query_filter(&filter);
 
                 sub_mgr
@@ -219,13 +198,9 @@ fn bench_query_cache_hit_vs_miss(c: &mut Criterion) {
     group.bench_with_input(BenchmarkId::new("cache_miss", 1000), &1000, |b, _| {
         b.iter_with_setup(
             || {
-                let store = EventStore::new(StoreConfig {
-                    max_events: 200_000,
-                    max_bytes: 0,
-                });
+                let store = EventStore::new(make_config());
                 let sub_mgr = SubscriptionManager::new(Arc::new(store));
 
-                // Pre-fill
                 for event in &kind1_events {
                     sub_mgr.store.insert(Arc::clone(event));
                 }
@@ -233,7 +208,6 @@ fn bench_query_cache_hit_vs_miss(c: &mut Criterion) {
                 sub_mgr
             },
             |sub_mgr| {
-                // Different filters each time - cache misses
                 for i in 0..1000 {
                     let filter = Filter {
                         kinds: Some(vec![if i % 2 == 0 { 1 } else { 7 }]),
@@ -251,15 +225,13 @@ fn bench_query_cache_hit_vs_miss(c: &mut Criterion) {
 
 fn bench_query_with_author_filter(c: &mut Criterion) {
     let mut group = c.benchmark_group("subscription_author_filter");
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = new_rng(42);
     let pubkey_pool = generate_pubkey_pool(&mut rng, 100);
 
-    // Pre-generate events with ~100 events per pubkey
     let events: Vec<Arc<Event>> = (0..100_000u64)
-        .map(|i| random_event(&mut rng.clone(), i, &pubkey_pool, 1))
+        .map(|i| random_event(&mut new_rng(42 + i), i, &pubkey_pool, 1))
         .collect();
 
-    // Get the first pubkey for querying
     let query_pubkey = pubkey_pool[0];
 
     for size in [10, 50, 100] {
@@ -269,20 +241,16 @@ fn bench_query_with_author_filter(c: &mut Criterion) {
             BenchmarkId::new("by_author_cached", size),
             &size,
             |b, &size| {
-                let store = EventStore::new(StoreConfig {
-                    max_events: 200_000,
-                    max_bytes: 0,
-                });
+                let store = EventStore::new(make_config());
                 let sub_mgr = SubscriptionManager::new(Arc::new(store));
 
-                // Pre-fill
                 for event in &events {
                     sub_mgr.store.insert(Arc::clone(event));
                 }
 
                 let pubkey_hex = hex_encode(&query_pubkey);
                 let filter = Filter {
-                    authors: Some(vec![pubkey_hex]),
+                    authors: Some(vec![pubkey_hex.into()]),
                     limit: Some(size),
                     ..Default::default()
                 };
@@ -301,12 +269,10 @@ fn bench_query_with_author_filter(c: &mut Criterion) {
 
 fn bench_cache_invalidation_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("cache_invalidation");
-    let mut rng = StdRng::seed_from_u64(42);
-    let pubkey_pool = generate_pubkey_pool(&mut rng, 1000);
+    let pubkey_pool = generate_pubkey_pool(&mut new_rng(42), 1000);
 
-    // Pre-generate events and fill cache
     let events: Vec<Arc<Event>> = (0..100_000u64)
-        .map(|i| random_event(&mut rng.clone(), i, &pubkey_pool, 1))
+        .map(|i| random_event(&mut new_rng(42 + i), i, &pubkey_pool, 1))
         .collect();
 
     group.throughput(Throughput::Elements(1000));
@@ -314,19 +280,14 @@ fn bench_cache_invalidation_overhead(c: &mut Criterion) {
     group.bench_function("invalidate_cache", |b| {
         b.iter_with_setup(
             || {
-                let store = EventStore::new(StoreConfig {
-                    max_events: 200_000,
-                    max_bytes: 0,
-                });
+                let store = EventStore::new(make_config());
                 let sub_mgr = SubscriptionManager::new(Arc::new(store));
 
-                // Pre-fill store and cache
                 for event in &events {
                     sub_mgr.store.insert(Arc::clone(event));
                 }
 
-                // Fill cache with various queries
-                for i in 0..100 {
+                for _ in 0..100 {
                     let filter = Filter {
                         kinds: Some(vec![1, 3, 7]),
                         limit: Some(100),
@@ -350,11 +311,10 @@ fn bench_cache_invalidation_overhead(c: &mut Criterion) {
 
 fn bench_repeated_identical_queries(c: &mut Criterion) {
     let mut group = c.benchmark_group("repeated_queries");
-    let mut rng = StdRng::seed_from_u64(42);
-    let pubkey_pool = generate_pubkey_pool(&mut rng, 1000);
+    let pubkey_pool = generate_pubkey_pool(&mut new_rng(42), 1000);
 
     let events: Vec<Arc<Event>> = (0..100_000u64)
-        .map(|i| random_event(&mut rng.clone(), i, &pubkey_pool, 1))
+        .map(|i| random_event(&mut new_rng(42 + i), i, &pubkey_pool, 1))
         .collect();
 
     for repeat_count in [10, 100, 1000] {
@@ -364,13 +324,9 @@ fn bench_repeated_identical_queries(c: &mut Criterion) {
             BenchmarkId::new("same_filter", repeat_count),
             &repeat_count,
             |b, &repeat_count| {
-                let store = EventStore::new(StoreConfig {
-                    max_events: 200_000,
-                    max_bytes: 0,
-                });
+                let store = EventStore::new(make_config());
                 let sub_mgr = SubscriptionManager::new(Arc::new(store));
 
-                // Pre-fill
                 for event in &events {
                     sub_mgr.store.insert(Arc::clone(event));
                 }
