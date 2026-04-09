@@ -4,15 +4,12 @@ use crate::store::{EventStore, InsertResult, StoreConfig};
 use crate::subscription::{Filter, Subscription, SubscriptionManager};
 use axum::{
     Router,
-    extract::{
-        ConnectInfo, State,
-        ws::{WebSocket},
-    },
+    extract::{ConnectInfo, State, ws::WebSocket},
     http::{HeaderMap, HeaderValue},
     response::IntoResponse,
     routing::get,
 };
-use futures_util::{stream::StreamExt, SinkExt};
+use futures_util::{SinkExt, stream::StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -113,7 +110,10 @@ async fn root_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    ws: Result<axum::extract::ws::WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+    ws: Result<
+        axum::extract::ws::WebSocketUpgrade,
+        axum::extract::ws::rejection::WebSocketUpgradeRejection,
+    >,
 ) -> axum::response::Response {
     let wants_info = headers
         .get("accept")
@@ -133,9 +133,7 @@ async fn root_handler(
             ws.on_failed_upgrade(move |err| {
                 tracing::warn!(%addr, "WebSocket upgrade failed: {}", err);
             })
-            .on_upgrade(move |socket| {
-                handle_socket(socket, addr, subscriptions, tx, conn_count)
-            })
+            .on_upgrade(move |socket| handle_socket(socket, addr, subscriptions, tx, conn_count))
             .into_response()
         }
         Err(_) => landing_page(&state.config).into_response(),
@@ -255,7 +253,11 @@ async fn handle_socket(
     // Spawn sender task - drains from send_rx and sends to socket
     let mut sender_handle = tokio::spawn(async move {
         while let Some(msg) = send_rx.recv().await {
-            if ws_send.send(axum::extract::ws::Message::Text(msg.into())).await.is_err() {
+            if ws_send
+                .send(axum::extract::ws::Message::Text(msg.into()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }

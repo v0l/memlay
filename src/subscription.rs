@@ -390,7 +390,7 @@ impl SubscriptionManager {
                 .iter()
                 .filter_map(|weak| weak.upgrade())
                 .collect();
-            
+
             if upgraded.len() == cached.len() {
                 return upgraded;
             }
@@ -406,10 +406,8 @@ impl SubscriptionManager {
                     self.cache.remove(&random_key);
                 }
             }
-            let weak_results: Vec<Weak<Event>> = results
-                .iter()
-                .map(|arc| Arc::downgrade(arc))
-                .collect();
+            let weak_results: Vec<Weak<Event>> =
+                results.iter().map(|arc| Arc::downgrade(arc)).collect();
             self.cache.insert(cache_key, weak_results);
         }
 

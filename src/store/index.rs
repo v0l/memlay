@@ -77,6 +77,20 @@ impl std::hash::Hash for EventRef {
     }
 }
 
+/// Result of inserting an event into the index.
+#[derive(Debug)]
+pub enum InsertOutcome {
+    /// Event was successfully inserted
+    Inserted {
+        /// Old event that was replaced (for replaceable events)
+        replaced: Option<Arc<Event>>,
+    },
+    /// Event was a duplicate (same ID already exists)
+    Duplicate,
+    /// Insert lost a replaceable event race (another thread won)
+    LostRace,
+}
+
 /// In-memory index for fast event lookups.
 /// Each index has its own RwLock for fine-grained concurrency.
 pub struct EventIndex {
@@ -104,7 +118,7 @@ pub struct EventIndex {
 
     // Track actual memory usage (bytes of raw event JSON)
     memory_bytes: AtomicUsize,
-    
+
     // Track event count for lock-free stats
     event_count: AtomicUsize,
 }
@@ -126,17 +140,16 @@ impl EventIndex {
     }
 
     /// Insert an event into all indexes
-    /// Returns the old event if this is a replaceable event that replaces an existing one
-    pub fn insert(&self, event: Arc<Event>) -> Option<Arc<Event>> {
+    /// Returns InsertOutcome indicating whether the event was inserted, was a duplicate,
+    /// or lost a replaceable event race.
+    pub fn insert(&self, event: Arc<Event>) -> InsertOutcome {
         let mut replaced = None;
 
-        // Handle replaceable events: atomically get and remove old version
+        // Handle replaceable events: atomically swap old ID in by_replaceable
         if event.is_replaceable() {
             let key = event.replacement_key();
             if let ReplacementKey::Replaceable { .. } | ReplacementKey::Addressable { .. } = &key {
-                // Atomically swap the old ID and get it
                 if let Some(old_id) = self.by_replaceable.insert(key.clone(), event.id) {
-                    // Remove old event from all indexes except by_replaceable (already updated)
                     if let Some(old_event) = self.internal_remove(&old_id, true) {
                         replaced = Some(old_event);
                     }
@@ -144,12 +157,25 @@ impl EventIndex {
             }
         }
 
-        // Track memory usage (raw JSON bytes)
-        self.memory_bytes.fetch_add(event.raw.len(), AtomicOrdering::Relaxed);
-        self.event_count.fetch_add(1, AtomicOrdering::Relaxed);
+        // Primary index: atomic insert — detect duplicate IDs
+        if self.by_id.insert(event.id, event.clone()).is_some() {
+            return InsertOutcome::Duplicate;
+        }
 
-        // Primary index
-        self.by_id.insert(event.id, event.clone());
+        // Early verification: check if we're still the winner for replaceable events.
+        // Between by_replaceable.insert() and by_id.insert(), another thread could
+        // have replaced our ID in by_replaceable and removed our event from by_id
+        // via internal_remove. Our by_id.insert() would then succeed (since we were
+        // just removed), creating an orphaned event.
+        if event.is_replaceable() && !self.is_still_winner(&event) {
+            self.by_id.remove(&event.id);
+            return InsertOutcome::LostRace;
+        }
+
+        // Track memory usage (raw JSON bytes) — only after confirmed new insert
+        self.memory_bytes
+            .fetch_add(event.raw.len(), AtomicOrdering::Relaxed);
+        self.event_count.fetch_add(1, AtomicOrdering::Relaxed);
 
         // Pubkey index
         {
@@ -216,70 +242,80 @@ impl EventIndex {
         // Oldest-first index for eviction (newest first in EventRef ordering)
         {
             let mut by_oldest = self.by_oldest.write();
-            by_oldest.insert(EventRef::new(event));
+            by_oldest.insert(EventRef::new(event.clone()));
         }
 
-        replaced
-    }
-
-/// Remove an event from all indexes
-    /// If skip_replaceable is true, skip removing from the replaceable index (used during insert to avoid deadlock)
-    pub fn remove(&self, id: &[u8; 32]) -> Option<Arc<Event>> {
-        self.internal_remove(id, true)
-    }
-
-    fn internal_remove(&self, id: &[u8; 32], skip_replaceable: bool) -> Option<Arc<Event>> {
-        let (_, event) = self.by_id.remove(id)?;
-
-        let event_size = event.raw.len();
-        self.memory_bytes.fetch_sub(event_size, AtomicOrdering::Relaxed);
-        self.event_count.fetch_sub(1, AtomicOrdering::Relaxed);
-
-        if !skip_replaceable && event.is_replaceable() {
-            let key = event.replacement_key();
-            if let ReplacementKey::Replaceable { .. } | ReplacementKey::Addressable { .. } = &key {
-                self.by_replaceable.remove(&key);
+        // Final consistency check: verify the event is still in by_id.
+        // A concurrent remove() could have removed from by_id while we were
+        // populating secondary indexes, leaving orphaned entries.
+        // For replaceable events, also check we're still the winner.
+        if !self.by_id.contains_key(&event.id) {
+            self.cleanup_secondary_indexes(&event);
+            if event.is_replaceable() {
+                return InsertOutcome::LostRace;
             }
+            return InsertOutcome::Duplicate;
         }
 
+        if event.is_replaceable() && !self.is_still_winner(&event) {
+            self.cleanup_event(&event);
+            return InsertOutcome::LostRace;
+        }
+
+        InsertOutcome::Inserted { replaced }
+    }
+
+    /// Check if a replaceable event is still the current winner in by_replaceable
+    fn is_still_winner(&self, event: &Event) -> bool {
+        let key = event.replacement_key();
+        match &key {
+            ReplacementKey::Replaceable { .. } | ReplacementKey::Addressable { .. } => self
+                .by_replaceable
+                .get(&key)
+                .map(|guard| *guard == event.id)
+                .unwrap_or(false),
+            _ => true,
+        }
+    }
+
+    /// Remove an event from by_id and all secondary indexes, handling the case
+    /// where by_id.remove() returns None (another thread already removed from by_id
+    /// while we were adding to secondary indexes, leaving orphaned entries).
+    fn cleanup_event(&self, event: &Arc<Event>) {
+        if self.by_id.remove(&event.id).is_some() {
+            self.memory_bytes
+                .fetch_sub(event.raw.len(), AtomicOrdering::Relaxed);
+            self.event_count.fetch_sub(1, AtomicOrdering::Relaxed);
+        }
+
+        self.cleanup_secondary_indexes(event);
+    }
+
+    /// Remove an event from all secondary indexes (but NOT by_id or counters).
+    /// Used to clean up orphaned entries when a concurrent remove() already
+    /// removed from by_id while we were populating secondary indexes.
+    /// The caller is responsible for counter adjustments.
+    fn cleanup_secondary_indexes(&self, event: &Arc<Event>) {
         let er = EventRef::new(event.clone());
 
         {
             let pubkey_hash = TagIdHash::from_id(&event.pubkey);
-            let mut should_remove_key = false;
             if let Some(set_lock) = self.by_pubkey.get(&pubkey_hash) {
-                let mut set = set_lock.write();
-                set.remove(&er);
-                should_remove_key = set.is_empty();
-            }
-            if should_remove_key {
-                self.by_pubkey.remove(&pubkey_hash);
+                set_lock.write().remove(&er);
             }
         }
 
         {
-            let mut should_remove_key = false;
             if let Some(set_lock) = self.by_kind.get(&event.kind) {
-                let mut set = set_lock.write();
-                set.remove(&er);
-                should_remove_key = set.is_empty();
-            }
-            if should_remove_key {
-                self.by_kind.remove(&event.kind);
+                set_lock.write().remove(&er);
             }
         }
 
         {
             for e_tag in event.e_tags() {
                 let e_tag_hash = TagIdHash::from_id(&e_tag);
-                let mut should_remove_key = false;
                 if let Some(set_lock) = self.by_tag_e.get(&e_tag_hash) {
-                    let mut set = set_lock.write();
-                    set.remove(&er);
-                    should_remove_key = set.is_empty();
-                }
-                if should_remove_key {
-                    self.by_tag_e.remove(&e_tag_hash);
+                    set_lock.write().remove(&er);
                 }
             }
         }
@@ -287,14 +323,8 @@ impl EventIndex {
         {
             for p_tag in event.p_tags() {
                 let p_tag_hash = TagIdHash::from_id(&p_tag);
-                let mut should_remove_key = false;
                 if let Some(set_lock) = self.by_tag_p.get(&p_tag_hash) {
-                    let mut set = set_lock.write();
-                    set.remove(&er);
-                    should_remove_key = set.is_empty();
-                }
-                if should_remove_key {
-                    self.by_tag_p.remove(&p_tag_hash);
+                    set_lock.write().remove(&er);
                 }
             }
         }
@@ -307,21 +337,92 @@ impl EventIndex {
                     && letter != 'p'
                     && let Some(value) = tag.value()
                 {
-                    let mut should_remove_value = false;
-                    let mut should_remove_letter = false;
                     if let Some(inner_map) = self.by_tag_other.get(&letter) {
                         if let Some(set_lock) = inner_map.get(value) {
-                            let mut set = set_lock.write();
-                            set.remove(&er);
-                            should_remove_value = set.is_empty();
+                            set_lock.write().remove(&er);
                         }
-                        if should_remove_value {
-                            inner_map.remove(value);
-                        }
-                        should_remove_letter = inner_map.is_empty();
                     }
-                    if should_remove_letter {
-                        self.by_tag_other.remove(&letter);
+                }
+            }
+        }
+
+        {
+            let mut by_oldest = self.by_oldest.write();
+            by_oldest.remove(&er);
+        }
+    }
+
+    /// Remove an event from all indexes
+    /// If skip_replaceable is true, skip removing from the replaceable index (used during insert to avoid deadlock)
+    pub fn remove(&self, id: &[u8; 32]) -> Option<Arc<Event>> {
+        self.internal_remove(id, true)
+    }
+
+    fn internal_remove(&self, id: &[u8; 32], skip_replaceable: bool) -> Option<Arc<Event>> {
+        let (_, event) = self.by_id.remove(id)?;
+
+        let event_size = event.raw.len();
+        self.memory_bytes
+            .fetch_sub(event_size, AtomicOrdering::Relaxed);
+        self.event_count.fetch_sub(1, AtomicOrdering::Relaxed);
+
+        if !skip_replaceable && event.is_replaceable() {
+            let key = event.replacement_key();
+            if let ReplacementKey::Replaceable { .. } | ReplacementKey::Addressable { .. } = &key {
+                self.by_replaceable.remove(&key);
+            }
+        }
+
+        let er = EventRef::new(event.clone());
+
+        // Remove from secondary indexes.
+        // We no longer remove empty DashMap entries here because that creates
+        // a TOCTOU race: between checking is_empty() and calling .remove(),
+        // another thread could insert into the set. Leaving empty sets uses
+        // slightly more memory but eliminates the race.
+        {
+            let pubkey_hash = TagIdHash::from_id(&event.pubkey);
+            if let Some(set_lock) = self.by_pubkey.get(&pubkey_hash) {
+                set_lock.write().remove(&er);
+            }
+        }
+
+        {
+            if let Some(set_lock) = self.by_kind.get(&event.kind) {
+                set_lock.write().remove(&er);
+            }
+        }
+
+        {
+            for e_tag in event.e_tags() {
+                let e_tag_hash = TagIdHash::from_id(&e_tag);
+                if let Some(set_lock) = self.by_tag_e.get(&e_tag_hash) {
+                    set_lock.write().remove(&er);
+                }
+            }
+        }
+
+        {
+            for p_tag in event.p_tags() {
+                let p_tag_hash = TagIdHash::from_id(&p_tag);
+                if let Some(set_lock) = self.by_tag_p.get(&p_tag_hash) {
+                    set_lock.write().remove(&er);
+                }
+            }
+        }
+
+        {
+            for tag in &event.tags {
+                let mut chars = tag.name.chars();
+                if let (Some(letter), None) = (chars.next(), chars.next())
+                    && letter != 'e'
+                    && letter != 'p'
+                    && let Some(value) = tag.value()
+                {
+                    if let Some(inner_map) = self.by_tag_other.get(&letter) {
+                        if let Some(set_lock) = inner_map.get(value) {
+                            set_lock.write().remove(&er);
+                        }
                     }
                 }
             }
@@ -339,13 +440,8 @@ impl EventIndex {
     pub fn get_oldest(&self, count: usize) -> Vec<EventRef> {
         // BTreeSet is sorted newest-first (EventRef ordering), so iterate from end
         let by_oldest = self.by_oldest.read();
-        let oldest: Vec<EventRef> = by_oldest
-            .iter()
-            .rev()
-            .take(count)
-            .cloned()
-            .collect();
-        
+        let oldest: Vec<EventRef> = by_oldest.iter().rev().take(count).cloned().collect();
+
         oldest
     }
 
@@ -353,7 +449,7 @@ impl EventIndex {
     pub fn memory_bytes(&self) -> usize {
         self.memory_bytes.load(AtomicOrdering::Relaxed)
     }
-    
+
     /// Get event count (lock-free)
     pub fn event_count(&self) -> usize {
         self.event_count.load(AtomicOrdering::Relaxed)
@@ -384,12 +480,12 @@ impl EventIndex {
     /// Query by pubkey, returns events sorted by created_at DESC
     pub fn query_by_pubkey(&self, pubkey: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         let pubkey_hash = TagIdHash::from_id(pubkey);
-        
+
         // Fast path: check if entry exists without holding lock
         let Some(set_lock) = self.by_pubkey.get(&pubkey_hash) else {
             return Vec::new();
         };
-        
+
         // Clone Arcs quickly while holding read lock, then return
         let events: Vec<Arc<Event>> = {
             let set = set_lock.read();
@@ -398,7 +494,7 @@ impl EventIndex {
                 .map(|r| Arc::clone(&r.event))
                 .collect()
         };
-        
+
         events
     }
 
@@ -407,7 +503,7 @@ impl EventIndex {
         let Some(set_lock) = self.by_kind.get(&kind) else {
             return Vec::new();
         };
-        
+
         let events: Vec<Arc<Event>> = {
             let set = set_lock.read();
             set.iter()
@@ -415,7 +511,7 @@ impl EventIndex {
                 .map(|r| Arc::clone(&r.event))
                 .collect()
         };
-        
+
         events
     }
 
@@ -427,11 +523,11 @@ impl EventIndex {
         limit: usize,
     ) -> Vec<Arc<Event>> {
         let pubkey_hash = TagIdHash::from_id(pubkey);
-        
+
         let Some(set_lock) = self.by_pubkey.get(&pubkey_hash) else {
             return Vec::new();
         };
-        
+
         let events: Vec<Arc<Event>> = {
             let set = set_lock.read();
             set.iter()
@@ -440,18 +536,18 @@ impl EventIndex {
                 .map(|r| Arc::clone(&r.event))
                 .collect()
         };
-        
+
         events
     }
 
     /// Query by e-tag (events referencing this event ID)
     pub fn query_by_e_tag(&self, event_id: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         let e_tag_hash = TagIdHash::from_id(event_id);
-        
+
         let Some(set_lock) = self.by_tag_e.get(&e_tag_hash) else {
             return Vec::new();
         };
-        
+
         let events: Vec<Arc<Event>> = {
             let set = set_lock.read();
             set.iter()
@@ -459,18 +555,18 @@ impl EventIndex {
                 .map(|r| Arc::clone(&r.event))
                 .collect()
         };
-        
+
         events
     }
 
     /// Query by p-tag (events mentioning this pubkey)
     pub fn query_by_p_tag(&self, pubkey: &[u8; 32], limit: usize) -> Vec<Arc<Event>> {
         let p_tag_hash = TagIdHash::from_id(pubkey);
-        
+
         let Some(set_lock) = self.by_tag_p.get(&p_tag_hash) else {
             return Vec::new();
         };
-        
+
         let events: Vec<Arc<Event>> = {
             let set = set_lock.read();
             set.iter()
@@ -478,7 +574,7 @@ impl EventIndex {
                 .map(|r| Arc::clone(&r.event))
                 .collect()
         };
-        
+
         events
     }
 
@@ -487,11 +583,11 @@ impl EventIndex {
         let Some(inner_map) = self.by_tag_other.get(&letter) else {
             return Vec::new();
         };
-        
+
         let Some(set_lock) = inner_map.get(value) else {
             return Vec::new();
         };
-        
+
         let events: Vec<Arc<Event>> = {
             let set = set_lock.read();
             set.iter()
@@ -499,7 +595,7 @@ impl EventIndex {
                 .map(|r| Arc::clone(&r.event))
                 .collect()
         };
-        
+
         events
     }
 }
@@ -526,7 +622,13 @@ mod tests {
         Arc::new(Event::from_json_unchecked(json.as_bytes()).unwrap())
     }
 
-    fn make_event_with_content(id: u8, pubkey: u8, kind: u32, created_at: u64, content: &str) -> Arc<Event> {
+    fn make_event_with_content(
+        id: u8,
+        pubkey: u8,
+        kind: u32,
+        created_at: u64,
+        content: &str,
+    ) -> Arc<Event> {
         let json = format!(
             r#"{{"id":"{:0>64}","pubkey":"{:0>64}","created_at":{},"kind":{},"tags":[],"content":"{}","sig":"{:0>128}"}}"#,
             format!("{:x}", id),
@@ -548,7 +650,7 @@ mod tests {
         let expected_size = event.raw.len();
 
         index.insert(event);
-        
+
         // Memory should equal the raw JSON size
         assert_eq!(index.memory_bytes(), expected_size);
     }
@@ -556,17 +658,17 @@ mod tests {
     #[test]
     fn test_memory_tracking_on_remove() {
         let index = EventIndex::new();
-        
+
         let event = make_event(1, 1, 1, 1000);
         let event_size = event.raw.len();
-        
+
         index.insert(event.clone());
         let mem_after_insert = index.memory_bytes();
         assert_eq!(mem_after_insert, event_size);
 
         index.remove(&event.id);
         let mem_after_remove = index.memory_bytes();
-        
+
         // Memory should be back to 0
         assert_eq!(mem_after_remove, 0);
     }
@@ -574,14 +676,14 @@ mod tests {
     #[test]
     fn test_memory_tracking_multiple_events() {
         let index = EventIndex::new();
-        
+
         let mut total_size = 0;
         for i in 0..10 {
             let event = make_event(i, 1, 1, 1000 + i as u64);
             total_size += event.raw.len();
             index.insert(event);
         }
-        
+
         let mem_used = index.memory_bytes();
         assert_eq!(mem_used, total_size);
         assert_eq!(index.len(), 10);
@@ -593,7 +695,7 @@ mod tests {
             total_size -= removed_size;
             index.remove(&event.id);
         }
-        
+
         let mem_after_remove = index.memory_bytes();
         assert_eq!(mem_after_remove, total_size);
         assert_eq!(index.len(), 5);
@@ -602,15 +704,15 @@ mod tests {
     #[test]
     fn test_memory_tracking_with_large_content() {
         let index = EventIndex::new();
-        
+
         // Create events with different content sizes
         let small_event = make_event_with_content(1, 1, 1, 1000, "small");
         let large_content = "x".repeat(1000);
         let large_event = make_event_with_content(2, 1, 1, 1001, &large_content);
-        
+
         let small_size = small_event.raw.len();
         let large_size = large_event.raw.len();
-        
+
         index.insert(small_event.clone());
         let mem_after_small = index.memory_bytes();
         assert_eq!(mem_after_small, small_size);
@@ -633,22 +735,22 @@ mod tests {
     #[test]
     fn test_memory_tracking_with_replaceable_events() {
         let index = EventIndex::new();
-        
+
         // Create two replaceable events (kind 10000) with same pubkey
         let event1 = make_event(1, 1, 10000, 1000);
         let size1 = event1.raw.len();
-        
+
         index.insert(event1.clone());
         let mem_after_first = index.memory_bytes();
         assert_eq!(mem_after_first, size1);
 
         let event2 = make_event(2, 1, 10000, 2000);
         let size2 = event2.raw.len();
-        
+
         // Insert second event (should replace first)
         index.insert(event2.clone());
         let mem_after_replace = index.memory_bytes();
-        
+
         // Memory should be roughly the same (one removed, one added)
         assert_eq!(mem_after_replace, size2);
         assert_eq!(index.len(), 1);

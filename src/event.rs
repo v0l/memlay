@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use hex::FromHex;
-use secp256k1::{schnorr::Signature, XOnlyPublicKey};
+use secp256k1::{XOnlyPublicKey, schnorr::Signature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;

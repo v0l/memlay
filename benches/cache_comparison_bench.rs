@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use memlay::event::Event;
 use memlay::store::{EventStore, StoreConfig};
 use memlay::subscription::{Filter, SubscriptionManager};

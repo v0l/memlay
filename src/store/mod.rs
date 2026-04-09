@@ -2,14 +2,14 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 mod index;
 mod wal;
 
-pub use index::{EventIndex, EventRef};
+pub use index::{EventIndex, EventRef, InsertOutcome};
 pub use wal::{WalOp, WriteAheadLog};
 
 use crate::event::Event;
@@ -179,7 +179,9 @@ impl EventStore {
                 );
                 tokio::time::sleep(interval).await;
                 let store = store.clone();
-                tokio::task::spawn_blocking(move || store.maybe_evict()).await.ok();
+                tokio::task::spawn_blocking(move || store.maybe_evict())
+                    .await
+                    .ok();
             }
         });
     }
@@ -198,7 +200,7 @@ impl EventStore {
         let process_mem = {
             let mut sys = self.sys.lock().unwrap();
             sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-            
+
             match sysinfo::get_current_pid() {
                 Ok(pid) => {
                     if let Some(process) = sys.process(pid) {
@@ -212,7 +214,8 @@ impl EventStore {
         };
 
         // Adaptive interval: evict more frequently when close to limit
-        let new_interval = if current_mem >= max_bytes * 70 / 100 || process_mem >= max_bytes as u64 {
+        let new_interval = if current_mem >= max_bytes * 70 / 100 || process_mem >= max_bytes as u64
+        {
             1 // 1s when over 70% or RSS over limit
         } else if current_mem >= max_bytes * 50 / 100 {
             2 // 2s when 50-70% of limit
@@ -224,10 +227,14 @@ impl EventStore {
             .store(new_interval, Ordering::Relaxed);
 
         let target = max_bytes * 50 / 100;
-        
+
         // Evict if tracked memory is over target OR if actual process memory exceeds limit
         if current_mem > target || process_mem > max_bytes as u64 {
-            let batch_size = if process_mem > max_bytes as u64 { 5000 } else { 1000 };
+            let batch_size = if process_mem > max_bytes as u64 {
+                5000
+            } else {
+                1000
+            };
             let mut removed = 0;
 
             let oldest = self.index.get_oldest(batch_size);
@@ -282,29 +289,38 @@ impl EventStore {
         }
 
         // Insert the event and get replaced events (for replaceable events)
-        let replaced = self.index.insert(event.clone());
+        // EventIndex::insert now handles the duplicate check atomically
+        // and returns LostRace if we lost a replaceable event race
+        let outcome = self.index.insert(event.clone());
 
-        // Write to WAL if available
-        if let Some(ref wal) = self.wal {
-            if let Err(e) = wal.insert(&event) {
-                tracing::error!(error = %e, "failed to write insert to WAL");
+        match outcome {
+            InsertOutcome::Duplicate | InsertOutcome::LostRace => {
+                return InsertResult::Duplicate;
             }
+            InsertOutcome::Inserted { replaced } => {
+                // Write to WAL if available
+                if let Some(ref wal) = self.wal {
+                    if let Err(e) = wal.insert(&event) {
+                        tracing::error!(error = %e, "failed to write insert to WAL");
+                    }
 
-            // If this event replaced another, write delete for the old one
-            if let Some(replaced_event) = &replaced {
-                if let Err(e) = wal.delete(&replaced_event.id) {
-                    tracing::error!(error = %e, "failed to write delete to WAL");
+                    // If this event replaced another, write delete for the old one
+                    if let Some(replaced_event) = &replaced {
+                        if let Err(e) = wal.delete(&replaced_event.id) {
+                            tracing::error!(error = %e, "failed to write delete to WAL");
+                        }
+                    }
+                }
+
+                // Record write delay metric
+                crate::metrics::observe_write_delay(start.elapsed());
+                crate::metrics::inc_events_saved();
+
+                InsertResult::Stored {
+                    event,
+                    replaced: replaced.map(|e| vec![e]).unwrap_or_default(),
                 }
             }
-        }
-
-        // Record write delay metric
-        crate::metrics::observe_write_delay(start.elapsed());
-        crate::metrics::inc_events_saved();
-
-        InsertResult::Stored {
-            event,
-            replaced: replaced.map(|e| vec![e]).unwrap_or_default(),
         }
     }
 
@@ -329,24 +345,30 @@ impl EventStore {
                 continue;
             }
 
-            let old = self.index.insert(event.clone());
-            inserted += 1;
+            let outcome = self.index.insert(event.clone());
 
-            // Write to WAL if available
-            if let Some(ref wal) = self.wal {
-                if let Err(e) = wal.insert(&event) {
-                    tracing::error!(error = %e, "failed to write batch insert to WAL");
-                }
+            match outcome {
+                InsertOutcome::Inserted { replaced: old } => {
+                    inserted += 1;
 
-                if let Some(old_event) = &old {
-                    if let Err(e) = wal.delete(&old_event.id) {
-                        tracing::error!(error = %e, "failed to write batch delete to WAL");
+                    // Write to WAL if available
+                    if let Some(ref wal) = self.wal {
+                        if let Err(e) = wal.insert(&event) {
+                            tracing::error!(error = %e, "failed to write batch insert to WAL");
+                        }
+
+                        if let Some(old_event) = &old {
+                            if let Err(e) = wal.delete(&old_event.id) {
+                                tracing::error!(error = %e, "failed to write batch delete to WAL");
+                            }
+                        }
+                    }
+
+                    if let Some(old_event) = old {
+                        replaced.push(old_event);
                     }
                 }
-            }
-
-            if let Some(old_event) = old {
-                replaced.push(old_event);
+                InsertOutcome::Duplicate | InsertOutcome::LostRace => {}
             }
         }
 
@@ -488,38 +510,42 @@ impl EventStore {
         let mut errors = 0usize;
         let mut evicted = 0usize;
         let max_bytes = self.config.max_bytes;
-        let eviction_threshold = if max_bytes > 0 { max_bytes * 90 / 100 } else { 0 };
-        let eviction_target = if max_bytes > 0 { max_bytes * 70 / 100 } else { 0 };
+        let eviction_threshold = if max_bytes > 0 {
+            max_bytes * 90 / 100
+        } else {
+            0
+        };
+        let eviction_target = if max_bytes > 0 {
+            max_bytes * 70 / 100
+        } else {
+            0
+        };
 
-        match wal.replay(|op| {
-            match op {
-                WalOp::Insert(data) => {
-                    match Event::from_json_unchecked(&data) {
-                        Ok(event) => {
-                            self.index.insert(Arc::new(event));
-                            wal_count += 1;
+        match wal.replay(|op| match op {
+            WalOp::Insert(data) => match Event::from_json_unchecked(&data) {
+                Ok(event) => {
+                    self.index.insert(Arc::new(event));
+                    wal_count += 1;
 
-                            if eviction_threshold > 0 && self.index.memory_bytes() > eviction_threshold {
-                                while self.index.memory_bytes() > eviction_target {
-                                    let oldest = self.index.get_oldest(1);
-                                    if oldest.is_empty() {
-                                        break;
-                                    }
-                                    self.index.remove(&oldest[0].id);
-                                    evicted += 1;
-                                }
+                    if eviction_threshold > 0 && self.index.memory_bytes() > eviction_threshold {
+                        while self.index.memory_bytes() > eviction_target {
+                            let oldest = self.index.get_oldest(1);
+                            if oldest.is_empty() {
+                                break;
                             }
-                        }
-                        Err(e) => {
-                            errors += 1;
-                            tracing::warn!(error = %e, "failed to parse event from WAL");
+                            self.index.remove(&oldest[0].id);
+                            evicted += 1;
                         }
                     }
                 }
-                WalOp::Delete(id) => {
-                    self.index.remove(&id);
-                    wal_count += 1;
+                Err(e) => {
+                    errors += 1;
+                    tracing::warn!(error = %e, "failed to parse event from WAL");
                 }
+            },
+            WalOp::Delete(id) => {
+                self.index.remove(&id);
+                wal_count += 1;
             }
         }) {
             Ok(_) => {
@@ -574,14 +600,12 @@ impl EventStore {
 
                 let store = store.clone();
                 let path = path.clone();
-                tokio::task::spawn_blocking(move || {
-                    match store.save_to_disk() {
-                        Ok(_) => {
-                            tracing::debug!(path, "background persistence completed");
-                        }
-                        Err(e) => {
-                            tracing::error!(path, error = %e, "background persistence failed");
-                        }
+                tokio::task::spawn_blocking(move || match store.save_to_disk() {
+                    Ok(_) => {
+                        tracing::debug!(path, "background persistence completed");
+                    }
+                    Err(e) => {
+                        tracing::error!(path, error = %e, "background persistence failed");
                     }
                 })
                 .await
@@ -1054,19 +1078,28 @@ mod tests {
 
         // Should have loaded all events from WAL
         assert_eq!(loaded, 100, "Should load all events from WAL");
-        
+
         // But store should have fewer events after eviction
-        assert!(store2.len() < 100, "Store should have fewer than 100 events after eviction");
-        
+        assert!(
+            store2.len() < 100,
+            "Store should have fewer than 100 events after eviction"
+        );
+
         // Should have the newest events (highest created_at), not the oldest
         // The oldest events (created_at 0, 1, 2...) should have been evicted
         let newest_event_id = make_event(99, 1, 1, 99).id;
         let oldest_event_id = make_event(0, 1, 1, 0).id;
-        
+
         // Verify newest event is kept
-        assert!(store2.get(&newest_event_id).is_some(), "Should keep newest event (created_at=99)");
-        
+        assert!(
+            store2.get(&newest_event_id).is_some(),
+            "Should keep newest event (created_at=99)"
+        );
+
         // Verify oldest event is evicted
-        assert!(store2.get(&oldest_event_id).is_none(), "Should evict oldest event (created_at=0)");
+        assert!(
+            store2.get(&oldest_event_id).is_none(),
+            "Should evict oldest event (created_at=0)"
+        );
     }
 }
