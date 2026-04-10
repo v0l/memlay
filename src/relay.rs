@@ -288,7 +288,52 @@ async fn handle_socket(
 
                 match msg {
                     axum::extract::ws::Message::Text(text) => {
-                        handle_text(&text, addr, &send_tx, &subscriptions, &tx, &mut conn_subs, &mut events_sent, &mut events_dropped, &mut subs_opened, &mut subs_closed).await;
+                        // Handle REQ asynchronously to keep main loop responsive
+                        if text.starts_with("[\"REQ\"") {
+                            let text_str = text.as_ref();
+                            if let Ok(NostrMessage::Request { id, filters }) = NostrMessage::from_json(text_str) {
+                                // Update conn_subs in main loop immediately so broadcast events are matched
+                                conn_subs.insert(id.clone(), filters.clone());
+                                
+                                let send_tx = send_tx.clone();
+                                let subs = subscriptions.clone();
+                                let filters = filters.clone();
+                                let id = id.clone();
+                                
+                                tokio::spawn(async move {
+                                    // Register subscription
+                                    subs.add_subscription(crate::subscription::Subscription {
+                                        id: id.clone(),
+                                        filters: filters.clone(),
+                                    });
+                                    
+                                    // Send stored matching events
+                                    for filter in &filters {
+                                        let events = subs.query_filter(filter);
+                                        for event in events {
+                                            let msg = NostrMessage::Event {
+                                                sub_id: Some(id.clone()),
+                                                event: event.as_ref().clone(),
+                                            };
+                                            let _ = send_tx.try_send(msg.to_json());
+                                            crate::metrics::inc_events_output();
+                                        }
+                                    }
+                                    
+                                    let eose = NostrMessage::EndOfStoredEvents { id };
+                                    let _ = send_tx.send(eose.to_json()).await;
+                                });
+                            }
+                        } else if text.starts_with("[\"CLOSE\"") {
+                            // Handle CLOSE for async subscriptions
+                            let text_str = text.as_ref();
+                            if let Ok(NostrMessage::Close { id }) = NostrMessage::from_json(text_str) {
+                                subscriptions.remove_subscription(&id);
+                                conn_subs.remove(&id);
+                            }
+                        } else {
+                            handle_text(&text, addr, &send_tx, &subscriptions, &tx, &mut conn_subs, &mut events_sent, &mut events_dropped, &mut subs_opened, &mut subs_closed).await;
+                        }
                     }
                     axum::extract::ws::Message::Binary(_) => {
                         let notice = NostrMessage::Notification {
