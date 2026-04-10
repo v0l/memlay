@@ -21,6 +21,9 @@ const BROADCAST_CAP: usize = 8192;
 /// Capacity of per-connection send channels (backpressure for slow clients).
 const CONN_SEND_CAP: usize = 256;
 
+/// Maximum consecutive dropped events before disconnecting a slow peer.
+const SLOW_PEER_MAX_DROPPED: usize = 10;
+
 /// Shared state threaded through axum via `State<Arc<AppState>>`.
 struct AppState {
     events: Arc<EventStore>,
@@ -250,6 +253,17 @@ async fn handle_socket(
 
     let mut rx = tx.subscribe();
 
+    // Track consecutive dropped events for slow peer detection
+    let mut consecutive_dropped = 0;
+    
+    // Track event statistics for this connection
+    let mut events_sent = 0;
+    let mut events_dropped = 0;
+    
+    // Track subscription statistics for this connection
+    let mut subs_opened = 0;
+    let mut subs_closed = 0;
+
     // Spawn sender task - drains from send_rx and sends to socket
     let mut sender_handle = tokio::spawn(async move {
         while let Some(msg) = send_rx.recv().await {
@@ -274,7 +288,7 @@ async fn handle_socket(
 
                 match msg {
                     axum::extract::ws::Message::Text(text) => {
-                        handle_text(&text, addr, &send_tx, &subscriptions, &tx, &mut conn_subs).await;
+                        handle_text(&text, addr, &send_tx, &subscriptions, &tx, &mut conn_subs, &mut events_sent, &mut events_dropped, &mut subs_opened, &mut subs_closed).await;
                     }
                     axum::extract::ws::Message::Binary(_) => {
                         let notice = NostrMessage::Notification {
@@ -304,7 +318,17 @@ async fn handle_socket(
                                     };
                                     // Send asynchronously via channel (non-blocking)
                                     if send_tx.try_send(msg.to_json()).is_err() {
-                                        tracing::warn!(%addr, sub_id, "send channel full, dropping event");
+                                        consecutive_dropped += 1;
+                                        events_dropped += 1;
+                                        tracing::warn!(%addr, sub_id, consecutive_dropped, "send channel full, dropping event");
+                                        
+                                        // Disconnect slow peer
+                                        if consecutive_dropped >= SLOW_PEER_MAX_DROPPED {
+                                            tracing::warn!(%addr, "disconnecting slow peer after {} dropped events", consecutive_dropped);
+                                            break;
+                                        }
+                                    } else {
+                                        events_sent += 1;
                                     }
                                     // Track events output
                                     crate::metrics::inc_events_output();
@@ -326,6 +350,12 @@ async fn handle_socket(
                 break; // Sender task failed
             }
         }
+        
+        // Check for slow peer after each iteration
+        if consecutive_dropped >= SLOW_PEER_MAX_DROPPED {
+            tracing::warn!(%addr, "disconnecting slow peer ({} dropped events)", consecutive_dropped);
+            break;
+        }
     }
 
     // Clean up all subscriptions for this connection on disconnect
@@ -340,7 +370,7 @@ async fn handle_socket(
     connection_count.fetch_sub(1, Ordering::Relaxed);
     crate::metrics::ACTIVE_CONNECTIONS.dec();
 
-    tracing::info!(%addr, "client disconnected");
+    tracing::info!(%addr, "client disconnected: sent={}, dropped={}, subs_opened={}, subs_closed={}", events_sent, events_dropped, subs_opened, subs_closed);
 }
 
 async fn handle_text(
@@ -350,6 +380,10 @@ async fn handle_text(
     subscriptions: &Arc<SubscriptionManager>,
     tx: &broadcast::Sender<Arc<crate::event::Event>>,
     conn_subs: &mut std::collections::HashMap<String, Vec<Filter>>,
+    events_sent: &mut usize,
+    events_dropped: &mut usize,
+    subs_opened: &mut usize,
+    subs_closed: &mut usize,
 ) {
     match NostrMessage::from_json(text) {
         Ok(NostrMessage::Event { event, .. }) => {
@@ -409,6 +443,7 @@ async fn handle_text(
                 filters: filters.clone(),
             });
             conn_subs.insert(id.clone(), filters.clone());
+            *subs_opened += 1;
 
             // Send stored matching events
             for filter in &filters {
@@ -419,7 +454,10 @@ async fn handle_text(
                         event: event.as_ref().clone(),
                     };
                     if send_tx.try_send(msg.to_json()).is_err() {
+                        *events_dropped += 1;
                         tracing::warn!(%addr, id, "send channel full, dropping event");
+                    } else {
+                        *events_sent += 1;
                     }
                     // Track events output
                     crate::metrics::inc_events_output();
@@ -436,6 +474,7 @@ async fn handle_text(
         Ok(NostrMessage::Close { id }) => {
             subscriptions.remove_subscription(&id);
             conn_subs.remove(&id);
+            *subs_closed += 1;
         }
 
         Err(e) => {
