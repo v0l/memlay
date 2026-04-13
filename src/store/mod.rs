@@ -173,15 +173,27 @@ impl EventStore {
     pub fn start_eviction_task(self: &Arc<Self>) {
         let store = self.clone();
         tokio::spawn(async move {
+            let task_id = std::process::id();
+            tracing::trace!(task_id = %task_id, "eviction task started");
             loop {
                 let interval = Duration::from_secs(
                     store.state.interval_seconds.load(Ordering::Relaxed) as u64,
                 );
                 tokio::time::sleep(interval).await;
                 let store = store.clone();
-                tokio::task::spawn_blocking(move || store.maybe_evict())
-                    .await
-                    .ok();
+                let start = std::time::Instant::now();
+                tracing::trace!(task_id = %task_id, "spawning eviction blocking task");
+                tokio::task::spawn_blocking(move || {
+                    let inner_start = std::time::Instant::now();
+                    tracing::trace!(task_id = %task_id, "eviction blocking task started");
+                    store.maybe_evict();
+                    let duration = inner_start.elapsed();
+                    tracing::trace!(task_id = %task_id, duration_us = %duration.as_micros(), "eviction blocking task completed");
+                })
+                .await
+                .ok();
+                let total_duration = start.elapsed();
+                tracing::trace!(task_id = %task_id, total_duration_us = %total_duration.as_micros(), "eviction cycle completed");
             }
         });
     }
@@ -595,21 +607,33 @@ impl EventStore {
         let path = path.clone();
 
         tokio::spawn(async move {
+            let task_id = std::process::id();
+            tracing::trace!(task_id = %task_id, "persistence task started");
             loop {
                 tokio::time::sleep(Duration::from_secs(interval_seconds)).await;
 
                 let store = store.clone();
                 let path = path.clone();
-                tokio::task::spawn_blocking(move || match store.save_to_disk() {
-                    Ok(_) => {
-                        tracing::debug!(path, "background persistence completed");
-                    }
-                    Err(e) => {
-                        tracing::error!(path, error = %e, "background persistence failed");
+                let start = std::time::Instant::now();
+                tracing::trace!(task_id = %task_id, "spawning persistence blocking task");
+                tokio::task::spawn_blocking(move || {
+                    let inner_start = std::time::Instant::now();
+                    tracing::trace!(task_id = %task_id, "persistence blocking task started");
+                    let result = store.save_to_disk();
+                    let duration = inner_start.elapsed();
+                    match result {
+                        Ok(_) => {
+                            tracing::trace!(task_id = %task_id, path = %path, duration_us = %duration.as_micros(), "persistence blocking task completed successfully");
+                        }
+                        Err(e) => {
+                            tracing::error!(task_id = %task_id, path = %path, error = %e, duration_us = %duration.as_micros(), "persistence blocking task failed");
+                        }
                     }
                 })
                 .await
                 .ok();
+                let total_duration = start.elapsed();
+                tracing::trace!(task_id = %task_id, total_duration_us = %total_duration.as_micros(), "persistence cycle completed");
             }
         });
     }

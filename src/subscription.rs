@@ -344,34 +344,67 @@ impl SubscriptionManager {
     }
 
     pub fn add_subscription(&self, mut sub: Subscription) {
+        let sub_id = sub.id.clone();
+        let start = std::time::Instant::now();
+        tracing::trace!(sub_id = %sub_id, "acquiring subscriptions write lock");
         let mut subs = self.subscriptions.write();
+        let lock_duration = start.elapsed();
+        tracing::trace!(sub_id = %sub_id, lock_duration_us = %lock_duration.as_micros(), "subscriptions write lock acquired");
+        
         // Pre-parse e-tag and p-tag values once at subscription time
+        let parse_start = std::time::Instant::now();
         for filter in &mut sub.filters {
             filter.parse_hex_values();
         }
-        subs.insert(sub.id.clone(), sub);
+        let parse_duration = parse_start.elapsed();
+        tracing::trace!(sub_id = %sub_id, parse_duration_us = %parse_duration.as_micros(), "parsed filter hex values");
+        
+        let insert_start = std::time::Instant::now();
+        subs.insert(sub_id.clone(), sub);
+        let insert_duration = insert_start.elapsed();
+        tracing::trace!(sub_id = %sub_id, insert_duration_us = %insert_duration.as_micros(), "subscription inserted");
     }
 
     pub fn remove_subscription(&self, id: &str) {
+        let start = std::time::Instant::now();
+        tracing::trace!(sub_id = %id, "acquiring subscriptions write lock for removal");
         let mut subs = self.subscriptions.write();
-        subs.remove(id);
+        let lock_duration = start.elapsed();
+        tracing::trace!(sub_id = %id, lock_duration_us = %lock_duration.as_micros(), "subscriptions write lock acquired for removal");
+        
+        let remove_start = std::time::Instant::now();
+        let removed = subs.remove(id);
+        let remove_duration = remove_start.elapsed();
+        tracing::trace!(sub_id = %id, removed = removed.is_some(), remove_duration_us = %remove_duration.as_micros(), "subscription removal completed");
     }
 
     pub fn query_subscriptions(&self) -> Vec<Arc<Event>> {
+        let start = std::time::Instant::now();
+        tracing::trace!("acquiring subscriptions read lock for query_subscriptions");
         let subs = self.subscriptions.read();
+        let lock_duration = start.elapsed();
+        tracing::trace!(lock_duration_us = %lock_duration.as_micros(), subs_count = %subs.len(), "subscriptions read lock acquired for query_subscriptions");
+        
         let mut all_events = Vec::new();
-
+        let mut total_filters = 0;
+        
         for sub in subs.values() {
             for filter in &sub.filters {
+                total_filters += 1;
                 let events = self.query_filter(filter);
                 all_events.extend(events);
             }
         }
+        
+        tracing::trace!(subs_count = %subs.len(), filters_processed = %total_filters, events_returned = %all_events.len(), "query_subscriptions completed");
 
         all_events
     }
 
     pub fn query_filter(&self, filter: &Filter) -> Vec<Arc<Event>> {
+        let query_start = std::time::Instant::now();
+        tracing::trace!("acquiring query_filter lock");
+        
         if filter.kinds.is_none()
             && filter.authors.is_none()
             && filter.tag_filters.is_empty()
@@ -379,11 +412,13 @@ impl SubscriptionManager {
             && filter.until.is_none()
             && filter.ids.is_none()
         {
+            tracing::trace!(query_duration_us = %query_start.elapsed().as_micros(), "query_filter rejected empty filter");
             return Vec::new();
         }
 
         let cache_key = CacheKey::from_filter(filter);
 
+        let cache_check_start = std::time::Instant::now();
         if let Some(cached) = self.cache.get(&cache_key) {
             let upgraded: Vec<Arc<Event>> = cached
                 .value()
@@ -392,11 +427,20 @@ impl SubscriptionManager {
                 .collect();
 
             if upgraded.len() == cached.len() {
+                let cache_hit_duration = cache_check_start.elapsed();
+                let total_duration = query_start.elapsed();
+                tracing::trace!(cache_hit = true, events = %upgraded.len(), cache_check_duration_us = %cache_hit_duration.as_micros(), total_duration_us = %total_duration.as_micros(), "query_filter cache hit");
                 return upgraded;
             }
         }
+        
+        let cache_check_duration = cache_check_start.elapsed();
+        tracing::trace!(cache_hit = false, cache_check_duration_us = %cache_check_duration.as_micros(), "query_filter cache miss, calling query_filter_internal");
 
+        let results_start = std::time::Instant::now();
         let results = self.query_filter_internal(filter);
+        let results_duration = results_start.elapsed();
+        tracing::trace!(results_count = %results.len(), results_duration_us = %results_duration.as_micros(), "query_filter_internal completed");
 
         if !results.is_empty() {
             // Evict oldest cache entry if at capacity instead of clearing all
@@ -404,13 +448,19 @@ impl SubscriptionManager {
                 // Remove one random entry to make room (DashMap doesn't have LRU built-in)
                 if let Some(random_key) = self.cache.iter().next().map(|r| r.key().clone()) {
                     self.cache.remove(&random_key);
+                    tracing::trace!("evicted oldest cache entry to make room");
                 }
             }
             let weak_results: Vec<Weak<Event>> =
                 results.iter().map(|arc| Arc::downgrade(arc)).collect();
+            let insert_start = std::time::Instant::now();
             self.cache.insert(cache_key, weak_results);
+            let insert_duration = insert_start.elapsed();
+            tracing::trace!(cache_insert_duration_us = %insert_duration.as_micros(), "inserted query results into cache");
         }
 
+        let total_duration = query_start.elapsed();
+        tracing::trace!(total_duration_us = %total_duration.as_micros(), final_results = %results.len(), "query_filter completed");
         results
     }
 

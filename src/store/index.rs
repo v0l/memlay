@@ -180,31 +180,49 @@ impl EventIndex {
         // Pubkey index
         {
             let pubkey_hash = TagIdHash::from_id(&event.pubkey);
-            self.by_pubkey
+            let start = std::time::Instant::now();
+            let set_lock = self.by_pubkey
                 .entry(pubkey_hash)
-                .or_insert_with(|| RwLock::new(BTreeSet::new()))
-                .write()
-                .insert(EventRef::new(event.clone()));
+                .or_insert_with(|| RwLock::new(BTreeSet::new()));
+            let entry_duration = start.elapsed();
+            tracing::trace!(event_id = %hex::encode(event.id), index = "pubkey", entry_duration_us = %entry_duration.as_micros(), "acquired pubkey index entry");
+            
+            let write_start = std::time::Instant::now();
+            set_lock.write().insert(EventRef::new(event.clone()));
+            let write_duration = write_start.elapsed();
+            tracing::trace!(event_id = %hex::encode(event.id), index = "pubkey", write_duration_us = %write_duration.as_micros(), "pubkey index write completed");
         }
 
         // Kind index
         {
-            self.by_kind
+            let start = std::time::Instant::now();
+            let set_lock = self.by_kind
                 .entry(event.kind)
-                .or_insert_with(|| RwLock::new(BTreeSet::new()))
-                .write()
-                .insert(EventRef::new(event.clone()));
+                .or_insert_with(|| RwLock::new(BTreeSet::new()));
+            let entry_duration = start.elapsed();
+            tracing::trace!(event_id = %hex::encode(event.id), index = "kind", kind = event.kind, entry_duration_us = %entry_duration.as_micros(), "acquired kind index entry");
+            
+            let write_start = std::time::Instant::now();
+            set_lock.write().insert(EventRef::new(event.clone()));
+            let write_duration = write_start.elapsed();
+            tracing::trace!(event_id = %hex::encode(event.id), index = "kind", kind = event.kind, write_duration_us = %write_duration.as_micros(), "kind index write completed");
         }
 
         // E-tag index
         {
             for e_tag in event.e_tags() {
                 let e_tag_hash = TagIdHash::from_id(&e_tag);
-                self.by_tag_e
+                let start = std::time::Instant::now();
+                let set_lock = self.by_tag_e
                     .entry(e_tag_hash)
-                    .or_insert_with(|| RwLock::new(BTreeSet::new()))
-                    .write()
-                    .insert(EventRef::new(event.clone()));
+                    .or_insert_with(|| RwLock::new(BTreeSet::new()));
+                let entry_duration = start.elapsed();
+                tracing::trace!(event_id = %hex::encode(event.id), index = "e-tag", e_tag = %hex::encode(e_tag), entry_duration_us = %entry_duration.as_micros(), "acquired e-tag index entry");
+                
+                let write_start = std::time::Instant::now();
+                set_lock.write().insert(EventRef::new(event.clone()));
+                let write_duration = write_start.elapsed();
+                tracing::trace!(event_id = %hex::encode(event.id), index = "e-tag", e_tag = %hex::encode(e_tag), write_duration_us = %write_duration.as_micros(), "e-tag index write completed");
             }
         }
 
@@ -212,11 +230,17 @@ impl EventIndex {
         {
             for p_tag in event.p_tags() {
                 let p_tag_hash = TagIdHash::from_id(&p_tag);
-                self.by_tag_p
+                let start = std::time::Instant::now();
+                let set_lock = self.by_tag_p
                     .entry(p_tag_hash)
-                    .or_insert_with(|| RwLock::new(BTreeSet::new()))
-                    .write()
-                    .insert(EventRef::new(event.clone()));
+                    .or_insert_with(|| RwLock::new(BTreeSet::new()));
+                let entry_duration = start.elapsed();
+                tracing::trace!(event_id = %hex::encode(event.id), index = "p-tag", p_tag = %hex::encode(p_tag), entry_duration_us = %entry_duration.as_micros(), "acquired p-tag index entry");
+                
+                let write_start = std::time::Instant::now();
+                set_lock.write().insert(EventRef::new(event.clone()));
+                let write_duration = write_start.elapsed();
+                tracing::trace!(event_id = %hex::encode(event.id), index = "p-tag", p_tag = %hex::encode(p_tag), write_duration_us = %write_duration.as_micros(), "p-tag index write completed");
             }
         }
 
@@ -229,20 +253,37 @@ impl EventIndex {
                     && letter != 'p'
                     && let Some(value) = tag.value()
                 {
+                    let start = std::time::Instant::now();
                     let inner_map = self.by_tag_other.entry(letter).or_insert_with(DashMap::new);
-                    inner_map
+                    let inner_entry_duration = start.elapsed();
+                    tracing::trace!(event_id = %hex::encode(event.id), index = "generic-tag", letter = %letter, value = %value, inner_entry_duration_us = %inner_entry_duration.as_micros(), "acquired generic tag inner map entry");
+                    
+                    let start = std::time::Instant::now();
+                    let set_lock = inner_map
                         .entry(value.to_string())
-                        .or_insert_with(|| RwLock::new(BTreeSet::new()))
-                        .write()
-                        .insert(EventRef::new(event.clone()));
+                        .or_insert_with(|| RwLock::new(BTreeSet::new()));
+                    let entry_duration = start.elapsed();
+                    tracing::trace!(event_id = %hex::encode(event.id), index = "generic-tag", letter = %letter, value = %value, entry_duration_us = %entry_duration.as_micros(), "acquired generic tag entry");
+                    
+                    let write_start = std::time::Instant::now();
+                    set_lock.write().insert(EventRef::new(event.clone()));
+                    let write_duration = write_start.elapsed();
+                    tracing::trace!(event_id = %hex::encode(event.id), index = "generic-tag", letter = %letter, value = %value, write_duration_us = %write_duration.as_micros(), "generic tag index write completed");
                 }
             }
         }
 
         // Oldest-first index for eviction (newest first in EventRef ordering)
         {
+            let start = std::time::Instant::now();
             let mut by_oldest = self.by_oldest.write();
+            let lock_duration = start.elapsed();
+            tracing::trace!(event_id = %hex::encode(event.id), index = "by_oldest", lock_duration_us = %lock_duration.as_micros(), "acquired by_oldest write lock");
+            
+            let insert_start = std::time::Instant::now();
             by_oldest.insert(EventRef::new(event.clone()));
+            let insert_duration = insert_start.elapsed();
+            tracing::trace!(event_id = %hex::encode(event.id), index = "by_oldest", insert_duration_us = %insert_duration.as_micros(), "by_oldest insert completed");
         }
 
         // Final consistency check: verify the event is still in by_id.
@@ -293,21 +334,28 @@ impl EventIndex {
 
     /// Remove an event from all secondary indexes (but NOT by_id or counters).
     /// Used to clean up orphaned entries when a concurrent remove() already
-    /// removed from by_id while we were populating secondary indexes.
+    /// removed from by_id while we were adding to secondary indexes.
     /// The caller is responsible for counter adjustments.
     fn cleanup_secondary_indexes(&self, event: &Arc<Event>) {
         let er = EventRef::new(event.clone());
+        let event_id = hex::encode(event.id);
 
         {
             let pubkey_hash = TagIdHash::from_id(&event.pubkey);
             if let Some(set_lock) = self.by_pubkey.get(&pubkey_hash) {
+                let start = std::time::Instant::now();
                 set_lock.write().remove(&er);
+                let duration = start.elapsed();
+                tracing::trace!(event_id = %event_id, index = "pubkey", cleanup = true, duration_us = %duration.as_micros(), "pubkey index cleanup completed");
             }
         }
 
         {
             if let Some(set_lock) = self.by_kind.get(&event.kind) {
+                let start = std::time::Instant::now();
                 set_lock.write().remove(&er);
+                let duration = start.elapsed();
+                tracing::trace!(event_id = %event_id, index = "kind", kind = event.kind, cleanup = true, duration_us = %duration.as_micros(), "kind index cleanup completed");
             }
         }
 
@@ -315,7 +363,10 @@ impl EventIndex {
             for e_tag in event.e_tags() {
                 let e_tag_hash = TagIdHash::from_id(&e_tag);
                 if let Some(set_lock) = self.by_tag_e.get(&e_tag_hash) {
+                    let start = std::time::Instant::now();
                     set_lock.write().remove(&er);
+                    let duration = start.elapsed();
+                    tracing::trace!(event_id = %event_id, index = "e-tag", e_tag = %hex::encode(e_tag), cleanup = true, duration_us = %duration.as_micros(), "e-tag index cleanup completed");
                 }
             }
         }
@@ -324,7 +375,10 @@ impl EventIndex {
             for p_tag in event.p_tags() {
                 let p_tag_hash = TagIdHash::from_id(&p_tag);
                 if let Some(set_lock) = self.by_tag_p.get(&p_tag_hash) {
+                    let start = std::time::Instant::now();
                     set_lock.write().remove(&er);
+                    let duration = start.elapsed();
+                    tracing::trace!(event_id = %event_id, index = "p-tag", p_tag = %hex::encode(p_tag), cleanup = true, duration_us = %duration.as_micros(), "p-tag index cleanup completed");
                 }
             }
         }
@@ -339,7 +393,10 @@ impl EventIndex {
                 {
                     if let Some(inner_map) = self.by_tag_other.get(&letter) {
                         if let Some(set_lock) = inner_map.get(value) {
+                            let start = std::time::Instant::now();
                             set_lock.write().remove(&er);
+                            let duration = start.elapsed();
+                            tracing::trace!(event_id = %event_id, index = "generic-tag", letter = %letter, value = %value, cleanup = true, duration_us = %duration.as_micros(), "generic tag index cleanup completed");
                         }
                     }
                 }
@@ -347,8 +404,15 @@ impl EventIndex {
         }
 
         {
+            let start = std::time::Instant::now();
             let mut by_oldest = self.by_oldest.write();
+            let lock_duration = start.elapsed();
+            tracing::trace!(event_id = %event_id, index = "by_oldest", cleanup = true, lock_duration_us = %lock_duration.as_micros(), "acquired by_oldest write lock for cleanup");
+            
+            let remove_start = std::time::Instant::now();
             by_oldest.remove(&er);
+            let remove_duration = remove_start.elapsed();
+            tracing::trace!(event_id = %event_id, index = "by_oldest", cleanup = true, remove_duration_us = %remove_duration.as_micros(), "by_oldest cleanup completed");
         }
     }
 
@@ -359,7 +423,12 @@ impl EventIndex {
     }
 
     fn internal_remove(&self, id: &[u8; 32], skip_replaceable: bool) -> Option<Arc<Event>> {
+        let event_id = hex::encode(id);
+        let start = std::time::Instant::now();
+        tracing::trace!(event_id = %event_id, "acquiring by_id remove lock");
         let (_, event) = self.by_id.remove(id)?;
+        let remove_duration = start.elapsed();
+        tracing::trace!(event_id = %event_id, remove_duration_us = %remove_duration.as_micros(), "by_id remove completed");
 
         let event_size = event.raw.len();
         self.memory_bytes
@@ -368,9 +437,10 @@ impl EventIndex {
 
         if !skip_replaceable && event.is_replaceable() {
             let key = event.replacement_key();
-            if let ReplacementKey::Replaceable { .. } | ReplacementKey::Addressable { .. } = &key {
-                self.by_replaceable.remove(&key);
-            }
+            let start = std::time::Instant::now();
+            self.by_replaceable.remove(&key);
+            let duration = start.elapsed();
+            tracing::trace!(event_id = %event_id, index = "replaceable", cleanup = true, duration_us = %duration.as_micros(), "replaceable index cleanup completed");
         }
 
         let er = EventRef::new(event.clone());
@@ -383,13 +453,19 @@ impl EventIndex {
         {
             let pubkey_hash = TagIdHash::from_id(&event.pubkey);
             if let Some(set_lock) = self.by_pubkey.get(&pubkey_hash) {
+                let start = std::time::Instant::now();
                 set_lock.write().remove(&er);
+                let duration = start.elapsed();
+                tracing::trace!(event_id = %event_id, index = "pubkey", cleanup = true, duration_us = %duration.as_micros(), "pubkey index cleanup completed");
             }
         }
 
         {
             if let Some(set_lock) = self.by_kind.get(&event.kind) {
+                let start = std::time::Instant::now();
                 set_lock.write().remove(&er);
+                let duration = start.elapsed();
+                tracing::trace!(event_id = %event_id, index = "kind", kind = event.kind, cleanup = true, duration_us = %duration.as_micros(), "kind index cleanup completed");
             }
         }
 
@@ -397,7 +473,10 @@ impl EventIndex {
             for e_tag in event.e_tags() {
                 let e_tag_hash = TagIdHash::from_id(&e_tag);
                 if let Some(set_lock) = self.by_tag_e.get(&e_tag_hash) {
+                    let start = std::time::Instant::now();
                     set_lock.write().remove(&er);
+                    let duration = start.elapsed();
+                    tracing::trace!(event_id = %event_id, index = "e-tag", e_tag = %hex::encode(e_tag), cleanup = true, duration_us = %duration.as_micros(), "e-tag index cleanup completed");
                 }
             }
         }
@@ -406,7 +485,10 @@ impl EventIndex {
             for p_tag in event.p_tags() {
                 let p_tag_hash = TagIdHash::from_id(&p_tag);
                 if let Some(set_lock) = self.by_tag_p.get(&p_tag_hash) {
+                    let start = std::time::Instant::now();
                     set_lock.write().remove(&er);
+                    let duration = start.elapsed();
+                    tracing::trace!(event_id = %event_id, index = "p-tag", p_tag = %hex::encode(p_tag), cleanup = true, duration_us = %duration.as_micros(), "p-tag index cleanup completed");
                 }
             }
         }
@@ -421,7 +503,10 @@ impl EventIndex {
                 {
                     if let Some(inner_map) = self.by_tag_other.get(&letter) {
                         if let Some(set_lock) = inner_map.get(value) {
+                            let start = std::time::Instant::now();
                             set_lock.write().remove(&er);
+                            let duration = start.elapsed();
+                            tracing::trace!(event_id = %event_id, index = "generic-tag", letter = %letter, value = %value, cleanup = true, duration_us = %duration.as_micros(), "generic tag index cleanup completed");
                         }
                     }
                 }
@@ -429,8 +514,15 @@ impl EventIndex {
         }
 
         {
+            let start = std::time::Instant::now();
             let mut by_oldest = self.by_oldest.write();
+            let lock_duration = start.elapsed();
+            tracing::trace!(event_id = %event_id, index = "by_oldest", cleanup = true, lock_duration_us = %lock_duration.as_micros(), "acquired by_oldest write lock for removal");
+            
+            let remove_start = std::time::Instant::now();
             by_oldest.remove(&er);
+            let remove_duration = remove_start.elapsed();
+            tracing::trace!(event_id = %event_id, index = "by_oldest", cleanup = true, remove_duration_us = %remove_duration.as_micros(), "by_oldest removal completed");
         }
 
         Some(event)
@@ -439,8 +531,15 @@ impl EventIndex {
     /// Get the oldest events for eviction (returns oldest first)
     pub fn get_oldest(&self, count: usize) -> Vec<EventRef> {
         // BTreeSet is sorted newest-first (EventRef ordering), so iterate from end
+        let start = std::time::Instant::now();
+        tracing::trace!("acquiring by_oldest read lock for get_oldest");
         let by_oldest = self.by_oldest.read();
+        let lock_duration = start.elapsed();
+        tracing::trace!(count = %count, total_events = %by_oldest.len(), lock_duration_us = %lock_duration.as_micros(), "by_oldest read lock acquired for get_oldest");
+        
         let oldest: Vec<EventRef> = by_oldest.iter().rev().take(count).cloned().collect();
+        let iter_duration = start.elapsed();
+        tracing::trace!(requested = %count, returned = %oldest.len(), total_duration_us = %iter_duration.as_micros(), "get_oldest completed");
 
         oldest
     }
