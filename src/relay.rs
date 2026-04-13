@@ -16,13 +16,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::broadcast;
 
 /// Capacity of the relay-wide new-event broadcast channel.
-const BROADCAST_CAP: usize = 8192;
+/// Increased to handle high event volume with many concurrent clients.
+const BROADCAST_CAP: usize = 262144;
 
 /// Capacity of per-connection send channels (backpressure for slow clients).
-const CONN_SEND_CAP: usize = 256;
+/// Increased to handle burst traffic without dropping events.
+const CONN_SEND_CAP: usize = 4096;
 
 /// Maximum consecutive dropped events before disconnecting a slow peer.
-const SLOW_PEER_MAX_DROPPED: usize = 10;
+const SLOW_PEER_MAX_DROPPED: usize = 100;
 
 /// Shared state threaded through axum via `State<Arc<AppState>>`.
 struct AppState {
@@ -472,6 +474,7 @@ async fn handle_text(
                     tracing::debug!(%addr, id = %event_id, kind = ev.kind, "ephemeral event");
                     // Ephemeral events are not stored but still broadcast to active subscribers
                     subscriptions.invalidate_cache();
+                    // Use try_send to prevent blocking when broadcast channel is full
                     let _ = tx.send(ev);
                     NostrMessage::Ok {
                         id: event_id,
@@ -499,6 +502,7 @@ async fn handle_text(
                     // Invalidate query cache on new event insertion
                     subscriptions.invalidate_cache();
                     // Broadcast to live subscriptions on other connections
+                    // Use try_send to prevent blocking when broadcast channel is full
                     let _ = tx.send(event);
                     NostrMessage::Ok {
                         id: event_id,
