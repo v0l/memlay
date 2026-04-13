@@ -607,3 +607,73 @@ async fn test_scale_2000_clients() {
 
     assert!(elapsed.as_secs() < 120, "Scale test took too long: {:?}", elapsed);
 }
+
+/// Test that specifically targets the deadlock pattern: many concurrent REQs
+/// with high event counts that fill the channel buffer
+#[tokio::test]
+async fn test_no_deadlock_under_high_load() {
+    let url = spawn_relay().await;
+
+    // Populate with events first
+    println!("\n=== Populating relay ===");
+    let keys = Keys::generate();
+    let client = Client::new(keys.clone());
+    client.add_relay(&url).await.unwrap();
+    client.connect().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    for i in 0..5000 {
+        let builder = EventBuilder::text_note(&format!("Load test event {}", i));
+        let _ = client.send_event_builder(builder).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Now send many concurrent REQs that will try to fetch all events
+    // This is the pattern that causes deadlock
+    println!("\n=== Testing concurrent REQs (deadlock trigger) ===");
+    let start = Instant::now();
+    
+    let mut handles = vec![];
+    for i in 0..100 {
+        let url = url.clone();
+        let handle = tokio::spawn(async move {
+            let keys = Keys::generate();
+            let client = Client::new(keys);
+            client.add_relay(&url).await.unwrap();
+            client.connect().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Fetch ALL events - this will generate many messages
+            let filter = Filter::new().limit(1000);
+            match tokio::time::timeout(Duration::from_secs(10), client.fetch_events(filter, Duration::from_secs(10))).await {
+                Ok(Ok(events)) => (i, events.len(), 0),
+                Ok(Err(_)) => (i, 0, 1),
+                Err(_) => (i, 0, 2),
+            }
+        });
+        handles.push(handle);
+    }
+
+    let mut completed = 0;
+    let mut total_events = 0;
+    for handle in handles {
+        match handle.await {
+            Ok((_, events, status)) => {
+                completed += 1;
+                total_events += events;
+                if status != 0 {
+                    eprintln!("Client got status: {}", status);
+                }
+            }
+            Err(e) => eprintln!("Task failed: {:?}", e),
+        }
+    }
+
+    let elapsed = start.elapsed();
+    println!("Completed {} clients in {:?}, {} total events", completed, elapsed, total_events);
+    
+    // If we deadlock, this will timeout (120s is the test timeout)
+    // If fixed, it should complete in reasonable time
+    assert!(elapsed.as_secs() < 60, "Deadlock suspected: took {:?}", elapsed);
+    assert_eq!(completed, 100, "Not all clients completed");
+}
