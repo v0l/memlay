@@ -311,18 +311,33 @@ async fn handle_socket(
                                                 filters: filters.clone(),
                                             });
                                             
-                                            // Send stored matching events
-                                            for filter in &filters {
-                                                let events = subs.query_filter(filter);
-                                                for event in events {
-                                                    let msg = NostrMessage::Event {
-                                                        sub_id: Some(id_clone.clone()),
-                                                        event: event.as_ref().clone(),
-                                                    };
-                                                    let _ = send_tx.try_send(msg.to_json());
-                                                    crate::metrics::inc_events_output();
+                                            // Send stored matching events - run queries on blocking thread to avoid blocking async runtime
+                                            let query_result = tokio::task::spawn_blocking({
+                                                let subs = subs.clone();
+                                                let filters = filters.clone();
+                                                let id_clone = id_clone.clone();
+                                                let send_tx = send_tx.clone();
+                                                
+                                                move || {
+                                                    let mut events_sent = 0;
+                                                    for filter in &filters {
+                                                        let events = subs.query_filter(filter);
+                                                        for event in events {
+                                                            let msg = NostrMessage::Event {
+                                                                sub_id: Some(id_clone.clone()),
+                                                                event: event.as_ref().clone(),
+                                                            };
+                                                            if send_tx.blocking_send(msg.to_json()).is_ok() {
+                                                                events_sent += 1;
+                                                                crate::metrics::inc_events_output();
+                                                            }
+                                                        }
+                                                    }
+                                                    (id_clone, events_sent)
                                                 }
-                                            }
+                                            }).await;
+                                            
+                                            let (id_clone, _events_sent) = query_result.unwrap_or((id_clone, 0));
                                             
                                             let eose = NostrMessage::EndOfStoredEvents { id: id_clone };
                                             let _ = send_tx.send(eose.to_json()).await;
@@ -506,30 +521,44 @@ async fn handle_text(
             conn_subs.insert(id.clone(), filters.clone());
             *subs_opened += 1;
 
-            // Send stored matching events
-            for filter in &filters {
-                let events = subscriptions.query_filter(filter);
-                for event in events {
-                    let msg = NostrMessage::Event {
-                        sub_id: Some(id.clone()),
-                        event: event.as_ref().clone(),
-                    };
-                    if send_tx.try_send(msg.to_json()).is_err() {
-                        *events_dropped += 1;
-                        tracing::warn!(%addr, id, "send channel full, dropping event");
-                    } else {
-                        *events_sent += 1;
+            // Send stored matching events - run queries on blocking thread to avoid blocking async runtime
+            let filters_clone = filters.clone();
+            let id_clone = id.clone();
+            let send_tx_for_query = send_tx.clone();
+            let send_tx_for_eose = send_tx.clone();
+            let subs = subscriptions.clone();
+            
+            let query_result = tokio::task::spawn_blocking(move || {
+                let mut events_sent = 0;
+                let mut events_dropped = 0;
+                for filter in &filters_clone {
+                    let events = subs.query_filter(filter);
+                    for event in events {
+                        let msg = NostrMessage::Event {
+                            sub_id: Some(id_clone.clone()),
+                            event: event.as_ref().clone(),
+                        };
+                        if send_tx_for_query.blocking_send(msg.to_json()).is_err() {
+                            events_dropped += 1;
+                        } else {
+                            events_sent += 1;
+                        }
+                        // Track events output
+                        crate::metrics::inc_events_output();
                     }
-                    // Track events output
-                    crate::metrics::inc_events_output();
                 }
-            }
+                (id_clone, events_sent, events_dropped)
+            }).await;
+            
+            let (id, sent, dropped) = query_result.unwrap_or((id, 0, 0));
+            *events_sent += sent;
+            *events_dropped += dropped;
 
             // Record TTEOSE (Time To End Of Stored Events)
             crate::metrics::observe_tteose(sub_start.elapsed());
 
             let eose = NostrMessage::EndOfStoredEvents { id };
-            let _ = send_tx.send(eose.to_json()).await;
+            let _ = send_tx_for_eose.send(eose.to_json()).await;
         }
 
         Ok(NostrMessage::Close { id }) => {
