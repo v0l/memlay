@@ -677,3 +677,193 @@ async fn test_no_deadlock_under_high_load() {
     assert!(elapsed.as_secs() < 60, "Deadlock suspected: took {:?}", elapsed);
     assert_eq!(completed, 100, "Not all clients completed");
 }
+
+/// Test for deadlock with extreme concurrent REQs - more aggressive than test_no_deadlock_under_high_load
+/// This test sends many concurrent REQs that each fetch large result sets, filling the send channel
+#[tokio::test]
+async fn test_extreme_concurrent_reqs() {
+    let url = spawn_relay().await;
+
+    // Populate with events first
+    println!("\n=== Populating relay with 10k events ===");
+    let keys = Keys::generate();
+    let client = Client::new(keys.clone());
+    client.add_relay(&url).await.unwrap();
+    client.connect().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Send 10,000 events
+    for i in 0..10000 {
+        let builder = EventBuilder::text_note(&format!("Extreme load test event {}", i));
+        let _ = client.send_event_builder(builder).await;
+        if i % 2000 == 0 {
+            println!("  Sent {} events...", i);
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("  Done populating");
+
+    // Now send many concurrent REQs that will try to fetch all events
+    // This is the pattern that causes deadlock when channel fills up
+    println!("\n=== Testing extreme concurrent REQs (50 clients, 5k events each) ===");
+    let start = Instant::now();
+    
+    let mut handles = vec![];
+    for i in 0..50 {
+        let url = url.clone();
+        let handle = tokio::spawn(async move {
+            let keys = Keys::generate();
+            let client = Client::new(keys);
+            client.add_relay(&url).await.unwrap();
+            client.connect().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // Fetch ALL events - this will generate many messages and fill the channel
+            let filter = Filter::new().limit(5000);
+            match tokio::time::timeout(Duration::from_secs(30), client.fetch_events(filter, Duration::from_secs(30))).await {
+                Ok(Ok(events)) => (i, events.len(), 0),
+                Ok(Err(_)) => (i, 0, 1),
+                Err(_) => (i, 0, 2),
+            }
+        });
+        handles.push(handle);
+    }
+
+    let mut completed = 0;
+    let mut total_events = 0;
+    let mut timeouts = 0;
+    for handle in handles {
+        match handle.await {
+            Ok((_, events, status)) => {
+                completed += 1;
+                total_events += events;
+                if status == 2 {
+                    timeouts += 1;
+                }
+            }
+            Err(e) => eprintln!("Task failed: {:?}", e),
+        }
+    }
+
+    let elapsed = start.elapsed();
+    println!("Completed {} clients in {:?}, {} total events, {} timeouts", completed, elapsed, total_events, timeouts);
+    
+    // If we deadlock, this will timeout (120s is the test timeout)
+    // With the fix, it should complete within reasonable time even if some clients timeout
+    assert!(elapsed.as_secs() < 90, "Possible deadlock: took {:?}", elapsed);
+    assert!(completed > 40, "Most clients should complete, got {}", completed);
+}
+
+/// Test for broadcast channel backpressure under high event volume
+/// This reproduces the production issue where many concurrent clients + rapid event publishing
+/// saturates the broadcast channel (8192 capacity), causing dropped events and apparent lockup
+#[tokio::test]
+async fn test_broadcast_backpressure() {
+    let url = spawn_relay().await;
+
+    // Phase 1: Connect many clients with subscriptions
+    println!("\n=== Phase 1: Connecting 50 clients with subscriptions ===");
+    let mut clients = Vec::new();
+    let mut handles = Vec::new();
+    
+    for i in 0..50 {
+        let url = url.clone();
+        let handle = tokio::spawn(async move {
+            let keys = Keys::generate();
+            let client = Client::new(keys);
+            client.add_relay(&url).await.unwrap();
+            client.connect().await;
+            
+            // Subscribe to everything - this makes them all broadcast subscribers
+            let filter = Filter::new().limit(100);
+            client.subscribe(filter, None).await.unwrap();
+            
+            // Give time for subscription to register
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            
+            (i, client)
+        });
+        handles.push(handle);
+    }
+    
+    // Wait for all clients to connect and subscribe
+    for handle in handles {
+        let (id, client) = handle.await.unwrap();
+        clients.push((id, client));
+    }
+    println!("  Connected {} clients with subscriptions", clients.len());
+    
+    // Phase 2: Rapid event publishing to saturate broadcast channel
+    println!("\n=== Phase 2: Publishing 2k events rapidly (backpressure trigger) ===");
+    let start = Instant::now();
+    
+    let pub_keys = Keys::generate();
+    let pub_client = Client::new(pub_keys);
+    pub_client.add_relay(&url).await.unwrap();
+    pub_client.connect().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    
+    let mut sent = 0;
+    let mut dropped = 0;
+    let mut failed = 0;
+    
+    // Publish events as fast as possible
+    for i in 0..2000 {
+        let builder = EventBuilder::text_note(&format!("Backpressure test event {}", i));
+        match pub_client.send_event_builder(builder).await {
+            Ok(_) => {
+                sent += 1;
+                if sent % 500 == 0 {
+                    println!("  Sent {} events...", sent);
+                }
+            }
+            Err(e) => {
+                // Check if it's a timeout (backpressure indicator)
+                if format!("{:?}", e).contains("timeout") {
+                    dropped += 1;
+                } else {
+                    failed += 1;
+                }
+                if dropped % 100 == 0 && dropped > 0 {
+                    println!("  Timeout/dropped: {} (sent: {}, failed: {})", dropped, sent, failed);
+                }
+            }
+        }
+    }
+    
+    let elapsed = start.elapsed();
+    println!("  Published {} events in {:?}", sent, elapsed);
+    println!("  Timeouts/dropped: {}, Failed: {}", dropped, failed);
+    
+    // Phase 3: Check if clients are still responsive
+    println!("\n=== Phase 3: Checking client responsiveness ===");
+    let mut responsive = 0;
+    for (_id, client) in clients.into_iter() {
+        // Try to fetch a small set - if client is deadlocked, this will timeout
+        let filter = Filter::new().limit(10);
+        match tokio::time::timeout(Duration::from_secs(5), client.fetch_events(filter, Duration::from_secs(5))).await {
+            Ok(Ok(_events)) => {
+                responsive += 1;
+                if responsive % 10 == 0 {
+                    println!("  Responsive clients: {}", responsive);
+                }
+            }
+            _ => {
+                // Client is unresponsive (deadlocked or overwhelmed)
+            }
+        }
+    }
+    
+    println!("  Responsive clients: {}/50", responsive);
+    
+    // Assertions
+    let total_elapsed = start.elapsed();
+    println!("\nTotal test duration: {:?}", total_elapsed);
+    
+    // If we have severe backpressure issues, clients should become unresponsive
+    // A healthy system should keep most clients responsive
+    assert!(responsive > 25, "Only {} clients responsive - severe backpressure detected", responsive);
+    
+    // Test should complete in reasonable time (not hang forever)
+    assert!(total_elapsed.as_secs() < 120, "Test took too long: {:?} - possible deadlock", total_elapsed);
+}
