@@ -257,17 +257,17 @@ async fn handle_socket(
 
     // Track consecutive dropped events for slow peer detection
     let mut consecutive_dropped = 0;
-    
+
     // Track event statistics for this connection
     let mut events_sent = 0;
     let mut events_dropped = 0;
-    
+
     // Track subscription statistics for this connection
     let mut subs_opened = 0;
     let mut subs_closed = 0;
-    
+
     // Track spawned REQ task handles for cleanup on disconnect
-    let mut req_task_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = 
+    let mut req_task_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
         std::collections::HashMap::new();
 
     // Spawn sender task - drains from send_rx and sends to socket
@@ -300,28 +300,28 @@ async fn handle_socket(
                                     if let Ok(NostrMessage::Request { id, filters }) = NostrMessage::from_json(text_str) {
                                         // Update conn_subs in main loop immediately so broadcast events are matched
                                         conn_subs.insert(id.clone(), filters.clone());
-                                        
+
                                         let send_tx = send_tx.clone();
                                         let subs = subscriptions.clone();
                                         let filters = filters.clone();
                                         let id_clone = id.clone();
-                                        
+
                                         let handle = tokio::spawn(async move {
                                             let query_start = std::time::Instant::now();
-                                            
+
                                             // Register subscription
                                             subs.add_subscription(crate::subscription::Subscription {
                                                 id: id_clone.clone(),
                                                 filters: filters.clone(),
                                             });
-                                            
+
                                             // Query events directly (no spawn_blocking - queries are fast)
                                             let mut events = Vec::new();
                                             for filter in &filters {
                                                 let filter_query_start = std::time::Instant::now();
                                                 let matched = subs.query_filter(filter);
                                                 let filter_query_duration = filter_query_start.elapsed();
-                                                
+
                                                 tracing::trace!(
                                                     sub_id = %id_clone,
                                                     filter_idx = 0,
@@ -329,7 +329,7 @@ async fn handle_socket(
                                                     query_duration_us = filter_query_duration.as_micros(),
                                                     "query_filter completed"
                                                 );
-                                                
+
                                                 for event in matched {
                                                     events.push(NostrMessage::Event {
                                                         sub_id: Some(id_clone.clone()),
@@ -338,7 +338,7 @@ async fn handle_socket(
                                                     crate::metrics::inc_events_output();
                                                 }
                                             }
-                                            
+
                                             let query_duration = query_start.elapsed();
                                             tracing::trace!(
                                                 sub_id = %id_clone,
@@ -346,7 +346,7 @@ async fn handle_socket(
                                                 query_duration_us = query_duration.as_micros(),
                                                 "REQ query completed"
                                             );
-                                            
+
                                             // Send events from async context
                                             let mut send_count = 0;
                                             let mut send_duration = std::time::Duration::ZERO;
@@ -356,18 +356,18 @@ async fn handle_socket(
                                                 send_duration += send_start.elapsed();
                                                 send_count += 1;
                                             }
-                                            
+
                                             tracing::trace!(
                                                 sub_id = %id_clone,
                                                 send_count = send_count,
                                                 send_duration_us = send_duration.as_micros(),
                                                 "REQ send completed"
                                             );
-                                            
+
                                             let eose = NostrMessage::EndOfStoredEvents { id: id_clone };
                                             let _ = send_tx.send(eose.to_json()).await;
                                         });
-                                        
+
                                         // Track the task handle for cleanup
                                         req_task_handles.insert(id, handle);
                                     }
@@ -407,7 +407,7 @@ async fn handle_socket(
                         // Pre-compute event JSON once
                         let event_json = String::from_utf8_lossy(&event.raw);
                         let mut dropped_for_event = 0;
-                        
+
                         // Check every active subscription on this connection
                         for (sub_id, filters) in &conn_subs {
                             for filter in filters {
@@ -419,7 +419,7 @@ async fn handle_socket(
                                         dropped_for_event += 1;
                                         events_dropped += 1;
                                         consecutive_dropped += 1;
-                                        
+
                                         // Disconnect slow peer
                                         if consecutive_dropped >= SLOW_PEER_MAX_DROPPED {
                                             tracing::warn!(%addr, "disconnecting slow peer after {} dropped events", consecutive_dropped);
@@ -437,7 +437,7 @@ async fn handle_socket(
                                 break;
                             }
                         }
-                        
+
                         if dropped_for_event > 0 {
                             tracing::debug!(%addr, "dropped {} events for this broadcast", dropped_for_event);
                         }
@@ -455,7 +455,7 @@ async fn handle_socket(
                 break; // Sender task failed
             }
         }
-        
+
         // Check for slow peer after each iteration
         if consecutive_dropped >= SLOW_PEER_MAX_DROPPED {
             tracing::warn!(%addr, "disconnecting slow peer ({} dropped events)", consecutive_dropped);
@@ -490,9 +490,9 @@ async fn handle_text(
     subscriptions: &Arc<SubscriptionManager>,
     tx: &broadcast::Sender<Arc<crate::event::Event>>,
     conn_subs: &mut std::collections::HashMap<String, Vec<Filter>>,
-    events_sent: &mut usize,
-    events_dropped: &mut usize,
-    subs_opened: &mut usize,
+    _events_sent: &mut usize,
+    _events_dropped: &mut usize,
+    _subs_opened: &mut usize,
     subs_closed: &mut usize,
 ) {
     match NostrMessage::from_json(text) {
@@ -546,84 +546,47 @@ async fn handle_text(
         }
 
         Ok(NostrMessage::Request { id, filters }) => {
-            // Track subscription start time for TTEOSE metric
-            let sub_start = std::time::Instant::now();
-
-            // Register subscription
-            let sub_register_start = std::time::Instant::now();
-            subscriptions.add_subscription(Subscription {
-                id: id.clone(),
-                filters: filters.clone(),
-            });
+            // Register subscription and update conn_subs immediately
+            // so broadcast events are matched while the query runs.
             conn_subs.insert(id.clone(), filters.clone());
-            *subs_opened += 1;
-            tracing::trace!(
-                sub_id = %id,
-                register_duration_us = sub_register_start.elapsed().as_micros(),
-                "subscription registered"
-            );
 
-            // Send stored matching events - query directly (no spawn_blocking)
+            let send_tx = send_tx.clone();
+            let subs = subscriptions.clone();
             let filters_clone = filters.clone();
             let id_clone = id.clone();
-            let send_tx_for_eose = send_tx.clone();
-            let subs = subscriptions.clone();
-            
-            let query_start = std::time::Instant::now();
-            let mut events = Vec::new();
-            for (idx, filter) in filters_clone.iter().enumerate() {
-                let filter_query_start = std::time::Instant::now();
-                let matched = subs.query_filter(filter);
-                let filter_duration = filter_query_start.elapsed();
-                
-                tracing::trace!(
-                    sub_id = %id,
-                    filter_idx = idx,
-                    matched_events = matched.len(),
-                    query_duration_us = filter_duration.as_micros(),
-                    "filter query completed"
-                );
-                
-                for event in matched {
-                    events.push(NostrMessage::Event {
-                        sub_id: Some(id_clone.clone()),
-                        event: event.as_ref().clone(),
-                    });
-                    crate::metrics::inc_events_output();
-                }
-            }
-            let query_duration = query_start.elapsed();
-            tracing::trace!(
-                sub_id = %id,
-                total_events = events.len(),
-                query_duration_us = query_duration.as_micros(),
-                "REQ query completed"
-            );
-            
-            // Send events asynchronously
-            let send_start = std::time::Instant::now();
-            let mut send_count = 0;
-            for msg in events {
-                if send_tx.send(msg.to_json()).await.is_err() {
-                    *events_dropped += 1;
-                } else {
-                    *events_sent += 1;
-                    send_count += 1;
-                }
-            }
-            let send_duration = send_start.elapsed();
-            tracing::trace!(
-                sub_id = %id,
-                send_count = send_count,
-                send_duration_us = send_duration.as_micros(),
-                "REQ send completed"
-            );
+            let sub_start = std::time::Instant::now();
 
-            // Record TTEOSE (Time To End Of Stored Events)
-            crate::metrics::observe_tteose(sub_start.elapsed());
+            tokio::spawn(async move {
+                // Register subscription
+                subs.add_subscription(Subscription {
+                    id: id_clone.clone(),
+                    filters: filters_clone.clone(),
+                });
 
-            let eose = NostrMessage::EndOfStoredEvents { id: id_clone };
-            let _ = send_tx_for_eose.send(eose.to_json()).await;
+                // Query events
+                let mut events = Vec::new();
+                for filter in &filters_clone {
+                    let matched = subs.query_filter(filter);
+                    for event in matched {
+                        events.push(NostrMessage::Event {
+                            sub_id: Some(id_clone.clone()),
+                            event: event.as_ref().clone(),
+                        });
+                        crate::metrics::inc_events_output();
+                    }
+                }
+
+                // Send events
+                for msg in events {
+                    let _ = send_tx.send(msg.to_json()).await;
+                }
+
+                // Record TTEOSE
+                crate::metrics::observe_tteose(sub_start.elapsed());
+
+                let eose = NostrMessage::EndOfStoredEvents { id: id_clone };
+                let _ = send_tx.send(eose.to_json()).await;
+            });
         }
 
         Ok(NostrMessage::Close { id }) => {

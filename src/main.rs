@@ -2,7 +2,7 @@ use clap::Parser;
 use memlay::{config::Config, relay::Relay};
 use std::fs;
 use std::path::Path;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(version, about = "memlay - in-memory Nostr relay")]
@@ -17,19 +17,19 @@ async fn main() {
     // Initialize file logging
     let log_dir = "/data";
     let log_file = Path::new(log_dir).join("memlay.log");
-    
+
     // Ensure log directory exists
     if let Err(e) = fs::create_dir_all(log_dir) {
         eprintln!("Warning: Failed to create log directory {}: {}", log_dir, e);
     }
-    
+
     // Try to open log file, fallback to stdout only if failed
     let file_result = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open(&log_file);
-    
+
     match file_result {
         Ok(file) => {
             // Set up file logging layer
@@ -39,7 +39,7 @@ async fn main() {
                 .with_line_number(true)
                 .with_thread_ids(true)
                 .with_target(true);
-            
+
             // Set up stdout logging layer
             let stdout_layer = tracing_subscriber::fmt::layer()
                 .with_writer(std::io::stdout)
@@ -47,7 +47,7 @@ async fn main() {
                 .with_line_number(true)
                 .with_thread_ids(true)
                 .with_target(true);
-            
+
             // Combine layers with env filter
             tracing_subscriber::registry()
                 .with(EnvFilter::from_default_env())
@@ -56,7 +56,11 @@ async fn main() {
                 .init();
         }
         Err(e) => {
-            eprintln!("Warning: Failed to open log file {}: {}", log_file.display(), e);
+            eprintln!(
+                "Warning: Failed to open log file {}: {}",
+                log_file.display(),
+                e
+            );
             // Fallback to stdout only
             tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::from_default_env())

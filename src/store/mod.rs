@@ -2,8 +2,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 mod index;
@@ -86,7 +85,9 @@ pub struct EventStore {
     config: StoreConfig,
     state: EvictionState,
     wal: Option<Arc<WriteAheadLog>>,
-    sys: Mutex<sysinfo::System>,
+    /// Cached RSS in bytes, updated by a background task. Avoids expensive
+    /// `refresh_processes()` calls in the hot eviction path.
+    cached_rss_bytes: AtomicU64,
 }
 
 impl StoreConfig {
@@ -165,13 +166,28 @@ impl EventStore {
                 consecutive_evictions: AtomicUsize::new(0),
             },
             wal,
-            sys: Mutex::new(sysinfo::System::new()),
+            cached_rss_bytes: AtomicU64::new(Self::read_rss_bytes()),
         }
     }
 
     /// Start background eviction task (call from relay startup)
     pub fn start_eviction_task(self: &Arc<Self>) {
         let store = self.clone();
+
+        // Start background RSS sampler — reads process memory every 2s
+        // and stores it in cached_rss_bytes. This avoids the expensive
+        // refresh_processes() call in the hot eviction path.
+        {
+            let store = store.clone();
+            tokio::spawn(async move {
+                loop {
+                    let rss = Self::read_rss_bytes();
+                    store.cached_rss_bytes.store(rss, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            });
+        }
+
         tokio::spawn(async move {
             let task_id = std::process::id();
             tracing::trace!(task_id = %task_id, "eviction task started");
@@ -198,7 +214,22 @@ impl EventStore {
         });
     }
 
-    /// Background eviction check with adaptive interval and batch eviction
+    /// Read current process RSS in bytes using sysinfo.
+    /// This is expensive (10-100ms) and should only be called from the
+    /// background RSS sampler, never from the hot path.
+    fn read_rss_bytes() -> u64 {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+        match sysinfo::get_current_pid() {
+            Ok(pid) => sys.process(pid).map(|p| p.memory()).unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// Background eviction check with adaptive interval and batch eviction.
+    /// Uses cached_rss_bytes (updated by background sampler) instead of
+    /// calling refresh_processes() directly, eliminating the Mutex bottleneck.
     fn maybe_evict(&self) {
         let current_mem = self.index.memory_bytes();
         let max_bytes = self.config.max_bytes;
@@ -208,22 +239,8 @@ impl EventStore {
             return;
         }
 
-        // Reuse sysinfo::System instance to avoid expensive process refresh
-        let process_mem = {
-            let mut sys = self.sys.lock().unwrap();
-            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-
-            match sysinfo::get_current_pid() {
-                Ok(pid) => {
-                    if let Some(process) = sys.process(pid) {
-                        process.memory()
-                    } else {
-                        0
-                    }
-                }
-                Err(_) => 0,
-            }
-        };
+        // Use cached RSS from background sampler (lock-free, no refresh_processes)
+        let process_mem = self.cached_rss_bytes.load(Ordering::Relaxed);
 
         // Adaptive interval: evict more frequently when close to limit
         let new_interval = if current_mem >= max_bytes * 70 / 100 || process_mem >= max_bytes as u64
@@ -251,9 +268,18 @@ impl EventStore {
 
             let oldest = self.index.get_oldest(batch_size);
 
-            for event_ref in oldest.iter() {
-                self.index.remove(&event_ref.id);
-                removed += 1;
+            // Evict in small sub-batches, re-checking memory after each
+            // to avoid starving other tasks with a long hold on locks.
+            const EVICT_CHUNK: usize = 100;
+            for chunk in oldest.chunks(EVICT_CHUNK) {
+                for event_ref in chunk {
+                    self.index.remove(&event_ref.id);
+                    removed += 1;
+                }
+                // After each chunk, check if we've freed enough
+                if self.index.memory_bytes() <= target && process_mem <= max_bytes as u64 {
+                    break;
+                }
             }
 
             if removed > 0 {

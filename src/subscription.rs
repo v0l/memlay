@@ -350,7 +350,7 @@ impl SubscriptionManager {
         let mut subs = self.subscriptions.write();
         let lock_duration = start.elapsed();
         tracing::trace!(sub_id = %sub_id, lock_duration_us = %lock_duration.as_micros(), "subscriptions write lock acquired");
-        
+
         // Pre-parse e-tag and p-tag values once at subscription time
         let parse_start = std::time::Instant::now();
         for filter in &mut sub.filters {
@@ -358,7 +358,7 @@ impl SubscriptionManager {
         }
         let parse_duration = parse_start.elapsed();
         tracing::trace!(sub_id = %sub_id, parse_duration_us = %parse_duration.as_micros(), "parsed filter hex values");
-        
+
         let insert_start = std::time::Instant::now();
         subs.insert(sub_id.clone(), sub);
         let insert_duration = insert_start.elapsed();
@@ -371,7 +371,7 @@ impl SubscriptionManager {
         let mut subs = self.subscriptions.write();
         let lock_duration = start.elapsed();
         tracing::trace!(sub_id = %id, lock_duration_us = %lock_duration.as_micros(), "subscriptions write lock acquired for removal");
-        
+
         let remove_start = std::time::Instant::now();
         let removed = subs.remove(id);
         let remove_duration = remove_start.elapsed();
@@ -384,10 +384,10 @@ impl SubscriptionManager {
         let subs = self.subscriptions.read();
         let lock_duration = start.elapsed();
         tracing::trace!(lock_duration_us = %lock_duration.as_micros(), subs_count = %subs.len(), "subscriptions read lock acquired for query_subscriptions");
-        
+
         let mut all_events = Vec::new();
         let mut total_filters = 0;
-        
+
         for sub in subs.values() {
             for filter in &sub.filters {
                 total_filters += 1;
@@ -395,7 +395,7 @@ impl SubscriptionManager {
                 all_events.extend(events);
             }
         }
-        
+
         tracing::trace!(subs_count = %subs.len(), filters_processed = %total_filters, events_returned = %all_events.len(), "query_subscriptions completed");
 
         all_events
@@ -404,7 +404,7 @@ impl SubscriptionManager {
     pub fn query_filter(&self, filter: &Filter) -> Vec<Arc<Event>> {
         let query_start = std::time::Instant::now();
         tracing::trace!("acquiring query_filter lock");
-        
+
         if filter.kinds.is_none()
             && filter.authors.is_none()
             && filter.tag_filters.is_empty()
@@ -433,7 +433,7 @@ impl SubscriptionManager {
                 return upgraded;
             }
         }
-        
+
         let cache_check_duration = cache_check_start.elapsed();
         tracing::trace!(cache_hit = false, cache_check_duration_us = %cache_check_duration.as_micros(), "query_filter cache miss, calling query_filter_internal");
 

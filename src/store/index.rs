@@ -6,6 +6,11 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+/// Number of shards for the by_oldest eviction index.
+/// Each shard has its own RwLock, so inserts/removes to different shards
+/// never contend. Events are assigned to shards by hashing the event ID.
+const OLDEST_SHARDS: usize = 64;
+
 /// Tag letter used as key in `by_tag_other`.
 type TagLetter = char;
 
@@ -110,8 +115,11 @@ pub struct EventIndex {
     // Inner key: raw tag value string
     by_tag_other: DashMap<TagLetter, DashMap<String, RwLock<BTreeSet<EventRef>>>>,
 
-    // Oldest-first index for memory-based eviction
-    by_oldest: RwLock<BTreeSet<EventRef>>,
+    // Sharded oldest-first index for memory-based eviction.
+    // Uses OLDEST_SHARDS independent locks so inserts/removes to different
+    // shards never contend — eliminates the single-lock bottleneck that
+    // caused lockup under high insert + eviction load.
+    by_oldest: [RwLock<BTreeSet<EventRef>>; OLDEST_SHARDS],
 
     // Replaceable events index: maps (pubkey, kind) or (pubkey, kind, d-tag) to latest event id
     by_replaceable: DashMap<ReplacementKey, [u8; 32]>,
@@ -132,11 +140,22 @@ impl EventIndex {
             by_tag_e: DashMap::new(),
             by_tag_p: DashMap::new(),
             by_tag_other: DashMap::new(),
-            by_oldest: RwLock::new(BTreeSet::new()),
+            by_oldest: std::array::from_fn(|_| RwLock::new(BTreeSet::new())),
             by_replaceable: DashMap::new(),
             memory_bytes: AtomicUsize::new(0),
             event_count: AtomicUsize::new(0),
         }
+    }
+
+    /// Pick the by_oldest shard for a given event ID.
+    /// Uses a simple hash of the first 8 bytes modulo shard count.
+    #[inline]
+    fn oldest_shard(&self, id: &[u8; 32]) -> usize {
+        let mut hash: usize = 0;
+        for i in 0..8 {
+            hash = hash.wrapping_mul(31).wrapping_add(id[i] as usize);
+        }
+        hash % OLDEST_SHARDS
     }
 
     /// Insert an event into all indexes
@@ -181,12 +200,13 @@ impl EventIndex {
         {
             let pubkey_hash = TagIdHash::from_id(&event.pubkey);
             let start = std::time::Instant::now();
-            let set_lock = self.by_pubkey
+            let set_lock = self
+                .by_pubkey
                 .entry(pubkey_hash)
                 .or_insert_with(|| RwLock::new(BTreeSet::new()));
             let entry_duration = start.elapsed();
             tracing::trace!(event_id = %hex::encode(event.id), index = "pubkey", entry_duration_us = %entry_duration.as_micros(), "acquired pubkey index entry");
-            
+
             let write_start = std::time::Instant::now();
             set_lock.write().insert(EventRef::new(event.clone()));
             let write_duration = write_start.elapsed();
@@ -196,12 +216,13 @@ impl EventIndex {
         // Kind index
         {
             let start = std::time::Instant::now();
-            let set_lock = self.by_kind
+            let set_lock = self
+                .by_kind
                 .entry(event.kind)
                 .or_insert_with(|| RwLock::new(BTreeSet::new()));
             let entry_duration = start.elapsed();
             tracing::trace!(event_id = %hex::encode(event.id), index = "kind", kind = event.kind, entry_duration_us = %entry_duration.as_micros(), "acquired kind index entry");
-            
+
             let write_start = std::time::Instant::now();
             set_lock.write().insert(EventRef::new(event.clone()));
             let write_duration = write_start.elapsed();
@@ -213,12 +234,13 @@ impl EventIndex {
             for e_tag in event.e_tags() {
                 let e_tag_hash = TagIdHash::from_id(&e_tag);
                 let start = std::time::Instant::now();
-                let set_lock = self.by_tag_e
+                let set_lock = self
+                    .by_tag_e
                     .entry(e_tag_hash)
                     .or_insert_with(|| RwLock::new(BTreeSet::new()));
                 let entry_duration = start.elapsed();
                 tracing::trace!(event_id = %hex::encode(event.id), index = "e-tag", e_tag = %hex::encode(e_tag), entry_duration_us = %entry_duration.as_micros(), "acquired e-tag index entry");
-                
+
                 let write_start = std::time::Instant::now();
                 set_lock.write().insert(EventRef::new(event.clone()));
                 let write_duration = write_start.elapsed();
@@ -231,12 +253,13 @@ impl EventIndex {
             for p_tag in event.p_tags() {
                 let p_tag_hash = TagIdHash::from_id(&p_tag);
                 let start = std::time::Instant::now();
-                let set_lock = self.by_tag_p
+                let set_lock = self
+                    .by_tag_p
                     .entry(p_tag_hash)
                     .or_insert_with(|| RwLock::new(BTreeSet::new()));
                 let entry_duration = start.elapsed();
                 tracing::trace!(event_id = %hex::encode(event.id), index = "p-tag", p_tag = %hex::encode(p_tag), entry_duration_us = %entry_duration.as_micros(), "acquired p-tag index entry");
-                
+
                 let write_start = std::time::Instant::now();
                 set_lock.write().insert(EventRef::new(event.clone()));
                 let write_duration = write_start.elapsed();
@@ -257,14 +280,14 @@ impl EventIndex {
                     let inner_map = self.by_tag_other.entry(letter).or_insert_with(DashMap::new);
                     let inner_entry_duration = start.elapsed();
                     tracing::trace!(event_id = %hex::encode(event.id), index = "generic-tag", letter = %letter, value = %value, inner_entry_duration_us = %inner_entry_duration.as_micros(), "acquired generic tag inner map entry");
-                    
+
                     let start = std::time::Instant::now();
                     let set_lock = inner_map
                         .entry(value.to_string())
                         .or_insert_with(|| RwLock::new(BTreeSet::new()));
                     let entry_duration = start.elapsed();
                     tracing::trace!(event_id = %hex::encode(event.id), index = "generic-tag", letter = %letter, value = %value, entry_duration_us = %entry_duration.as_micros(), "acquired generic tag entry");
-                    
+
                     let write_start = std::time::Instant::now();
                     set_lock.write().insert(EventRef::new(event.clone()));
                     let write_duration = write_start.elapsed();
@@ -275,15 +298,16 @@ impl EventIndex {
 
         // Oldest-first index for eviction (newest first in EventRef ordering)
         {
+            let shard = self.oldest_shard(&event.id);
             let start = std::time::Instant::now();
-            let mut by_oldest = self.by_oldest.write();
+            let mut by_oldest = self.by_oldest[shard].write();
             let lock_duration = start.elapsed();
-            tracing::trace!(event_id = %hex::encode(event.id), index = "by_oldest", lock_duration_us = %lock_duration.as_micros(), "acquired by_oldest write lock");
-            
+            tracing::trace!(event_id = %hex::encode(event.id), index = "by_oldest", shard = shard, lock_duration_us = %lock_duration.as_micros(), "acquired by_oldest shard write lock");
+
             let insert_start = std::time::Instant::now();
             by_oldest.insert(EventRef::new(event.clone()));
             let insert_duration = insert_start.elapsed();
-            tracing::trace!(event_id = %hex::encode(event.id), index = "by_oldest", insert_duration_us = %insert_duration.as_micros(), "by_oldest insert completed");
+            tracing::trace!(event_id = %hex::encode(event.id), index = "by_oldest", shard = shard, insert_duration_us = %insert_duration.as_micros(), "by_oldest shard insert completed");
         }
 
         // Final consistency check: verify the event is still in by_id.
@@ -404,15 +428,16 @@ impl EventIndex {
         }
 
         {
+            let shard = self.oldest_shard(&event.id);
             let start = std::time::Instant::now();
-            let mut by_oldest = self.by_oldest.write();
+            let mut by_oldest = self.by_oldest[shard].write();
             let lock_duration = start.elapsed();
-            tracing::trace!(event_id = %event_id, index = "by_oldest", cleanup = true, lock_duration_us = %lock_duration.as_micros(), "acquired by_oldest write lock for cleanup");
-            
+            tracing::trace!(event_id = %event_id, index = "by_oldest", shard = shard, cleanup = true, lock_duration_us = %lock_duration.as_micros(), "acquired by_oldest shard write lock for cleanup");
+
             let remove_start = std::time::Instant::now();
             by_oldest.remove(&er);
             let remove_duration = remove_start.elapsed();
-            tracing::trace!(event_id = %event_id, index = "by_oldest", cleanup = true, remove_duration_us = %remove_duration.as_micros(), "by_oldest cleanup completed");
+            tracing::trace!(event_id = %event_id, index = "by_oldest", shard = shard, cleanup = true, remove_duration_us = %remove_duration.as_micros(), "by_oldest shard cleanup completed");
         }
     }
 
@@ -514,32 +539,58 @@ impl EventIndex {
         }
 
         {
+            let shard = self.oldest_shard(&event.id);
             let start = std::time::Instant::now();
-            let mut by_oldest = self.by_oldest.write();
+            let mut by_oldest = self.by_oldest[shard].write();
             let lock_duration = start.elapsed();
-            tracing::trace!(event_id = %event_id, index = "by_oldest", cleanup = true, lock_duration_us = %lock_duration.as_micros(), "acquired by_oldest write lock for removal");
-            
+            tracing::trace!(event_id = %event_id, index = "by_oldest", shard = shard, cleanup = true, lock_duration_us = %lock_duration.as_micros(), "acquired by_oldest shard write lock for removal");
+
             let remove_start = std::time::Instant::now();
             by_oldest.remove(&er);
             let remove_duration = remove_start.elapsed();
-            tracing::trace!(event_id = %event_id, index = "by_oldest", cleanup = true, remove_duration_us = %remove_duration.as_micros(), "by_oldest removal completed");
+            tracing::trace!(event_id = %event_id, index = "by_oldest", shard = shard, cleanup = true, remove_duration_us = %remove_duration.as_micros(), "by_oldest shard removal completed");
         }
 
         Some(event)
     }
 
-    /// Get the oldest events for eviction (returns oldest first)
+    /// Get the oldest events for eviction (returns oldest first).
+    /// Scans all shards, merges results, and returns the N oldest.
     pub fn get_oldest(&self, count: usize) -> Vec<EventRef> {
-        // BTreeSet is sorted newest-first (EventRef ordering), so iterate from end
         let start = std::time::Instant::now();
-        tracing::trace!("acquiring by_oldest read lock for get_oldest");
-        let by_oldest = self.by_oldest.read();
-        let lock_duration = start.elapsed();
-        tracing::trace!(count = %count, total_events = %by_oldest.len(), lock_duration_us = %lock_duration.as_micros(), "by_oldest read lock acquired for get_oldest");
-        
-        let oldest: Vec<EventRef> = by_oldest.iter().rev().take(count).cloned().collect();
-        let iter_duration = start.elapsed();
-        tracing::trace!(requested = %count, returned = %oldest.len(), total_duration_us = %iter_duration.as_micros(), "get_oldest completed");
+
+        // Use a min-heap (via reverse ordering) to merge N oldest from all shards.
+        // EventRef sorts newest-first, so its Reverse sorts oldest-first.
+        use std::cmp::Reverse;
+        let mut heap: std::collections::BinaryHeap<Reverse<EventRef>> =
+            std::collections::BinaryHeap::with_capacity(count);
+
+        for shard in &self.by_oldest {
+            let set = shard.read();
+            // BTreeSet is sorted newest-first, so iterate from end (oldest)
+            for er in set.iter().rev() {
+                if heap.len() < count {
+                    heap.push(Reverse(er.clone()));
+                } else if er.created_at < heap.peek().unwrap().0.created_at {
+                    heap.pop();
+                    heap.push(Reverse(er.clone()));
+                } else {
+                    // This shard is sorted oldest→newest from .rev(), so once
+                    // we see a newer event than our heap max, we can stop.
+                    break;
+                }
+            }
+        }
+
+        // Extract from heap, sorted oldest-first
+        let mut oldest: Vec<EventRef> = Vec::with_capacity(heap.len());
+        while let Some(Reverse(er)) = heap.pop() {
+            oldest.push(er);
+        }
+        oldest.reverse(); // oldest first
+
+        let duration = start.elapsed();
+        tracing::trace!(requested = %count, returned = %oldest.len(), duration_us = %duration.as_micros(), "get_oldest completed");
 
         oldest
     }
