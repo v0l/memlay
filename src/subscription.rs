@@ -445,8 +445,14 @@ impl SubscriptionManager {
         if !results.is_empty() {
             // Evict oldest cache entry if at capacity instead of clearing all
             if self.cache.len() >= self.cache_max_entries {
-                // Remove one random entry to make room (DashMap doesn't have LRU built-in)
-                if let Some(random_key) = self.cache.iter().next().map(|r| r.key().clone()) {
+                // Remove one entry to make room (DashMap doesn't have LRU built-in).
+                // IMPORTANT: the `iter()` temporary holds a read lock on a shard for
+                // as long as it is alive. We must drop the iterator (by finishing this
+                // statement) BEFORE calling `remove()`, otherwise `remove()` would try
+                // to acquire a write lock on the same shard the iterator is still
+                // reading — a guaranteed self-deadlock.
+                let random_key = self.cache.iter().next().map(|r| r.key().clone());
+                if let Some(random_key) = random_key {
                     self.cache.remove(&random_key);
                     tracing::trace!("evicted oldest cache entry to make room");
                 }

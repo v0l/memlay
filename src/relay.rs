@@ -390,7 +390,10 @@ async fn handle_socket(
                         let notice = NostrMessage::Notification {
                             message: "binary messages are not supported".to_string(),
                         };
-                        let _ = send_tx.send(notice.to_json()).await;
+                        // Non-blocking: never await inside the select loop, or a stuck
+                        // client whose send channel is full would freeze the whole
+                        // connection (no broadcast draining, no disconnect detection).
+                        let _ = send_tx.try_send(notice.to_json());
                     }
                     axum::extract::ws::Message::Ping(_) => {
                         // axum automatically responds to pings
@@ -542,7 +545,9 @@ async fn handle_text(
                     }
                 }
             };
-            let _ = send_tx.send(ok.to_json()).await;
+            // Non-blocking: handle_text runs in the connection's select loop, so an
+            // awaited send on a full channel (stuck client) would freeze the loop.
+            let _ = send_tx.try_send(ok.to_json());
         }
 
         Ok(NostrMessage::Request { id, filters }) => {
@@ -597,7 +602,8 @@ async fn handle_text(
 
         Err(e) => {
             let notice = NostrMessage::Notification { message: e };
-            let _ = send_tx.send(notice.to_json()).await;
+            // Non-blocking: see note above — never block the select loop.
+            let _ = send_tx.try_send(notice.to_json());
         }
 
         _ => {} // client-side messages (OK, EOSE, NOTICE) — ignore
