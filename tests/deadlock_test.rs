@@ -181,9 +181,13 @@ async fn test_concurrent_replaceable_events() {
             .expect("Task failed");
     }
 
-    // Verify only one event per pubkey
+    // Verify only one event per pubkey.
+    // make_event encodes the pubkey as a big-endian hex number, so the
+    // resulting 32-byte pubkey is [0; 31] followed by `pubkey_byte`.
     for pubkey_byte in 0..5 {
-        let events = store.query_by_pubkey(&[pubkey_byte; 32], 100);
+        let mut pk = [0u8; 32];
+        pk[31] = pubkey_byte;
+        let events = store.query_by_pubkey(&pk, 100);
         assert_eq!(
             events.len(),
             1,

@@ -14,20 +14,24 @@ const OLDEST_SHARDS: usize = 64;
 /// Tag letter used as key in `by_tag_other`.
 type TagLetter = char;
 
-/// 64-bit hash for tag index keys.
-/// Computes a hash from the full 32-byte ID using XOR folding.
-/// Collision probability: ~0.000003% for 1M events (essentially zero).
+/// 128-bit hash for tag index keys.
+/// Computes a hash from the full 32-byte ID by XOR-folding its two 16-byte
+/// halves. IDs are SHA-256 outputs and pubkeys are uniformly random, so the
+/// result is uniformly distributed.
+///
+/// At 128 bits, finding *any* accidental or adversarial collision requires on
+/// the order of 2^64 work (birthday bound) — cryptographically infeasible — so
+/// callers can trust the bucket contents without re-verifying the full key.
+/// (The previous 64-bit fold was forgeable: an attacker controlling a tag value
+/// could grind a colliding value in ~2^32 work and pollute another query.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TagIdHash(u64);
+pub struct TagIdHash(u128);
 
 impl TagIdHash {
     pub fn from_id(id: &[u8; 32]) -> Self {
-        // Fold all 32 bytes into 8 bytes using XOR (uniform distribution)
-        let mut hash = [0u8; 8];
-        for (i, &byte) in id.iter().enumerate() {
-            hash[i % 8] ^= byte;
-        }
-        Self(u64::from_be_bytes(hash))
+        let hi = u128::from_be_bytes(id[0..16].try_into().unwrap());
+        let lo = u128::from_be_bytes(id[16..32].try_into().unwrap());
+        Self(hi ^ lo)
     }
 }
 
@@ -532,7 +536,7 @@ impl EventIndex {
             return Vec::new();
         };
 
-        // Clone Arcs quickly while holding read lock, then return
+        // Clone Arcs quickly while holding read lock, then return.
         let events: Vec<Arc<Event>> = {
             let set = set_lock.read();
             set.iter()

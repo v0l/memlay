@@ -3,6 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::event::Event;
 
@@ -27,6 +28,10 @@ pub struct WriteAheadLog {
     path: String,
     write_file: std::sync::Mutex<BufWriter<File>>,
     read_path: String,
+    /// Set when buffered writes have not yet been fsync'd. The background
+    /// group-commit task clears it after a successful sync. This lets the hot
+    /// append path skip the per-op fsync entirely.
+    dirty: AtomicBool,
 }
 
 impl WriteAheadLog {
@@ -51,6 +56,7 @@ impl WriteAheadLog {
             path: wal_path_str.clone(),
             write_file: std::sync::Mutex::new(BufWriter::new(write_file)),
             read_path: wal_path_str,
+            dirty: AtomicBool::new(false),
         })
     }
 
@@ -78,11 +84,32 @@ impl WriteAheadLog {
             }
         }
 
-        // Flush and sync to disk to ensure durability
+        // Group commit: flush the BufWriter to the OS (cheap write syscall) so
+        // the record is visible to readers and survives a process crash, but do
+        // NOT fsync on every append. A background task calls `group_commit()` on
+        // a short interval to make recent writes durable against power loss.
+        // This removes the expensive per-event fsync that previously serialized
+        // and stalled the ingest path.
         file.flush()?;
-        file.get_ref().sync_data()?;
+        drop(file);
+        self.dirty.store(true, Ordering::Relaxed);
 
         Ok(())
+    }
+
+    /// Durability checkpoint for group commit. If there are unsynced writes,
+    /// flush the BufWriter to the file and fsync. Cheap no-op when clean.
+    /// Returns true if a sync was performed.
+    pub fn group_commit(&self) -> anyhow::Result<bool> {
+        // Clear the flag first; any append racing in after this point will set
+        // it again and be picked up by the next tick.
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(false);
+        }
+        let mut file = self.write_file.lock().unwrap();
+        file.flush()?;
+        file.get_ref().sync_data()?;
+        Ok(true)
     }
 
     /// Append an insert operation
@@ -173,6 +200,7 @@ impl WriteAheadLog {
         let mut file = self.write_file.lock().unwrap();
         file.flush()?;
         file.get_ref().sync_data()?;
+        self.dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
 

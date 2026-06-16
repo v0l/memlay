@@ -3,6 +3,10 @@ name = "memlay"
 version = "0.2.0"
 edition = "2024"
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [features]
 unchecked = []
 wal = ["unchecked"]

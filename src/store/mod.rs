@@ -170,6 +170,28 @@ impl EventStore {
         }
     }
 
+    /// Start background WAL group-commit task (call from relay startup).
+    /// Periodically fsyncs buffered WAL writes so the hot append path can skip
+    /// the per-event fsync. Bounds the durability window to `interval_ms`.
+    pub fn start_wal_sync_task(self: &Arc<Self>) {
+        let Some(wal) = self.wal.clone() else {
+            return;
+        };
+        const WAL_SYNC_INTERVAL_MS: u64 = 200;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(WAL_SYNC_INTERVAL_MS)).await;
+                let wal = wal.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = wal.group_commit() {
+                        tracing::error!(error = %e, "WAL group commit failed");
+                    }
+                })
+                .await;
+            }
+        });
+    }
+
     /// Start background eviction task (call from relay startup)
     pub fn start_eviction_task(self: &Arc<Self>) {
         let store = self.clone();

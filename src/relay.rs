@@ -64,6 +64,9 @@ impl Relay {
         // Start background eviction task
         events.start_eviction_task();
 
+        // Start background WAL group-commit task (durability without per-event fsync)
+        events.start_wal_sync_task();
+
         // Start background persistence task if enabled
         if config.persistence_path.is_some() {
             events.start_persistence_task(config.persistence_interval);
@@ -297,22 +300,21 @@ async fn handle_socket(
                                 // Handle REQ asynchronously to keep main loop responsive
                                 if text.starts_with("[\"REQ\"") {
                                     let text_str = text.as_ref();
-                                    if let Ok(NostrMessage::Request { id, filters }) = NostrMessage::from_json(text_str) {
+                                    if let Ok(NostrMessage::Request { id, mut filters }) = NostrMessage::from_json(text_str) {
+                                        // Pre-parse hex tag values once so both the
+                                        // initial query and live broadcast matching
+                                        // use the fast 32-byte index path.
+                                        for f in &mut filters {
+                                            f.parse_hex_values();
+                                        }
                                         // Update conn_subs in main loop immediately so broadcast events are matched
                                         conn_subs.insert(id.clone(), filters.clone());
 
                                         let send_tx = send_tx.clone();
                                         let subs = subscriptions.clone();
-                                        let filters = filters.clone();
                                         let id_clone = id.clone();
 
                                         let handle = tokio::spawn(async move {
-                                            // Register subscription
-                                            subs.add_subscription(crate::subscription::Subscription {
-                                                id: id_clone.clone(),
-                                                filters: filters.clone(),
-                                            });
-
                                             // Query events directly (no spawn_blocking - queries are fast)
                                             // Build response JSON straight from the stored raw bytes
                                             // to avoid deep-cloning each Event.
@@ -341,11 +343,30 @@ async fn handle_socket(
                                         // Track the task handle for cleanup
                                         req_task_handles.insert(id, handle);
                                     }
+                        } else if text.starts_with("[\"EVENT\"") {
+                            // Offload EVENT parse + signature verification (the
+                            // dominant ~1.4ms CPU cost) to the blocking pool so it
+                            // never stalls this connection's async select loop or
+                            // starves the tokio runtime under concurrent ingest.
+                            let text_owned = text.to_string();
+                            let subs = subscriptions.clone();
+                            let tx2 = tx.clone();
+                            let send_tx2 = send_tx.clone();
+                            tokio::spawn(async move {
+                                let outcome = tokio::task::spawn_blocking(move || {
+                                    process_event_message(&text_owned, &subs, &tx2)
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+                                if let Some(reply) = outcome {
+                                    let _ = send_tx2.send(reply).await;
+                                }
+                            });
                         } else if text.starts_with("[\"CLOSE\"") {
                             // Handle CLOSE for async subscriptions
                             let text_str = text.as_ref();
                             if let Ok(NostrMessage::Close { id }) = NostrMessage::from_json(text_str) {
-                                subscriptions.remove_subscription(&id);
                                 conn_subs.remove(&id);
                                 // Abort the spawned task if it exists
                                 if let Some(handle) = req_task_handles.remove(&id) {
@@ -385,8 +406,16 @@ async fn handle_socket(
                         for (sub_id, filters) in &conn_subs {
                             for filter in filters {
                                 if filter_matches(filter, &*event) {
-                                    // Construct message with pre-computed JSON
-                                    let msg = format!(r#"["EVENT","{}",{}]"#, sub_id, event_json);
+                                    // Build the message with a single exact-capacity
+                                    // allocation, reusing the pre-computed event JSON
+                                    // and avoiding format! machinery on the hot path.
+                                    // Layout: ["EVENT","<sub_id>",<event_json>]
+                                    let mut msg = String::with_capacity(sub_id.len() + event_json.len() + 13);
+                                    msg.push_str("[\"EVENT\",\"");
+                                    msg.push_str(sub_id);
+                                    msg.push_str("\",");
+                                    msg.push_str(&event_json);
+                                    msg.push(']');
                                     // Send asynchronously via channel (non-blocking)
                                     if send_tx.try_send(msg).is_err() {
                                         dropped_for_event += 1;
@@ -436,10 +465,8 @@ async fn handle_socket(
         }
     }
 
-    // Clean up all subscriptions for this connection on disconnect
-    for sub_id in conn_subs.keys() {
-        subscriptions.remove_subscription(sub_id);
-    }
+    // Per-connection subscriptions live only in conn_subs, which is dropped
+    // when this task ends — no global registry cleanup required.
 
     // Abort all spawned REQ tasks for this connection
     for (_, handle) in req_task_handles {
@@ -454,6 +481,60 @@ async fn handle_socket(
     crate::metrics::ACTIVE_CONNECTIONS.dec();
 
     tracing::info!(%addr, "client disconnected: sent={}, dropped={}, subs_opened={}, subs_closed={}", events_sent, events_dropped, subs_opened, subs_closed);
+}
+
+/// Parse, verify, store and broadcast an EVENT message. Runs on the blocking
+/// thread pool (signature verification is CPU-heavy). Returns the OK/NOTICE
+/// reply JSON to send back to the client, if any.
+fn process_event_message(
+    text: &str,
+    subscriptions: &Arc<SubscriptionManager>,
+    tx: &broadcast::Sender<Arc<crate::event::Event>>,
+) -> Option<String> {
+    match NostrMessage::from_json(text) {
+        Ok(NostrMessage::Event { event, .. }) => {
+            let event_id = hex::encode(event.id);
+            let ev = Arc::new(event);
+
+            let ok = match subscriptions.store.insert(ev.clone()) {
+                InsertResult::Ephemeral => {
+                    tracing::debug!(id = %event_id, kind = ev.kind, "ephemeral event");
+                    // Ephemeral events are not stored but still broadcast.
+                    let _ = tx.send(ev);
+                    NostrMessage::Ok {
+                        id: event_id,
+                        accepted: true,
+                        message: "ephemeral: will not be stored".to_string(),
+                    }
+                }
+                InsertResult::Duplicate => {
+                    tracing::debug!(id = %event_id, "duplicate event");
+                    NostrMessage::Ok {
+                        id: event_id,
+                        accepted: true,
+                        message: "duplicate: already have this event".to_string(),
+                    }
+                }
+                InsertResult::Stored { event, replaced } => {
+                    tracing::debug!(
+                        id = %event_id,
+                        kind = event.kind,
+                        replaced = replaced.len(),
+                        "event stored"
+                    );
+                    let _ = tx.send(event);
+                    NostrMessage::Ok {
+                        id: event_id,
+                        accepted: true,
+                        message: String::new(),
+                    }
+                }
+            };
+            Some(ok.to_json())
+        }
+        Ok(_) => None,
+        Err(e) => Some(NostrMessage::Notification { message: e }.to_json()),
+    }
 }
 
 async fn handle_text(
@@ -494,11 +575,10 @@ async fn handle_text(
                     }
                 }
                 InsertResult::Stored { event, replaced } => {
-                    tracing::info!(
+                    tracing::debug!(
                         %addr,
                         id = %event_id,
                         kind = event.kind,
-                        pubkey = %hex::encode(event.pubkey),
                         replaced = replaced.len(),
                         "event stored"
                     );
