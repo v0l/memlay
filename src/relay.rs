@@ -163,7 +163,7 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         "events": events.len(),
         "store_bytes": store_memory,
         "max_bytes": cfg.max_bytes,
-        "process_memory": crate::store::get_process_memory(),
+        "process_memory": events.cached_process_memory(),
         "memory_limit": cfg.max_bytes,
         "memory_used": store_memory,
     });
@@ -307,8 +307,6 @@ async fn handle_socket(
                                         let id_clone = id.clone();
 
                                         let handle = tokio::spawn(async move {
-                                            let query_start = std::time::Instant::now();
-
                                             // Register subscription
                                             subs.add_subscription(crate::subscription::Subscription {
                                                 id: id_clone.clone(),
@@ -316,53 +314,25 @@ async fn handle_socket(
                                             });
 
                                             // Query events directly (no spawn_blocking - queries are fast)
-                                            let mut events = Vec::new();
+                                            // Build response JSON straight from the stored raw bytes
+                                            // to avoid deep-cloning each Event.
+                                            let mut events: Vec<String> = Vec::new();
                                             for filter in &filters {
-                                                let filter_query_start = std::time::Instant::now();
                                                 let matched = subs.query_filter(filter);
-                                                let filter_query_duration = filter_query_start.elapsed();
-
-                                                tracing::trace!(
-                                                    sub_id = %id_clone,
-                                                    filter_idx = 0,
-                                                    matched_events = matched.len(),
-                                                    query_duration_us = filter_query_duration.as_micros(),
-                                                    "query_filter completed"
-                                                );
-
                                                 for event in matched {
-                                                    events.push(NostrMessage::Event {
-                                                        sub_id: Some(id_clone.clone()),
-                                                        event: event.as_ref().clone(),
-                                                    });
+                                                    events.push(format!(
+                                                        r#"["EVENT","{}",{}]"#,
+                                                        id_clone,
+                                                        String::from_utf8_lossy(&event.raw)
+                                                    ));
                                                     crate::metrics::inc_events_output();
                                                 }
                                             }
 
-                                            let query_duration = query_start.elapsed();
-                                            tracing::trace!(
-                                                sub_id = %id_clone,
-                                                total_events = events.len(),
-                                                query_duration_us = query_duration.as_micros(),
-                                                "REQ query completed"
-                                            );
-
                                             // Send events from async context
-                                            let mut send_count = 0;
-                                            let mut send_duration = std::time::Duration::ZERO;
                                             for msg in events {
-                                                let send_start = std::time::Instant::now();
-                                                let _ = send_tx.send(msg.to_json()).await;
-                                                send_duration += send_start.elapsed();
-                                                send_count += 1;
+                                                let _ = send_tx.send(msg).await;
                                             }
-
-                                            tracing::trace!(
-                                                sub_id = %id_clone,
-                                                send_count = send_count,
-                                                send_duration_us = send_duration.as_micros(),
-                                                "REQ send completed"
-                                            );
 
                                             let eose = NostrMessage::EndOfStoredEvents { id: id_clone };
                                             let _ = send_tx.send(eose.to_json()).await;
@@ -507,7 +477,6 @@ async fn handle_text(
                 InsertResult::Ephemeral => {
                     tracing::debug!(%addr, id = %event_id, kind = ev.kind, "ephemeral event");
                     // Ephemeral events are not stored but still broadcast to active subscribers
-                    subscriptions.invalidate_cache();
                     // Use try_send to prevent blocking when broadcast channel is full
                     let _ = tx.send(ev);
                     NostrMessage::Ok {
@@ -533,8 +502,6 @@ async fn handle_text(
                         replaced = replaced.len(),
                         "event stored"
                     );
-                    // Invalidate query cache on new event insertion
-                    subscriptions.invalidate_cache();
                     // Broadcast to live subscriptions on other connections
                     // Use try_send to prevent blocking when broadcast channel is full
                     let _ = tx.send(event);
@@ -568,22 +535,24 @@ async fn handle_text(
                     filters: filters_clone.clone(),
                 });
 
-                // Query events
-                let mut events = Vec::new();
+                // Query events. Build response JSON directly from stored raw bytes
+                // to avoid deep-cloning each Event.
+                let mut events: Vec<String> = Vec::new();
                 for filter in &filters_clone {
                     let matched = subs.query_filter(filter);
                     for event in matched {
-                        events.push(NostrMessage::Event {
-                            sub_id: Some(id_clone.clone()),
-                            event: event.as_ref().clone(),
-                        });
+                        events.push(format!(
+                            r#"["EVENT","{}",{}]"#,
+                            id_clone,
+                            String::from_utf8_lossy(&event.raw)
+                        ));
                         crate::metrics::inc_events_output();
                     }
                 }
 
                 // Send events
                 for msg in events {
-                    let _ = send_tx.send(msg.to_json()).await;
+                    let _ = send_tx.send(msg).await;
                 }
 
                 // Record TTEOSE
@@ -631,14 +600,12 @@ fn filter_matches(filter: &Filter, event: &crate::event::Event) -> bool {
         return false;
     }
     if let Some(ids) = &filter.ids {
-        let event_id_hex = hex::encode(event.id);
-        if !ids.iter().any(|id| event_id_hex.starts_with(&id.as_hex())) {
+        if !ids.iter().any(|id| &event.id == id.as_bytes()) {
             return false;
         }
     }
     if let Some(authors) = &filter.authors {
-        let pubkey_hex = hex::encode(event.pubkey);
-        if !authors.iter().any(|a| pubkey_hex.starts_with(&a.as_hex())) {
+        if !authors.iter().any(|a| &event.pubkey == a.as_bytes()) {
             return false;
         }
     }

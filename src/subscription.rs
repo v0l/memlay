@@ -1,13 +1,11 @@
 use crate::event::Event;
 use crate::store::EventStore;
-use dashmap::DashMap;
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 /// Trait for filter matching against an event
 pub trait FilterMatch {
@@ -274,53 +272,6 @@ impl<'de> Deserialize<'de> for Filter {
 pub struct SubscriptionManager {
     subscriptions: parking_lot::RwLock<HashMap<String, Subscription>>,
     pub store: Arc<EventStore>,
-    /// LRU cache for query results (max 1000 entries by default)
-    cache: Arc<DashMap<CacheKey, Vec<Weak<Event>>>>,
-    cache_max_entries: usize,
-}
-
-/// Cache key for query results.
-/// Captures all filter fields that affect query results.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct CacheKey {
-    pub ids: Option<Vec<Hex32>>,
-    pub kinds: Option<Vec<u32>>,
-    pub authors: Option<Vec<Hex32>>,
-    pub tag_filters: Vec<(char, String)>,
-    pub since: Option<u64>,
-    pub until: Option<u64>,
-}
-
-impl CacheKey {
-    pub fn from_filter(filter: &Filter) -> Self {
-        // Convert HashMap to sorted Vec for Hash impl
-        let mut tag_filters: Vec<(char, String)> = filter
-            .tag_filters
-            .iter()
-            .flat_map(|(&letter, values)| values.iter().map(move |v| (letter, v.clone())))
-            .collect();
-        tag_filters.sort();
-
-        Self {
-            ids: filter.ids.clone(),
-            kinds: filter.kinds.clone(),
-            authors: filter.authors.clone(),
-            tag_filters,
-            since: filter.since,
-            until: filter.until,
-        }
-    }
-}
-
-impl Hash for CacheKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.ids.hash(state);
-        self.kinds.hash(state);
-        self.authors.hash(state);
-        self.tag_filters.hash(state);
-        self.since.hash(state);
-        self.until.hash(state);
-    }
 }
 
 impl SubscriptionManager {
@@ -328,83 +279,42 @@ impl SubscriptionManager {
         Self {
             subscriptions: parking_lot::RwLock::new(HashMap::new()),
             store,
-            cache: Arc::new(DashMap::with_capacity(1000)),
-            cache_max_entries: 1000,
-        }
-    }
-
-    /// Create a new SubscriptionManager with custom cache size
-    pub fn with_cache_size(store: Arc<EventStore>, max_entries: usize) -> Self {
-        Self {
-            subscriptions: parking_lot::RwLock::new(HashMap::new()),
-            store,
-            cache: Arc::new(DashMap::with_capacity(max_entries)),
-            cache_max_entries: max_entries,
         }
     }
 
     pub fn add_subscription(&self, mut sub: Subscription) {
         let sub_id = sub.id.clone();
-        let start = std::time::Instant::now();
-        tracing::trace!(sub_id = %sub_id, "acquiring subscriptions write lock");
         let mut subs = self.subscriptions.write();
-        let lock_duration = start.elapsed();
-        tracing::trace!(sub_id = %sub_id, lock_duration_us = %lock_duration.as_micros(), "subscriptions write lock acquired");
 
         // Pre-parse e-tag and p-tag values once at subscription time
-        let parse_start = std::time::Instant::now();
         for filter in &mut sub.filters {
             filter.parse_hex_values();
         }
-        let parse_duration = parse_start.elapsed();
-        tracing::trace!(sub_id = %sub_id, parse_duration_us = %parse_duration.as_micros(), "parsed filter hex values");
 
-        let insert_start = std::time::Instant::now();
-        subs.insert(sub_id.clone(), sub);
-        let insert_duration = insert_start.elapsed();
-        tracing::trace!(sub_id = %sub_id, insert_duration_us = %insert_duration.as_micros(), "subscription inserted");
+        subs.insert(sub_id, sub);
     }
 
     pub fn remove_subscription(&self, id: &str) {
-        let start = std::time::Instant::now();
-        tracing::trace!(sub_id = %id, "acquiring subscriptions write lock for removal");
         let mut subs = self.subscriptions.write();
-        let lock_duration = start.elapsed();
-        tracing::trace!(sub_id = %id, lock_duration_us = %lock_duration.as_micros(), "subscriptions write lock acquired for removal");
-
-        let remove_start = std::time::Instant::now();
-        let removed = subs.remove(id);
-        let remove_duration = remove_start.elapsed();
-        tracing::trace!(sub_id = %id, removed = removed.is_some(), remove_duration_us = %remove_duration.as_micros(), "subscription removal completed");
+        subs.remove(id);
     }
 
     pub fn query_subscriptions(&self) -> Vec<Arc<Event>> {
-        let start = std::time::Instant::now();
-        tracing::trace!("acquiring subscriptions read lock for query_subscriptions");
         let subs = self.subscriptions.read();
-        let lock_duration = start.elapsed();
-        tracing::trace!(lock_duration_us = %lock_duration.as_micros(), subs_count = %subs.len(), "subscriptions read lock acquired for query_subscriptions");
 
         let mut all_events = Vec::new();
-        let mut total_filters = 0;
 
         for sub in subs.values() {
             for filter in &sub.filters {
-                total_filters += 1;
                 let events = self.query_filter(filter);
                 all_events.extend(events);
             }
         }
 
-        tracing::trace!(subs_count = %subs.len(), filters_processed = %total_filters, events_returned = %all_events.len(), "query_subscriptions completed");
-
         all_events
     }
 
     pub fn query_filter(&self, filter: &Filter) -> Vec<Arc<Event>> {
-        let query_start = std::time::Instant::now();
-        tracing::trace!("acquiring query_filter lock");
-
         if filter.kinds.is_none()
             && filter.authors.is_none()
             && filter.tag_filters.is_empty()
@@ -412,62 +322,10 @@ impl SubscriptionManager {
             && filter.until.is_none()
             && filter.ids.is_none()
         {
-            tracing::trace!(query_duration_us = %query_start.elapsed().as_micros(), "query_filter rejected empty filter");
             return Vec::new();
         }
 
-        let cache_key = CacheKey::from_filter(filter);
-
-        let cache_check_start = std::time::Instant::now();
-        if let Some(cached) = self.cache.get(&cache_key) {
-            let upgraded: Vec<Arc<Event>> = cached
-                .value()
-                .iter()
-                .filter_map(|weak| weak.upgrade())
-                .collect();
-
-            if upgraded.len() == cached.len() {
-                let cache_hit_duration = cache_check_start.elapsed();
-                let total_duration = query_start.elapsed();
-                tracing::trace!(cache_hit = true, events = %upgraded.len(), cache_check_duration_us = %cache_hit_duration.as_micros(), total_duration_us = %total_duration.as_micros(), "query_filter cache hit");
-                return upgraded;
-            }
-        }
-
-        let cache_check_duration = cache_check_start.elapsed();
-        tracing::trace!(cache_hit = false, cache_check_duration_us = %cache_check_duration.as_micros(), "query_filter cache miss, calling query_filter_internal");
-
-        let results_start = std::time::Instant::now();
-        let results = self.query_filter_internal(filter);
-        let results_duration = results_start.elapsed();
-        tracing::trace!(results_count = %results.len(), results_duration_us = %results_duration.as_micros(), "query_filter_internal completed");
-
-        if !results.is_empty() {
-            // Evict oldest cache entry if at capacity instead of clearing all
-            if self.cache.len() >= self.cache_max_entries {
-                // Remove one entry to make room (DashMap doesn't have LRU built-in).
-                // IMPORTANT: the `iter()` temporary holds a read lock on a shard for
-                // as long as it is alive. We must drop the iterator (by finishing this
-                // statement) BEFORE calling `remove()`, otherwise `remove()` would try
-                // to acquire a write lock on the same shard the iterator is still
-                // reading — a guaranteed self-deadlock.
-                let random_key = self.cache.iter().next().map(|r| r.key().clone());
-                if let Some(random_key) = random_key {
-                    self.cache.remove(&random_key);
-                    tracing::trace!("evicted oldest cache entry to make room");
-                }
-            }
-            let weak_results: Vec<Weak<Event>> =
-                results.iter().map(|arc| Arc::downgrade(arc)).collect();
-            let insert_start = std::time::Instant::now();
-            self.cache.insert(cache_key, weak_results);
-            let insert_duration = insert_start.elapsed();
-            tracing::trace!(cache_insert_duration_us = %insert_duration.as_micros(), "inserted query results into cache");
-        }
-
-        let total_duration = query_start.elapsed();
-        tracing::trace!(total_duration_us = %total_duration.as_micros(), final_results = %results.len(), "query_filter completed");
-        results
+        self.query_filter_internal(filter)
     }
 
     fn query_filter_internal(&self, filter: &Filter) -> Vec<Arc<Event>> {
@@ -640,26 +498,6 @@ impl SubscriptionManager {
 
         results
     }
-
-    /// Invalidate the entire cache (called on new event insertion)
-    pub fn invalidate_cache(&self) {
-        self.cache.clear();
-    }
-
-    /// Get cache statistics
-    pub fn cache_stats(&self) -> CacheStats {
-        CacheStats {
-            size: self.cache.len(),
-            max_entries: self.cache_max_entries,
-        }
-    }
-}
-
-/// Cache statistics
-#[derive(Debug, Clone)]
-pub struct CacheStats {
-    pub size: usize,
-    pub max_entries: usize,
 }
 
 #[cfg(test)]
@@ -1014,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_hit_returns_same_results() {
+    fn test_repeated_query_returns_same_results() {
         let store = EventStore::new(StoreConfig::default());
         let sm = SubscriptionManager::new(Arc::new(store));
 
@@ -1028,21 +866,18 @@ mod tests {
             ..Default::default()
         };
 
-        // First query - cache miss
         let results1 = sm.query_filter(&filter);
         assert_eq!(results1.len(), 2);
 
-        // Second query - cache hit - should return same results
+        // Querying again returns identical results
         let results2 = sm.query_filter(&filter);
         assert_eq!(results2.len(), 2);
-
-        // Results should be identical
         assert_eq!(results1[0].id, results2[0].id);
         assert_eq!(results1[1].id, results2[1].id);
     }
 
     #[test]
-    fn test_cache_invalidation_on_new_event() {
+    fn test_new_event_visible_in_subsequent_query() {
         let store = EventStore::new(StoreConfig::default());
         let sm = SubscriptionManager::new(Arc::new(store));
 
@@ -1055,130 +890,44 @@ mod tests {
             ..Default::default()
         };
 
-        // Populate cache
         let results1 = sm.query_filter(&filter);
         assert_eq!(results1.len(), 2);
 
-        // Store inserts directly, so we need to invalidate cache to reflect new data
-        // This simulates what the relay does when storing events
         let new_event = make_event(3, 1, 1, 3000);
         let event_id = new_event.id;
         sm.store.insert(new_event);
-        sm.invalidate_cache();
 
-        // Cache invalidation ensures new query sees 3 events
+        // A newly inserted event is immediately visible (no stale cache)
         let results2 = sm.query_filter(&filter);
         assert_eq!(results2.len(), 3);
-
-        // Verify new event is included
         let ids: Vec<[u8; 32]> = results2.iter().map(|e| e.id).collect();
         assert!(ids.contains(&event_id));
     }
 
     #[test]
-    fn test_cache_statistics() {
+    fn test_query_respects_varying_limits() {
+        // Regression guard: the removed cache ignored `limit`, so the same
+        // filter shape with different limits could return wrong-sized results.
         let store = EventStore::new(StoreConfig::default());
         let sm = SubscriptionManager::new(Arc::new(store));
 
-        sm.store.insert(make_event(1, 1, 1, 1000));
-        sm.store.insert(make_event(2, 1, 1, 2000));
+        for i in 0..5u8 {
+            sm.store.insert(make_event(i + 1, 1, 1, 1000 + i as u64));
+        }
 
-        // Initially cache is empty
-        let stats = sm.cache_stats();
-        assert_eq!(stats.size, 0);
-        assert_eq!(stats.max_entries, 1000);
-
-        // Populate cache with one query
-        let filter = Filter {
+        let small = Filter {
             kinds: Some(vec![1]),
-            limit: Some(10),
+            limit: Some(2),
             ..Default::default()
         };
-        sm.query_filter(&filter);
-
-        // Cache should have one entry
-        let stats = sm.cache_stats();
-        assert_eq!(stats.size, 1);
-
-        // Add different filters to populate more cache entries
-        let filter2 = Filter {
-            kinds: Some(vec![1, 2]),
-            limit: Some(10),
-            ..Default::default()
-        };
-        sm.query_filter(&filter2);
-
-        let stats = sm.cache_stats();
-        assert_eq!(stats.size, 2);
-
-        // Invalidate cache
-        sm.invalidate_cache();
-
-        let stats = sm.cache_stats();
-        assert_eq!(stats.size, 0);
-    }
-
-    #[test]
-    fn test_cache_different_filters_different_keys() {
-        let store = EventStore::new(StoreConfig::default());
-        let sm = SubscriptionManager::new(Arc::new(store));
-
-        sm.store.insert(make_event(1, 1, 1, 1000));
-        sm.store.insert(make_event(2, 1, 1, 2000));
-        sm.store.insert(make_event(3, 1, 2, 3000));
-
-        let filter1 = Filter {
+        let large = Filter {
             kinds: Some(vec![1]),
             limit: Some(10),
             ..Default::default()
         };
 
-        let filter2 = Filter {
-            kinds: Some(vec![2]),
-            limit: Some(10),
-            ..Default::default()
-        };
-
-        // Both queries populate cache
-        let results1 = sm.query_filter(&filter1);
-        let results2 = sm.query_filter(&filter2);
-
-        assert_eq!(results1.len(), 2);
-        assert_eq!(results2.len(), 1);
-
-        // Cache should have 2 entries
-        let stats = sm.cache_stats();
-        assert_eq!(stats.size, 2);
-    }
-
-    #[test]
-    fn test_cache_with_same_filter_twice_after_invalidation() {
-        let store = EventStore::new(StoreConfig::default());
-        let sm = SubscriptionManager::new(Arc::new(store));
-
-        sm.store.insert(make_event(1, 1, 1, 1000));
-        sm.store.insert(make_event(2, 1, 1, 2000));
-
-        let filter = Filter {
-            kinds: Some(vec![1]),
-            limit: Some(10),
-            ..Default::default()
-        };
-
-        // First query
-        let results1 = sm.query_filter(&filter);
-        assert_eq!(results1.len(), 2);
-
-        // Invalidate
-        sm.invalidate_cache();
-
-        // Second query - should recompute
-        let results2 = sm.query_filter(&filter);
-        assert_eq!(results2.len(), 2);
-
-        // Cache should have 1 entry
-        let stats = sm.cache_stats();
-        assert_eq!(stats.size, 1);
+        assert_eq!(sm.query_filter(&small).len(), 2);
+        assert_eq!(sm.query_filter(&large).len(), 5);
     }
 }
 
@@ -1200,14 +949,12 @@ impl FilterMatch for Filter {
             return false;
         }
         if let Some(ids) = &self.ids {
-            let event_id_hex = hex::encode(event.id);
-            if !ids.iter().any(|id| event_id_hex.starts_with(&id.as_hex())) {
+            if !ids.iter().any(|id| &event.id == id.as_bytes()) {
                 return false;
             }
         }
         if let Some(authors) = &self.authors {
-            let pubkey_hex = hex::encode(event.pubkey);
-            if !authors.iter().any(|a| pubkey_hex.starts_with(&a.as_hex())) {
+            if !authors.iter().any(|a| &event.pubkey == a.as_bytes()) {
                 return false;
             }
         }

@@ -80,11 +80,6 @@ name = "pipeline_bench"
 harness = false
 
 [[bench]]
-name = "subscription_cache_bench"
-harness = false
-required-features = ["unchecked"]
-
-[[bench]]
 name = "index_storage_bench"
 harness = false
 

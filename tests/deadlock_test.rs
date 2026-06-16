@@ -920,7 +920,6 @@ fn test_subscription_cache_concurrent_invalidation() {
                         (50 + i) as u64,
                     );
                     store.insert(event);
-                    sub_mgr.invalidate_cache();
                 } else {
                     // Query
                     let filter = Filter {
@@ -1325,7 +1324,6 @@ fn test_subscription_cache_post_quiesce_consistency() {
                             (100 + i) as u64,
                         );
                         store.index.remove(&event.id);
-                        sub_mgr.invalidate_cache();
                     }
                     _ => {
                         let filter = Filter {
@@ -1345,8 +1343,7 @@ fn test_subscription_cache_post_quiesce_consistency() {
         handle.join().expect("Thread panicked");
     }
 
-    // After quiescence: invalidate cache and verify a fresh query is consistent
-    sub_mgr.invalidate_cache();
+    // After quiescence: verify a fresh query is consistent
     let filter = Filter {
         kinds: Some(vec![1]),
         limit: Some(100000),

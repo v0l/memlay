@@ -468,6 +468,13 @@ impl EventStore {
         self.index.memory_bytes()
     }
 
+    /// Cached process RSS in bytes, updated every ~2s by the background sampler.
+    /// Cheap and lock-free — safe to call from request handlers, unlike
+    /// `get_process_memory()` which performs an expensive process scan.
+    pub fn cached_process_memory(&self) -> u64 {
+        self.cached_rss_bytes.load(Ordering::Relaxed)
+    }
+
     /// Get store configuration
     pub fn config(&self) -> &StoreConfig {
         &self.config

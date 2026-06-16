@@ -97,14 +97,16 @@ impl Event {
             .collect();
 
         // Verify event id = SHA-256([0, pubkey, created_at, kind, tags, content])
-        let serialised = serde_json::to_vec(&serde_json::json!([
-            0,
-            raw_event.pubkey,
+        // Serialize the tuple directly to avoid building an intermediate
+        // serde_json::Value tree.
+        let serialised = serde_json::to_vec(&(
+            0u8,
+            &raw_event.pubkey,
             raw_event.created_at,
             raw_event.kind,
-            raw_event.tags,
-            raw_event.content,
-        ]))
+            &raw_event.tags,
+            &raw_event.content,
+        ))
         .map_err(EventParseError::Json)?;
         let computed: [u8; 32] = Sha256::digest(&serialised).into();
         if computed != id {
