@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -533,10 +533,21 @@ impl EventStore {
         }
 
         // WAL not enabled - fall back to snapshot persistence
+        let count = self.write_snapshot(data_dir)?;
+
+        // Record disk persistence time metric
+        crate::metrics::observe_disk_persistence(start.elapsed());
+
+        tracing::info!(count, "saved events snapshot to disk");
+        Ok(())
+    }
+
+    /// Write a snapshot of all live events to `events.jsonl` atomically
+    /// (temp file + fsync + rename). Returns the number of events written.
+    fn write_snapshot(&self, data_dir: &Path) -> anyhow::Result<usize> {
         let events_file = data_dir.join("events.jsonl");
         let temp_file = data_dir.join("events.jsonl.tmp");
 
-        // Write events to temp file first (atomic write)
         let file = File::create(&temp_file)?;
         let mut writer = BufWriter::new(file);
 
@@ -548,34 +559,112 @@ impl EventStore {
         }
 
         writer.flush()?;
+        writer.get_ref().sync_data()?;
         drop(writer);
 
-        // Atomic rename
+        // Atomic rename into place.
         fs::rename(&temp_file, &events_file)?;
+        Ok(count)
+    }
 
-        // Record disk persistence time metric
+    /// Checkpoint: bound WAL growth by folding it into a fresh snapshot.
+    ///
+    /// Strategy (Option 2 — snapshot + WAL reset):
+    /// 1. Rotate the WAL (`wal.log` -> `wal.log.old`, fresh empty `wal.log`).
+    ///    Concurrent inserts after this point land in the new segment.
+    /// 2. Write a snapshot of all live events to `events.jsonl` (durably).
+    ///    Taken after rotation, so it supersedes everything in `wal.log.old`.
+    /// 3. Remove `wal.log.old`.
+    ///
+    /// Because the snapshot only contains live events, LRU-evicted events are
+    /// dropped automatically — no per-eviction delete records are needed.
+    /// Crash safety: if we die before step 3, recovery replays `wal.log.old`
+    /// (idempotent vs. the snapshot); if we die before step 2 finishes, the
+    /// previous `events.jsonl` plus `wal.log.old` plus `wal.log` still cover
+    /// the full state.
+    pub fn checkpoint(&self) -> anyhow::Result<()> {
+        let Some(ref path) = self.config.persistence_path else {
+            return Ok(());
+        };
+        let Some(ref wal) = self.wal else {
+            // No WAL: a plain snapshot is the whole persistence story.
+            let data_dir = Path::new(path);
+            fs::create_dir_all(data_dir)?;
+            self.write_snapshot(data_dir)?;
+            return Ok(());
+        };
+
+        let start = std::time::Instant::now();
+        let data_dir = Path::new(path);
+        fs::create_dir_all(data_dir)?;
+
+        // 1. Rotate the WAL to get a clean cut point.
+        let old_wal = wal.rotate()?;
+
+        // 2. Durably snapshot all live events (supersedes the rotated segment).
+        let count = self.write_snapshot(data_dir)?;
+
+        // 3. The snapshot now covers everything in the rotated segment.
+        if let Err(e) = fs::remove_file(&old_wal) {
+            tracing::warn!(error = %e, path = %old_wal, "failed to remove rotated WAL segment");
+        }
+
         crate::metrics::observe_disk_persistence(start.elapsed());
-
-        tracing::info!(path = %events_file.display(), count, "saved events snapshot to disk");
+        tracing::info!(
+            events = count,
+            duration_ms = %start.elapsed().as_millis(),
+            "checkpoint complete (snapshot written, WAL reset)"
+        );
         Ok(())
     }
 
-    /// Load events from disk by replaying the WAL.
-    /// Evicts old events during replay to stay within memory limits.
-    /// Compacts the WAL afterwards to remove stale entries.
-    pub fn load_from_disk(&self) -> anyhow::Result<usize> {
-        let Some(ref _path) = self.config.persistence_path else {
-            return Ok(0);
-        };
+    /// Minimum WAL size before a size-triggered checkpoint is considered.
+    /// Avoids rewriting a full snapshot for trivially small logs.
+    const MIN_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
+    /// Periodic maintenance for the background persistence task.
+    ///
+    /// Triggers a checkpoint (snapshot + WAL reset) once the WAL has grown well
+    /// beyond the live data set — this is what bounds WAL growth and reclaims
+    /// the inserts of LRU-evicted events. Otherwise it just ensures buffered
+    /// WAL writes are durable.
+    pub fn maybe_checkpoint(&self) -> anyhow::Result<()> {
         let Some(ref wal) = self.wal else {
-            return Ok(0);
+            // No WAL: the periodic snapshot is the whole persistence story.
+            return self.save_to_disk();
         };
 
-        let wal_path = wal.path();
-        let mut wal_count = 0usize;
-        let mut errors = 0usize;
-        let mut evicted = 0usize;
+        let pending = wal.pending_bytes();
+        let live = self.index.memory_bytes() as u64;
+        let threshold = Self::MIN_CHECKPOINT_BYTES.max(live.saturating_mul(2));
+
+        if pending >= threshold {
+            tracing::debug!(
+                wal_bytes = pending,
+                live_bytes = live,
+                "WAL exceeded checkpoint threshold"
+            );
+            self.checkpoint()
+        } else {
+            // No checkpoint needed; just make recent writes durable.
+            wal.group_commit().map(|_| ())
+        }
+    }
+
+    /// Load events from disk: restore the `events.jsonl` snapshot, then replay
+    /// any residual WAL segments (a `wal.log.old` left by a checkpoint that
+    /// crashed before cleanup, followed by the live `wal.log`). Old events are
+    /// evicted during load to stay within memory limits. After a successful
+    /// load with data, a checkpoint folds everything into a fresh snapshot and
+    /// resets the WAL.
+    ///
+    /// Returns the number of operations applied (snapshot + WAL records).
+    pub fn load_from_disk(&self) -> anyhow::Result<usize> {
+        let Some(ref path) = self.config.persistence_path else {
+            return Ok(0);
+        };
+        let data_dir = Path::new(path);
+
         let max_bytes = self.config.max_bytes;
         let eviction_threshold = if max_bytes > 0 {
             max_bytes * 90 / 100
@@ -588,22 +677,63 @@ impl EventStore {
             0
         };
 
-        match wal.replay(|op| match op {
-            WalOp::Insert(data) => match Event::from_json_unchecked(&data) {
-                Ok(event) => {
-                    self.index.insert(Arc::new(event));
-                    wal_count += 1;
+        let mut applied = 0usize;
+        let mut errors = 0usize;
+        let mut evicted = 0usize;
 
-                    if eviction_threshold > 0 && self.index.memory_bytes() > eviction_threshold {
-                        while self.index.memory_bytes() > eviction_target {
-                            let oldest = self.index.get_oldest(1);
-                            if oldest.is_empty() {
-                                break;
+        // Insert one event, evicting the oldest events if we exceed the limit.
+        let index = &self.index;
+        let mut ingest = |event: Arc<Event>| {
+            index.insert(event);
+            if eviction_threshold > 0 && index.memory_bytes() > eviction_threshold {
+                while index.memory_bytes() > eviction_target {
+                    let oldest = index.get_oldest(1);
+                    if oldest.is_empty() {
+                        break;
+                    }
+                    index.remove(&oldest[0].id);
+                    evicted += 1;
+                }
+            }
+        };
+
+        // 1. Restore the snapshot (events.jsonl), one raw JSON event per line.
+        let snapshot_file = data_dir.join("events.jsonl");
+        if snapshot_file.exists() {
+            match File::open(&snapshot_file) {
+                Ok(f) => {
+                    for line in BufReader::new(f).lines() {
+                        let line = match line {
+                            Ok(l) => l,
+                            Err(_) => break,
+                        };
+                        if line.is_empty() {
+                            continue;
+                        }
+                        match Event::from_json_unchecked(line.as_bytes()) {
+                            Ok(event) => {
+                                ingest(Arc::new(event));
+                                applied += 1;
                             }
-                            self.index.remove(&oldest[0].id);
-                            evicted += 1;
+                            Err(e) => {
+                                errors += 1;
+                                tracing::warn!(error = %e, "failed to parse event from snapshot");
+                            }
                         }
                     }
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to open snapshot"),
+            }
+        }
+
+        // 2 & 3. Replay WAL segments: the rotated `wal.log.old` (if a previous
+        // checkpoint crashed) first, then the live `wal.log`. Replaying inserts
+        // is idempotent vs. the snapshot (deduped by event id).
+        let mut replay_op = |op: WalOp| match op {
+            WalOp::Insert(data) => match Event::from_json_unchecked(&data) {
+                Ok(event) => {
+                    ingest(Arc::new(event));
+                    applied += 1;
                 }
                 Err(e) => {
                     errors += 1;
@@ -612,44 +742,54 @@ impl EventStore {
             },
             WalOp::Delete(id) => {
                 self.index.remove(&id);
-                wal_count += 1;
+                applied += 1;
             }
-        }) {
-            Ok(_) => {
-                if errors > 0 {
-                    tracing::warn!(errors, "some events failed to load from WAL");
-                }
-                tracing::info!(
-                    path = %wal_path,
-                    loaded = wal_count,
-                    evicted,
-                    errors,
-                    remaining = self.index.len(),
-                    memory = self.index.memory_bytes(),
-                    "loaded events from WAL"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to replay WAL");
+        };
+
+        let old_wal = self.wal.as_ref().map(|wal| format!("{}.old", wal.path()));
+        if let Some(ref old_wal) = old_wal {
+            let old_path = Path::new(old_wal);
+            if old_path.exists()
+                && let Err(e) = WriteAheadLog::replay_path(old_path, &mut replay_op)
+            {
+                tracing::warn!(error = %e, "failed to replay rotated WAL segment");
             }
         }
 
-        // Compact the WAL to only contain live events
-        if wal_count > 0 {
-            let live_ids = self.index.all_ids();
-            match wal.compact(&live_ids) {
-                Ok(removed) => {
-                    if removed > 0 {
-                        tracing::info!(removed, kept = live_ids.len(), "compacted WAL");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to compact WAL");
-                }
+        if let Some(ref wal) = self.wal
+            && let Err(e) = wal.replay(&mut replay_op)
+        {
+            tracing::warn!(error = %e, "failed to replay WAL");
+        }
+
+        // `replay_op` / `ingest` are no longer used past this point, so NLL
+        // ends their &mut borrows of the counters, which we now read.
+        if errors > 0 {
+            tracing::warn!(errors, "some events failed to load");
+        }
+        tracing::info!(
+            applied,
+            evicted,
+            errors,
+            remaining = self.index.len(),
+            memory = self.index.memory_bytes(),
+            "loaded events from disk"
+        );
+
+        // Remove any leftover rotated segment now that it has been replayed.
+        if let Some(ref old_wal) = old_wal {
+            let _ = fs::remove_file(old_wal);
+        }
+
+        // Fold the recovered state into a clean snapshot and reset the WAL so
+        // we don't re-read a growing log on every restart.
+        if applied > 0 {
+            if let Err(e) = self.checkpoint() {
+                tracing::warn!(error = %e, "failed to checkpoint after load");
             }
         }
 
-        Ok(wal_count)
+        Ok(applied)
     }
 
     /// Start background persistence task (call from relay startup)
@@ -674,7 +814,7 @@ impl EventStore {
                 tokio::task::spawn_blocking(move || {
                     let inner_start = std::time::Instant::now();
                     tracing::trace!(task_id = %task_id, "persistence blocking task started");
-                    let result = store.save_to_disk();
+                    let result = store.maybe_checkpoint();
                     let duration = inner_start.elapsed();
                     match result {
                         Ok(_) => {
@@ -1180,5 +1320,125 @@ mod tests {
             store2.get(&oldest_event_id).is_none(),
             "Should evict oldest event (created_at=0)"
         );
+    }
+
+    #[test]
+    fn test_checkpoint_writes_snapshot_and_resets_wal() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+
+        let store = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        for i in 0..10u8 {
+            store.insert(make_event(i, 1, 1, 1000 + i as u64));
+        }
+        assert_eq!(store.len(), 10);
+
+        let wal_file = std::path::Path::new(&path).join("wal.log");
+        let snapshot_file = std::path::Path::new(&path).join("events.jsonl");
+        let wal_before = std::fs::metadata(&wal_file).unwrap().len();
+        assert!(wal_before > 0, "WAL should have content before checkpoint");
+
+        store.checkpoint().unwrap();
+
+        // Snapshot now exists, WAL has been reset (rotated away), and the
+        // rotated segment has been removed.
+        assert!(
+            snapshot_file.exists(),
+            "snapshot should exist after checkpoint"
+        );
+        let wal_after = std::fs::metadata(&wal_file).unwrap().len();
+        assert_eq!(wal_after, 0, "WAL should be empty after checkpoint");
+        assert!(
+            !std::path::Path::new(&format!("{}.old", wal_file.display())).exists(),
+            "rotated WAL segment should be removed"
+        );
+
+        // A fresh store recovers the full state from the snapshot.
+        let store2 = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        store2.load_from_disk().unwrap();
+        assert_eq!(store2.len(), 10);
+    }
+
+    #[test]
+    fn test_checkpoint_drops_evicted_events() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+
+        let store = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        for i in 0..20u8 {
+            store.insert(make_event(i, 1, 1, 1000 + i as u64));
+        }
+        assert_eq!(store.len(), 20);
+
+        // Simulate LRU eviction (which does NOT write WAL deletes) of the
+        // 10 oldest events.
+        let oldest = store.index.get_oldest(10);
+        for er in &oldest {
+            store.index.remove(&er.id);
+        }
+        assert_eq!(store.len(), 10);
+
+        // Checkpoint snapshots only live events; the evicted inserts in the WAL
+        // are discarded with the rotated segment.
+        store.checkpoint().unwrap();
+
+        let store2 = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        store2.load_from_disk().unwrap();
+        assert_eq!(
+            store2.len(),
+            10,
+            "evicted events must not resurrect after checkpoint+reload"
+        );
+        // The 10 newest events survive; the 10 oldest stay gone.
+        assert!(store2.get(&make_event(19, 1, 1, 1019).id).is_some());
+        assert!(store2.get(&make_event(0, 1, 1, 1000).id).is_none());
+    }
+
+    #[test]
+    fn test_recovery_replays_leftover_rotated_wal() {
+        // Simulates a crash mid-checkpoint: a snapshot plus a leftover
+        // `wal.log.old` (rotated out, not yet deleted) plus new writes in the
+        // live `wal.log`. Recovery must merge all three.
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+
+        // Phase 1: write events and checkpoint to produce a snapshot.
+        let store = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        store.insert(make_event(1, 1, 1, 1000));
+        store.insert(make_event(2, 1, 1, 2000));
+        store.checkpoint().unwrap();
+
+        // Phase 2: more writes land in the live WAL, then we rotate (mimicking
+        // a checkpoint that crashed right after rotation, before snapshot +
+        // cleanup), leaving a populated wal.log.old behind.
+        store.insert(make_event(3, 1, 1, 3000));
+        if let Some(ref wal) = store.wal {
+            let _old = wal.rotate().unwrap();
+        }
+        // And a further write into the fresh live WAL.
+        store.insert(make_event(4, 1, 1, 4000));
+
+        let old_wal = std::path::Path::new(&path).join("wal.log.old");
+        assert!(old_wal.exists(), "leftover rotated WAL should exist");
+
+        // Recovery: snapshot (1,2) + wal.log.old (3) + wal.log (4) = 4 events.
+        let store2 = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        store2.load_from_disk().unwrap();
+        assert_eq!(
+            store2.len(),
+            4,
+            "recovery must merge snapshot + both WAL segments"
+        );
+        for i in 1..=4u8 {
+            assert!(
+                store2
+                    .get(&make_event(i, 1, 1, 1000 * i as u64).id)
+                    .is_some(),
+                "event {} should be recovered",
+                i
+            );
+        }
+        // Leftover segment is cleaned up after recovery.
+        assert!(!old_wal.exists(), "rotated segment removed after recovery");
     }
 }

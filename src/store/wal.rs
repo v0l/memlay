@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::event::Event;
 
@@ -32,6 +32,9 @@ pub struct WriteAheadLog {
     /// group-commit task clears it after a successful sync. This lets the hot
     /// append path skip the per-op fsync entirely.
     dirty: AtomicBool,
+    /// Bytes appended since the last rotate/truncate. Used to size-trigger
+    /// checkpoints without stat()-ing the file on every interval.
+    bytes_written: AtomicU64,
 }
 
 impl WriteAheadLog {
@@ -48,15 +51,19 @@ impl WriteAheadLog {
         // Open file for writing (appending)
         let write_file = OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&wal_path)?;
+
+        // Existing on-disk size seeds the byte counter so size-triggered
+        // checkpoints account for a WAL recovered from a previous run.
+        let initial_len = write_file.metadata().map(|m| m.len()).unwrap_or(0);
 
         Ok(Self {
             path: wal_path_str.clone(),
             write_file: std::sync::Mutex::new(BufWriter::new(write_file)),
             read_path: wal_path_str,
             dirty: AtomicBool::new(false),
+            bytes_written: AtomicU64::new(initial_len),
         })
     }
 
@@ -94,7 +101,43 @@ impl WriteAheadLog {
         drop(file);
         self.dirty.store(true, Ordering::Relaxed);
 
+        // Record-type byte (1) + payload (length prefix + data, or 32-byte id).
+        let written = 1 + match op {
+            WalOp::Insert(data) => 4 + data.len() as u64,
+            WalOp::Delete(_) => 32,
+        };
+        self.bytes_written.fetch_add(written, Ordering::Relaxed);
+
         Ok(())
+    }
+
+    /// Bytes appended to the current WAL segment since the last rotate/truncate.
+    pub fn pending_bytes(&self) -> u64 {
+        self.bytes_written.load(Ordering::Relaxed)
+    }
+
+    /// Atomically rotate the WAL: fsync and rename the current `wal.log` to
+    /// `wal.log.old`, then start a fresh empty `wal.log`. Concurrent appends
+    /// block briefly on the write lock, giving a clean cut point. Returns the
+    /// path of the rotated-out segment, which the caller is responsible for
+    /// removing once a superseding snapshot has been durably written.
+    pub fn rotate(&self) -> anyhow::Result<String> {
+        let old_path = format!("{}.old", self.read_path);
+        let mut file = self.write_file.lock().unwrap();
+        // Flush + fsync everything currently buffered before rotating.
+        file.flush()?;
+        file.get_ref().sync_data()?;
+        // Rename current segment out of the way, then open a fresh one.
+        std::fs::rename(&self.read_path, &old_path)?;
+        let new_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.read_path)?;
+        *file = BufWriter::new(new_file);
+        self.bytes_written.store(0, Ordering::Relaxed);
+        self.dirty.store(false, Ordering::Relaxed);
+        drop(file);
+        Ok(old_path)
     }
 
     /// Durability checkpoint for group commit. If there are unsynced writes,
@@ -124,12 +167,22 @@ impl WriteAheadLog {
 
     /// Replay all operations from the WAL
     /// Returns the number of operations replayed
-    pub fn replay<F>(&self, mut f: F) -> anyhow::Result<usize>
+    pub fn replay<F>(&self, f: F) -> anyhow::Result<usize>
+    where
+        F: FnMut(WalOp),
+    {
+        Self::replay_path(Path::new(&self.read_path), f)
+    }
+
+    /// Replay all operations from an arbitrary WAL file at `path`.
+    /// Used to recover both the live `wal.log` and a leftover `wal.log.old`
+    /// segment from a checkpoint that crashed before cleanup.
+    pub fn replay_path<F>(path: &Path, mut f: F) -> anyhow::Result<usize>
     where
         F: FnMut(WalOp),
     {
         // Open file fresh for reading
-        let file = File::open(&self.read_path)?;
+        let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
         let mut count = 0;
@@ -312,7 +365,6 @@ impl WriteAheadLog {
 
         let new_write_file = OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&self.read_path)?;
 
