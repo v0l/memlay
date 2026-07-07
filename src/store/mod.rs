@@ -39,24 +39,6 @@ fn get_total_memory() -> u64 {
     sys.total_memory()
 }
 
-/// Get current process memory usage (RSS) in bytes.
-/// Uses sysinfo for cross-platform compatibility (Windows, macOS, Linux).
-pub fn get_process_memory() -> u64 {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-
-    match sysinfo::get_current_pid() {
-        Ok(pid) => {
-            if let Some(process) = sys.process(pid) {
-                return process.memory();
-            }
-        }
-        Err(_e) => {}
-    }
-
-    0
-}
-
 /// Adaptive eviction state
 struct EvictionState {
     interval_seconds: AtomicUsize,
@@ -240,13 +222,14 @@ impl EventStore {
     /// This is expensive (10-100ms) and should only be called from the
     /// background RSS sampler, never from the hot path.
     fn read_rss_bytes() -> u64 {
+        let Ok(pid) = sysinfo::get_current_pid() else {
+            return 0;
+        };
+        // Refresh only our own process rather than walking the entire process
+        // table every sample.
         let mut sys = sysinfo::System::new();
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-
-        match sysinfo::get_current_pid() {
-            Ok(pid) => sys.process(pid).map(|p| p.memory()).unwrap_or(0),
-            Err(_) => 0,
-        }
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        sys.process(pid).map(|p| p.memory()).unwrap_or(0)
     }
 
     /// Background eviction check with adaptive interval and batch eviction.
@@ -335,7 +318,6 @@ impl EventStore {
     /// - Duplicate: event already exists
     /// - Stored: event was stored, with any replaced events (for replaceable events)
     pub fn insert(&self, event: Arc<Event>) -> InsertResult {
-        let event_id = event.id;
         let start = std::time::Instant::now();
 
         // Ephemeral events should never be stored
@@ -343,14 +325,10 @@ impl EventStore {
             return InsertResult::Ephemeral;
         }
 
-        // Check if event already exists
-        if self.index.get(&event_id).is_some() {
-            return InsertResult::Duplicate;
-        }
-
-        // Insert the event and get replaced events (for replaceable events)
-        // EventIndex::insert now handles the duplicate check atomically
-        // and returns LostRace if we lost a replaceable event race
+        // Insert the event and get replaced events (for replaceable events).
+        // EventIndex::insert handles the duplicate check atomically (via the
+        // by_id insert) and returns LostRace if we lost a replaceable race, so
+        // no separate pre-check is needed.
         let outcome = self.index.insert(event.clone());
 
         match outcome {
@@ -396,12 +374,6 @@ impl EventStore {
         for event in events {
             // Skip ephemeral events
             if event.is_ephemeral() {
-                continue;
-            }
-
-            let event_id = event.id;
-
-            if self.index.get(&event_id).is_some() {
                 continue;
             }
 
@@ -475,6 +447,11 @@ impl EventStore {
         self.index.query_by_tag(letter, value, limit)
     }
 
+    /// Get the newest `limit` events across all data (created_at DESC).
+    pub fn query_newest(&self, limit: usize) -> Vec<Arc<Event>> {
+        self.index.get_newest(limit)
+    }
+
     /// Number of events in the store
     pub fn len(&self) -> usize {
         self.index.event_count()
@@ -491,8 +468,8 @@ impl EventStore {
     }
 
     /// Cached process RSS in bytes, updated every ~2s by the background sampler.
-    /// Cheap and lock-free — safe to call from request handlers, unlike
-    /// `get_process_memory()` which performs an expensive process scan.
+    /// Cheap and lock-free — safe to call from request handlers, unlike a live
+    /// `refresh_processes()` scan.
     pub fn cached_process_memory(&self) -> u64 {
         self.cached_rss_bytes.load(Ordering::Relaxed)
     }

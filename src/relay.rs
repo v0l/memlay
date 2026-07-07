@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::message::NostrMessage;
 use crate::store::{EventStore, InsertResult, StoreConfig};
-use crate::subscription::{Filter, Subscription, SubscriptionManager};
+use crate::subscription::{Filter, FilterMatch, SubscriptionManager};
 use axum::{
     Router,
     extract::{ConnectInfo, State, ws::WebSocket},
@@ -13,11 +13,13 @@ use futures_util::{SinkExt, stream::StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 
 /// Capacity of the relay-wide new-event broadcast channel.
-/// Increased to handle high event volume with many concurrent clients.
-const BROADCAST_CAP: usize = 262144;
+/// Sized to absorb bursts without lagging readers, but not so large that a
+/// lagged reader replays a huge backlog. Slow peers are additionally handled
+/// by the per-connection drop counter.
+const BROADCAST_CAP: usize = 16384;
 
 /// Capacity of per-connection send channels (backpressure for slow clients).
 /// Increased to handle burst traffic without dropping events.
@@ -26,6 +28,20 @@ const CONN_SEND_CAP: usize = 4096;
 /// Maximum consecutive dropped events before disconnecting a slow peer.
 const SLOW_PEER_MAX_DROPPED: usize = 100;
 
+/// Maximum inbound WebSocket text frame size (bytes) we will parse. Larger
+/// frames are rejected to bound per-message CPU/allocation.
+const MAX_MESSAGE_BYTES: usize = 512 * 1024;
+
+/// Maximum number of filters accepted in a single REQ.
+const MAX_FILTERS_PER_REQ: usize = 20;
+
+/// Global cap on concurrent signature verifications. Bounds blocking-pool
+/// usage under an ingest flood (each verify is ~1.4ms of CPU) without throttling
+/// normal concurrent load. Kept well below tokio's default 512 blocking threads.
+fn verify_permits() -> usize {
+    (num_cpus::get() * 32).clamp(64, 256)
+}
+
 /// Shared state threaded through axum via `State<Arc<AppState>>`.
 struct AppState {
     events: Arc<EventStore>,
@@ -33,6 +49,7 @@ struct AppState {
     tx: broadcast::Sender<Arc<crate::event::Event>>,
     config: Config,
     connection_count: Arc<AtomicUsize>,
+    verify_sem: Arc<Semaphore>,
 }
 
 pub struct Relay {
@@ -101,6 +118,7 @@ impl Relay {
             tx: self.tx.clone(),
             config: self.config.clone(),
             connection_count: self.connection_count.clone(),
+            verify_sem: Arc::new(Semaphore::new(verify_permits())),
         });
 
         Router::new()
@@ -138,10 +156,22 @@ async fn root_handler(
             let subscriptions = state.subscriptions.clone();
             let tx = state.tx.clone();
             let conn_count = state.connection_count.clone();
+            let verify_sem = state.verify_sem.clone();
+            let config = state.config.clone();
             ws.on_failed_upgrade(move |err| {
                 tracing::warn!(%addr, "WebSocket upgrade failed: {}", err);
             })
-            .on_upgrade(move |socket| handle_socket(socket, addr, subscriptions, tx, conn_count))
+            .on_upgrade(move |socket| {
+                handle_socket(
+                    socket,
+                    addr,
+                    subscriptions,
+                    tx,
+                    conn_count,
+                    verify_sem,
+                    config,
+                )
+            })
             .into_response()
         }
         Err(_) => landing_page(&state.config).into_response(),
@@ -233,47 +263,61 @@ fn landing_page(_config: &Config) -> impl IntoResponse {
 
 // ── WebSocket connection handler ──────────────────────────────────────────────
 
+/// Cheaply peek the Nostr message type (first array element) without a full
+/// JSON parse or signature verification. Tolerant of leading whitespace, so it
+/// is robust where a naive `starts_with("[\"REQ\"")` check would fail.
+fn message_type(text: &str) -> Option<&str> {
+    let s = text.trim_start().strip_prefix('[')?.trim_start();
+    let s = s.strip_prefix('"')?;
+    let end = s.find('"')?;
+    Some(&s[..end])
+}
+
+/// Clamp each filter's `limit` to `max_limit` and pre-parse hex tag values so
+/// both the initial query and live matching use the fast 32-byte index path.
+fn prepare_filters(filters: &mut [Filter], max_limit: usize) {
+    for f in filters {
+        f.limit = Some(f.limit.map_or(max_limit, |l| l.min(max_limit)));
+        f.parse_hex_values();
+    }
+}
+
 async fn handle_socket(
     socket: WebSocket,
     addr: SocketAddr,
     subscriptions: Arc<SubscriptionManager>,
     tx: broadcast::Sender<Arc<crate::event::Event>>,
     connection_count: Arc<AtomicUsize>,
+    verify_sem: Arc<Semaphore>,
+    config: Config,
 ) {
-    // Increment connection count
     connection_count.fetch_add(1, Ordering::Relaxed);
     crate::metrics::ACTIVE_CONNECTIONS.inc();
 
     tracing::info!(%addr, "client connected");
 
-    // Split socket into send/receive parts
     let (mut ws_send, mut ws_recv) = socket.split();
 
-    // Per-connection subscription state: sub_id → filters
+    // Per-connection subscription state: sub_id → filters (already clamped/parsed).
     let mut conn_subs: std::collections::HashMap<String, Vec<Filter>> =
         std::collections::HashMap::new();
 
-    // Per-connection send channel for async event delivery (prevents slow clients from blocking)
+    // Per-connection send channel for async event delivery (prevents slow clients from blocking).
     let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<String>(CONN_SEND_CAP);
 
     let mut rx = tx.subscribe();
 
-    // Track consecutive dropped events for slow peer detection
-    let mut consecutive_dropped = 0;
+    let mut consecutive_dropped = 0usize;
+    let mut events_sent = 0usize;
+    let mut events_dropped = 0usize;
+    let mut subs_opened = 0usize;
+    let mut subs_closed = 0usize;
 
-    // Track event statistics for this connection
-    let mut events_sent = 0;
-    let mut events_dropped = 0;
-
-    // Track subscription statistics for this connection
-    let mut subs_opened = 0;
-    let mut subs_closed = 0;
-
-    // Track spawned REQ task handles for cleanup on disconnect
+    // Track spawned REQ task handles for cleanup on disconnect / CLOSE.
     let mut req_task_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
         std::collections::HashMap::new();
 
-    // Spawn sender task - drains from send_rx and sends to socket
+    // Sender task: drains from send_rx and writes to the socket.
     let mut sender_handle = tokio::spawn(async move {
         while let Some(msg) = send_rx.recv().await {
             if ws_send
@@ -295,100 +339,149 @@ async fn handle_socket(
                     _ => break,
                 };
 
-                        match msg {
-                            axum::extract::ws::Message::Text(text) => {
-                                // Handle REQ asynchronously to keep main loop responsive
-                                if text.starts_with("[\"REQ\"") {
-                                    let text_str = text.as_ref();
-                                    if let Ok(NostrMessage::Request { id, mut filters }) = NostrMessage::from_json(text_str) {
-                                        // Pre-parse hex tag values once so both the
-                                        // initial query and live broadcast matching
-                                        // use the fast 32-byte index path.
-                                        for f in &mut filters {
-                                            f.parse_hex_values();
+                match msg {
+                    axum::extract::ws::Message::Text(text) => {
+                        if text.len() > MAX_MESSAGE_BYTES {
+                            let notice = NostrMessage::Notification {
+                                message: "message too large".to_string(),
+                            };
+                            let _ = send_tx.try_send(notice.to_json());
+                            continue;
+                        }
+
+                        match message_type(&text) {
+                            Some("EVENT") => {
+                                // Offload parse + signature verification (the dominant
+                                // CPU cost) to the blocking pool. A global semaphore
+                                // caps concurrent verifications so an ingest flood
+                                // can't exhaust the pool, but the permit is acquired
+                                // inside the spawned task so the select loop stays
+                                // responsive to REQ/CLOSE/broadcast traffic.
+                                let text_owned = text.to_string();
+                                let store = subscriptions.store.clone();
+                                let tx2 = tx.clone();
+                                let send_tx2 = send_tx.clone();
+                                let sem = verify_sem.clone();
+                                tokio::spawn(async move {
+                                    let _permit = match sem.acquire_owned().await {
+                                        Ok(p) => p,
+                                        Err(_) => return, // semaphore closed → shutting down
+                                    };
+                                    let outcome = tokio::task::spawn_blocking(move || {
+                                        process_event_message(&text_owned, &store, &tx2)
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                    if let Some(reply) = outcome {
+                                        let _ = send_tx2.send(reply).await;
+                                    }
+                                });
+                            }
+                            Some("REQ") => {
+                                match NostrMessage::from_json(&text) {
+                                    Ok(NostrMessage::Request { id, mut filters }) => {
+                                        if filters.len() > MAX_FILTERS_PER_REQ {
+                                            let notice = NostrMessage::Notification {
+                                                message: format!(
+                                                    "too many filters (max {})",
+                                                    MAX_FILTERS_PER_REQ
+                                                ),
+                                            };
+                                            let _ = send_tx.try_send(notice.to_json());
+                                            continue;
                                         }
-                                        // Update conn_subs in main loop immediately so broadcast events are matched
+                                        // Enforce max concurrent subscriptions per connection.
+                                        if !conn_subs.contains_key(&id)
+                                            && conn_subs.len() >= config.max_subscriptions
+                                        {
+                                            let closed = NostrMessage::Notification {
+                                                message: format!(
+                                                    "subscription limit reached (max {})",
+                                                    config.max_subscriptions
+                                                ),
+                                            };
+                                            let _ = send_tx.try_send(closed.to_json());
+                                            continue;
+                                        }
+
+                                        prepare_filters(&mut filters, config.max_limit);
                                         conn_subs.insert(id.clone(), filters.clone());
+                                        subs_opened += 1;
+
+                                        // Abort any prior task reusing this sub id.
+                                        if let Some(h) = req_task_handles.remove(&id) {
+                                            h.abort();
+                                        }
 
                                         let send_tx = send_tx.clone();
                                         let subs = subscriptions.clone();
                                         let id_clone = id.clone();
+                                        let sub_start = std::time::Instant::now();
 
                                         let handle = tokio::spawn(async move {
-                                            // Query events directly (no spawn_blocking - queries are fast)
-                                            // Build response JSON straight from the stored raw bytes
-                                            // to avoid deep-cloning each Event.
-                                            let mut events: Vec<String> = Vec::new();
+                                            // Stream matched events directly from stored
+                                            // raw bytes (no deep clone, no Vec buffering).
                                             for filter in &filters {
-                                                let matched = subs.query_filter(filter);
-                                                for event in matched {
-                                                    events.push(format!(
-                                                        r#"["EVENT","{}",{}]"#,
-                                                        id_clone,
-                                                        String::from_utf8_lossy(&event.raw)
-                                                    ));
+                                                for event in subs.query_filter(filter) {
+                                                    let raw = String::from_utf8_lossy(&event.raw);
+                                                    let mut msg = String::with_capacity(
+                                                        id_clone.len() + raw.len() + 16,
+                                                    );
+                                                    msg.push_str("[\"EVENT\",\"");
+                                                    msg.push_str(&id_clone);
+                                                    msg.push_str("\",");
+                                                    msg.push_str(&raw);
+                                                    msg.push(']');
+                                                    if send_tx.send(msg).await.is_err() {
+                                                        return;
+                                                    }
                                                     crate::metrics::inc_events_output();
                                                 }
                                             }
-
-                                            // Send events from async context
-                                            for msg in events {
-                                                let _ = send_tx.send(msg).await;
-                                            }
-
-                                            let eose = NostrMessage::EndOfStoredEvents { id: id_clone };
+                                            crate::metrics::observe_tteose(sub_start.elapsed());
+                                            let eose =
+                                                NostrMessage::EndOfStoredEvents { id: id_clone };
                                             let _ = send_tx.send(eose.to_json()).await;
                                         });
 
-                                        // Track the task handle for cleanup
                                         req_task_handles.insert(id, handle);
                                     }
-                        } else if text.starts_with("[\"EVENT\"") {
-                            // Offload EVENT parse + signature verification (the
-                            // dominant ~1.4ms CPU cost) to the blocking pool so it
-                            // never stalls this connection's async select loop or
-                            // starves the tokio runtime under concurrent ingest.
-                            let text_owned = text.to_string();
-                            let subs = subscriptions.clone();
-                            let tx2 = tx.clone();
-                            let send_tx2 = send_tx.clone();
-                            tokio::spawn(async move {
-                                let outcome = tokio::task::spawn_blocking(move || {
-                                    process_event_message(&text_owned, &subs, &tx2)
-                                })
-                                .await
-                                .ok()
-                                .flatten();
-                                if let Some(reply) = outcome {
-                                    let _ = send_tx2.send(reply).await;
-                                }
-                            });
-                        } else if text.starts_with("[\"CLOSE\"") {
-                            // Handle CLOSE for async subscriptions
-                            let text_str = text.as_ref();
-                            if let Ok(NostrMessage::Close { id }) = NostrMessage::from_json(text_str) {
-                                conn_subs.remove(&id);
-                                // Abort the spawned task if it exists
-                                if let Some(handle) = req_task_handles.remove(&id) {
-                                    handle.abort();
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        let notice = NostrMessage::Notification { message: e };
+                                        let _ = send_tx.try_send(notice.to_json());
+                                    }
                                 }
                             }
-                        } else {
-                            handle_text(&text, addr, &send_tx, &subscriptions, &tx, &mut conn_subs, &mut events_sent, &mut events_dropped, &mut subs_opened, &mut subs_closed).await;
+                            Some("CLOSE") => {
+                                if let Ok(NostrMessage::Close { id }) =
+                                    NostrMessage::from_json(&text)
+                                {
+                                    conn_subs.remove(&id);
+                                    if let Some(handle) = req_task_handles.remove(&id) {
+                                        handle.abort();
+                                    }
+                                    subs_closed += 1;
+                                }
+                            }
+                            _ => {
+                                // Unknown / client-side frame (OK, EOSE, NOTICE) or
+                                // malformed. Reply with a NOTICE on parse error only.
+                                if let Err(e) = NostrMessage::from_json(&text) {
+                                    let notice = NostrMessage::Notification { message: e };
+                                    let _ = send_tx.try_send(notice.to_json());
+                                }
+                            }
                         }
                     }
                     axum::extract::ws::Message::Binary(_) => {
                         let notice = NostrMessage::Notification {
                             message: "binary messages are not supported".to_string(),
                         };
-                        // Non-blocking: never await inside the select loop, or a stuck
-                        // client whose send channel is full would freeze the whole
-                        // connection (no broadcast draining, no disconnect detection).
                         let _ = send_tx.try_send(notice.to_json());
                     }
-                    axum::extract::ws::Message::Ping(_) => {
-                        // axum automatically responds to pings
-                    }
+                    axum::extract::ws::Message::Ping(_) => {}
                     axum::extract::ws::Message::Pong(_) => {}
                     axum::extract::ws::Message::Close(_) => break,
                 }
@@ -398,41 +491,38 @@ async fn handle_socket(
             event = rx.recv() => {
                 match event {
                     Ok(event) => {
-                        // Pre-compute event JSON once
+                        // Skip all work if this connection has no active subscriptions.
+                        if conn_subs.is_empty() {
+                            continue;
+                        }
                         let event_json = String::from_utf8_lossy(&event.raw);
                         let mut dropped_for_event = 0;
 
-                        // Check every active subscription on this connection
                         for (sub_id, filters) in &conn_subs {
                             for filter in filters {
-                                if filter_matches(filter, &*event) {
-                                    // Build the message with a single exact-capacity
-                                    // allocation, reusing the pre-computed event JSON
-                                    // and avoiding format! machinery on the hot path.
-                                    // Layout: ["EVENT","<sub_id>",<event_json>]
-                                    let mut msg = String::with_capacity(sub_id.len() + event_json.len() + 13);
+                                if filter.matches_event(&event) {
+                                    let mut msg = String::with_capacity(
+                                        sub_id.len() + event_json.len() + 13,
+                                    );
                                     msg.push_str("[\"EVENT\",\"");
                                     msg.push_str(sub_id);
                                     msg.push_str("\",");
                                     msg.push_str(&event_json);
                                     msg.push(']');
-                                    // Send asynchronously via channel (non-blocking)
                                     if send_tx.try_send(msg).is_err() {
                                         dropped_for_event += 1;
                                         events_dropped += 1;
                                         consecutive_dropped += 1;
-
-                                        // Disconnect slow peer
                                         if consecutive_dropped >= SLOW_PEER_MAX_DROPPED {
                                             tracing::warn!(%addr, "disconnecting slow peer after {} dropped events", consecutive_dropped);
                                             break;
                                         }
                                     } else {
                                         events_sent += 1;
+                                        consecutive_dropped = 0;
                                     }
-                                    // Track events output
                                     crate::metrics::inc_events_output();
-                                    break; // only send once per subscription even if multiple filters match
+                                    break; // one send per subscription
                                 }
                             }
                             if consecutive_dropped >= SLOW_PEER_MAX_DROPPED {
@@ -454,29 +544,22 @@ async fn handle_socket(
             // ── sender task failure ───────────────────────────────────────
             res = &mut sender_handle => {
                 let _ = res;
-                break; // Sender task failed
+                break;
             }
         }
 
-        // Check for slow peer after each iteration
         if consecutive_dropped >= SLOW_PEER_MAX_DROPPED {
             tracing::warn!(%addr, "disconnecting slow peer ({} dropped events)", consecutive_dropped);
             break;
         }
     }
 
-    // Per-connection subscriptions live only in conn_subs, which is dropped
-    // when this task ends — no global registry cleanup required.
-
-    // Abort all spawned REQ tasks for this connection
+    // Abort all spawned REQ tasks and the sender task.
     for (_, handle) in req_task_handles {
         handle.abort();
     }
-
-    // Abort sender task
     sender_handle.abort();
 
-    // Decrement connection count
     connection_count.fetch_sub(1, Ordering::Relaxed);
     crate::metrics::ACTIVE_CONNECTIONS.dec();
 
@@ -488,7 +571,7 @@ async fn handle_socket(
 /// reply JSON to send back to the client, if any.
 fn process_event_message(
     text: &str,
-    subscriptions: &Arc<SubscriptionManager>,
+    store: &Arc<EventStore>,
     tx: &broadcast::Sender<Arc<crate::event::Event>>,
 ) -> Option<String> {
     match NostrMessage::from_json(text) {
@@ -496,10 +579,9 @@ fn process_event_message(
             let event_id = hex::encode(event.id);
             let ev = Arc::new(event);
 
-            let ok = match subscriptions.store.insert(ev.clone()) {
+            let ok = match store.insert(ev.clone()) {
                 InsertResult::Ephemeral => {
                     tracing::debug!(id = %event_id, kind = ev.kind, "ephemeral event");
-                    // Ephemeral events are not stored but still broadcast.
                     let _ = tx.send(ev);
                     NostrMessage::Ok {
                         id: event_id,
@@ -535,171 +617,4 @@ fn process_event_message(
         Ok(_) => None,
         Err(e) => Some(NostrMessage::Notification { message: e }.to_json()),
     }
-}
-
-async fn handle_text(
-    text: &str,
-    addr: SocketAddr,
-    send_tx: &tokio::sync::mpsc::Sender<String>,
-    subscriptions: &Arc<SubscriptionManager>,
-    tx: &broadcast::Sender<Arc<crate::event::Event>>,
-    conn_subs: &mut std::collections::HashMap<String, Vec<Filter>>,
-    _events_sent: &mut usize,
-    _events_dropped: &mut usize,
-    _subs_opened: &mut usize,
-    subs_closed: &mut usize,
-) {
-    match NostrMessage::from_json(text) {
-        Ok(NostrMessage::Event { event, .. }) => {
-            let event_id = hex::encode(event.id);
-            let ev = Arc::new(event);
-
-            let ok = match subscriptions.store.insert(ev.clone()) {
-                InsertResult::Ephemeral => {
-                    tracing::debug!(%addr, id = %event_id, kind = ev.kind, "ephemeral event");
-                    // Ephemeral events are not stored but still broadcast to active subscribers
-                    // Use try_send to prevent blocking when broadcast channel is full
-                    let _ = tx.send(ev);
-                    NostrMessage::Ok {
-                        id: event_id,
-                        accepted: true,
-                        message: "ephemeral: will not be stored".to_string(),
-                    }
-                }
-                InsertResult::Duplicate => {
-                    tracing::debug!(%addr, id = %event_id, "duplicate event");
-                    NostrMessage::Ok {
-                        id: event_id,
-                        accepted: true,
-                        message: "duplicate: already have this event".to_string(),
-                    }
-                }
-                InsertResult::Stored { event, replaced } => {
-                    tracing::debug!(
-                        %addr,
-                        id = %event_id,
-                        kind = event.kind,
-                        replaced = replaced.len(),
-                        "event stored"
-                    );
-                    // Broadcast to live subscriptions on other connections
-                    // Use try_send to prevent blocking when broadcast channel is full
-                    let _ = tx.send(event);
-                    NostrMessage::Ok {
-                        id: event_id,
-                        accepted: true,
-                        message: String::new(),
-                    }
-                }
-            };
-            // Non-blocking: handle_text runs in the connection's select loop, so an
-            // awaited send on a full channel (stuck client) would freeze the loop.
-            let _ = send_tx.try_send(ok.to_json());
-        }
-
-        Ok(NostrMessage::Request { id, filters }) => {
-            // Register subscription and update conn_subs immediately
-            // so broadcast events are matched while the query runs.
-            conn_subs.insert(id.clone(), filters.clone());
-
-            let send_tx = send_tx.clone();
-            let subs = subscriptions.clone();
-            let filters_clone = filters.clone();
-            let id_clone = id.clone();
-            let sub_start = std::time::Instant::now();
-
-            tokio::spawn(async move {
-                // Register subscription
-                subs.add_subscription(Subscription {
-                    id: id_clone.clone(),
-                    filters: filters_clone.clone(),
-                });
-
-                // Query events. Build response JSON directly from stored raw bytes
-                // to avoid deep-cloning each Event.
-                let mut events: Vec<String> = Vec::new();
-                for filter in &filters_clone {
-                    let matched = subs.query_filter(filter);
-                    for event in matched {
-                        events.push(format!(
-                            r#"["EVENT","{}",{}]"#,
-                            id_clone,
-                            String::from_utf8_lossy(&event.raw)
-                        ));
-                        crate::metrics::inc_events_output();
-                    }
-                }
-
-                // Send events
-                for msg in events {
-                    let _ = send_tx.send(msg).await;
-                }
-
-                // Record TTEOSE
-                crate::metrics::observe_tteose(sub_start.elapsed());
-
-                let eose = NostrMessage::EndOfStoredEvents { id: id_clone };
-                let _ = send_tx.send(eose.to_json()).await;
-            });
-        }
-
-        Ok(NostrMessage::Close { id }) => {
-            subscriptions.remove_subscription(&id);
-            conn_subs.remove(&id);
-            *subs_closed += 1;
-        }
-
-        Err(e) => {
-            let notice = NostrMessage::Notification { message: e };
-            // Non-blocking: see note above — never block the select loop.
-            let _ = send_tx.try_send(notice.to_json());
-        }
-
-        _ => {} // client-side messages (OK, EOSE, NOTICE) — ignore
-    }
-}
-
-// ── filter matching for live delivery ────────────────────────────────────────
-
-/// Returns true if `event` matches `filter` (same AND logic as query_filter,
-/// but applied to a single event without going through the store).
-fn filter_matches(filter: &Filter, event: &crate::event::Event) -> bool {
-    if let Some(since) = filter.since
-        && event.created_at < since
-    {
-        return false;
-    }
-    if let Some(until) = filter.until
-        && event.created_at > until
-    {
-        return false;
-    }
-    if let Some(kinds) = &filter.kinds
-        && !kinds.contains(&event.kind)
-    {
-        return false;
-    }
-    if let Some(ids) = &filter.ids {
-        if !ids.iter().any(|id| &event.id == id.as_bytes()) {
-            return false;
-        }
-    }
-    if let Some(authors) = &filter.authors {
-        if !authors.iter().any(|a| &event.pubkey == a.as_bytes()) {
-            return false;
-        }
-    }
-    if !filter.tag_filters.is_empty() {
-        for (&letter, values) in &filter.tag_filters {
-            let matched = event.tags.iter().any(|tag| {
-                let mut chars = tag.name.chars();
-                matches!((chars.next(), chars.next()), (Some(l), None) if l == letter)
-                    && tag.value().is_some_and(|v| values.iter().any(|fv| fv == v))
-            });
-            if !matched {
-                return false;
-            }
-        }
-    }
-    true
 }

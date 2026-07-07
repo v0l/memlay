@@ -26,6 +26,9 @@ pub struct Config {
     /// When set, /metrics endpoint will proxy to this server
     #[serde(default)]
     pub prometheus_url: Option<String>,
+    /// Directory for the rotating log file. When unset, logs go to stdout only.
+    #[serde(default)]
+    pub log_dir: Option<String>,
 }
 
 impl Config {
@@ -70,6 +73,7 @@ impl Default for Config {
             persistence_path: None,
             persistence_interval: default_persistence_interval(),
             prometheus_url: None,
+            log_dir: None,
         }
     }
 }

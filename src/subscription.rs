@@ -35,14 +35,6 @@ impl Hex32 {
     pub fn as_hex(&self) -> String {
         hex::encode(self.0)
     }
-
-    pub fn starts_with(&self, prefix: &str) -> bool {
-        if prefix.len() > 64 {
-            return false;
-        }
-        let hex = self.as_hex();
-        hex.starts_with(prefix)
-    }
 }
 
 impl From<&str> for Hex32 {
@@ -269,62 +261,24 @@ impl<'de> Deserialize<'de> for Filter {
     }
 }
 
+/// Executes NIP-01 filter queries against the event store.
+///
+/// Per-connection subscription state lives in the connection task (`conn_subs`);
+/// there is deliberately no global subscription registry here — it would leak on
+/// disconnect and is not consulted for live broadcast matching.
 pub struct SubscriptionManager {
-    subscriptions: parking_lot::RwLock<HashMap<String, Subscription>>,
     pub store: Arc<EventStore>,
 }
 
 impl SubscriptionManager {
     pub fn new(store: Arc<EventStore>) -> Self {
-        Self {
-            subscriptions: parking_lot::RwLock::new(HashMap::new()),
-            store,
-        }
-    }
-
-    pub fn add_subscription(&self, mut sub: Subscription) {
-        let sub_id = sub.id.clone();
-        let mut subs = self.subscriptions.write();
-
-        // Pre-parse e-tag and p-tag values once at subscription time
-        for filter in &mut sub.filters {
-            filter.parse_hex_values();
-        }
-
-        subs.insert(sub_id, sub);
-    }
-
-    pub fn remove_subscription(&self, id: &str) {
-        let mut subs = self.subscriptions.write();
-        subs.remove(id);
-    }
-
-    pub fn query_subscriptions(&self) -> Vec<Arc<Event>> {
-        let subs = self.subscriptions.read();
-
-        let mut all_events = Vec::new();
-
-        for sub in subs.values() {
-            for filter in &sub.filters {
-                let events = self.query_filter(filter);
-                all_events.extend(events);
-            }
-        }
-
-        all_events
+        Self { store }
     }
 
     pub fn query_filter(&self, filter: &Filter) -> Vec<Arc<Event>> {
-        if filter.kinds.is_none()
-            && filter.authors.is_none()
-            && filter.tag_filters.is_empty()
-            && filter.since.is_none()
-            && filter.until.is_none()
-            && filter.ids.is_none()
-        {
-            return Vec::new();
-        }
-
+        // NIP-01: an empty filter `{}` (or one carrying only since/until/limit)
+        // matches every event, bounded by limit. This is handled by the
+        // newest-events fallback in query_filter_internal.
         self.query_filter_internal(filter)
     }
 
@@ -428,7 +382,17 @@ impl SubscriptionManager {
         } else if use_authors {
             if let Some(authors) = &filter.authors {
                 for author in authors {
-                    candidates.extend(self.store.query_by_pubkey(author.as_bytes(), fetch_limit));
+                    // Use the since-aware path when a lower time bound is set so
+                    // the sorted index short-circuits instead of scanning all.
+                    match filter.since {
+                        Some(since) => candidates.extend(self.store.query_by_pubkey_since(
+                            author.as_bytes(),
+                            since,
+                            fetch_limit,
+                        )),
+                        None => candidates
+                            .extend(self.store.query_by_pubkey(author.as_bytes(), fetch_limit)),
+                    }
                 }
             } else if let Some(p_vals) = filter.p_tags() {
                 for val in p_vals {
@@ -447,6 +411,10 @@ impl SubscriptionManager {
                     candidates.extend(self.store.query_by_kind(*kind, fetch_limit));
                 }
             }
+        } else {
+            // No selective index (empty filter, or bare since/until): fall back
+            // to the newest events across the store, bounded by limit.
+            candidates.extend(self.store.query_newest(fetch_limit));
         }
 
         // Pre-compute author set for filtering if needed

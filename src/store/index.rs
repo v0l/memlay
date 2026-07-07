@@ -168,13 +168,38 @@ impl EventIndex {
     pub fn insert(&self, event: Arc<Event>) -> InsertOutcome {
         let mut replaced = None;
 
-        // Handle replaceable events: atomically swap old ID in by_replaceable
+        // Handle replaceable events: atomically swap old ID in by_replaceable,
+        // but only if the incoming event is newer than the one we already hold.
+        // NIP-01: keep the LATEST version per (pubkey, kind[, d-tag]); a
+        // late-arriving older event must NOT delete a newer stored one.
         if event.is_replaceable() {
             let key = event.replacement_key();
             if let ReplacementKey::Replaceable { .. } | ReplacementKey::Addressable { .. } = &key {
-                if let Some(old_id) = self.by_replaceable.insert(key.clone(), event.id) {
-                    if let Some(old_event) = self.internal_remove(&old_id, true) {
-                        replaced = Some(old_event);
+                use dashmap::mapref::entry::Entry;
+                match self.by_replaceable.entry(key.clone()) {
+                    Entry::Occupied(mut occ) => {
+                        let old_id = *occ.get();
+                        // Compare against the currently-stored event. Newer wins;
+                        // ties broken by lexicographically-lower id (deterministic).
+                        let incoming_wins = match self.by_id.get(&old_id) {
+                            Some(old) => {
+                                event.created_at > old.created_at
+                                    || (event.created_at == old.created_at && event.id < old.id)
+                            }
+                            // Stored id already gone (evicted/removed) — take over.
+                            None => true,
+                        };
+                        if !incoming_wins {
+                            // Incoming event is stale; reject without storing.
+                            return InsertOutcome::LostRace;
+                        }
+                        occ.insert(event.id);
+                        if let Some(old_event) = self.internal_remove(&old_id, true) {
+                            replaced = Some(old_event);
+                        }
+                    }
+                    Entry::Vacant(vac) => {
+                        vac.insert(event.id);
                     }
                 }
             }
@@ -495,6 +520,47 @@ impl EventIndex {
         oldest
     }
 
+    /// Get the newest `count` events across all data (created_at DESC).
+    /// Used to satisfy filters with no selective index (e.g. `{}` or a bare
+    /// `since`/`until`), bounded by the caller's limit.
+    pub fn get_newest(&self, count: usize) -> Vec<Arc<Event>> {
+        if count == 0 {
+            return Vec::new();
+        }
+        // Min-heap of the newest `count` seen so far. EventRef sorts newest
+        // first, so Reverse(er) makes the heap's peek() the OLDEST kept event,
+        // which is the one to drop when a newer candidate arrives.
+        use std::cmp::Reverse;
+        // Cap preallocation: callers may pass usize::MAX to mean "no limit".
+        let cap = count.min(4096);
+        let mut heap: std::collections::BinaryHeap<Reverse<EventRef>> =
+            std::collections::BinaryHeap::with_capacity(cap);
+
+        for shard in &self.by_oldest {
+            let set = shard.read();
+            // Iterate newest-first; stop early once the newest remaining is not
+            // better than our current oldest-kept.
+            for er in set.iter() {
+                if heap.len() < count {
+                    heap.push(Reverse(er.clone()));
+                } else if er.created_at > heap.peek().unwrap().0.created_at {
+                    heap.pop();
+                    heap.push(Reverse(er.clone()));
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let mut newest: Vec<EventRef> = Vec::with_capacity(heap.len());
+        while let Some(Reverse(er)) = heap.pop() {
+            newest.push(er);
+        }
+        // Heap pops oldest-first; reverse to newest-first.
+        newest.reverse();
+        newest.into_iter().map(|er| er.event).collect()
+    }
+
     /// Get current memory usage in bytes (raw JSON only)
     pub fn memory_bytes(&self) -> usize {
         self.memory_bytes.load(AtomicOrdering::Relaxed)
@@ -520,11 +586,6 @@ impl EventIndex {
     /// Get all events for persistence
     pub fn iter_all(&self) -> Vec<Arc<Event>> {
         self.by_id.iter().map(|r| Arc::clone(r.value())).collect()
-    }
-
-    /// Get all live event IDs
-    pub fn all_ids(&self) -> std::collections::HashSet<[u8; 32]> {
-        self.by_id.iter().map(|r| *r.key()).collect()
     }
 
     /// Query by pubkey, returns events sorted by created_at DESC
@@ -580,8 +641,11 @@ impl EventIndex {
 
         let events: Vec<Arc<Event>> = {
             let set = set_lock.read();
+            // The set is ordered created_at DESC, so every event with
+            // created_at >= since is a contiguous prefix. take_while stops at
+            // the first older event: O(log n + k) instead of scanning all.
             set.iter()
-                .filter(|r| r.created_at >= since)
+                .take_while(|r| r.created_at >= since)
                 .take(limit)
                 .map(|r| Arc::clone(&r.event))
                 .collect()
@@ -832,6 +896,34 @@ mod tests {
         assert_eq!(removed.id, id);
         assert_eq!(index.len(), 0);
         assert!(index.get(&id).is_none());
+    }
+
+    #[test]
+    fn test_replaceable_older_does_not_replace_newer() {
+        // kind 10000 is replaceable; same pubkey.
+        let index = EventIndex::new();
+        let newer = make_event(2, 1, 10000, 2000);
+        let newer_id = newer.id;
+        index.insert(newer);
+        assert_eq!(index.len(), 1);
+
+        // A late-arriving OLDER event must not evict the newer stored one.
+        let older = make_event(1, 1, 10000, 1000);
+        let older_id = older.id;
+        let outcome = index.insert(older);
+        assert!(matches!(outcome, InsertOutcome::LostRace));
+        assert_eq!(index.len(), 1);
+        assert!(index.get(&newer_id).is_some());
+        assert!(index.get(&older_id).is_none());
+
+        // A newer event DOES replace.
+        let newest = make_event(3, 1, 10000, 3000);
+        let newest_id = newest.id;
+        let outcome = index.insert(newest);
+        assert!(matches!(outcome, InsertOutcome::Inserted { .. }));
+        assert_eq!(index.len(), 1);
+        assert!(index.get(&newest_id).is_some());
+        assert!(index.get(&newer_id).is_none());
     }
 
     #[test]
