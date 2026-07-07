@@ -28,3 +28,8 @@ max_limit: 5000
 # When set, /metrics endpoint will proxy requests to this Prometheus server
 # The landing page will also show a link to view metrics
 # prometheus_url: "http://localhost:9090/api/v1/query?query=up"
+
+# Directory for the rotating log file (optional)
+# When unset, logs are written to stdout only. When set, logs also go to
+# <log_dir>/memlay.log
+# log_dir: "/data"

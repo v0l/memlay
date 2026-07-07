@@ -2,7 +2,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use memlay::event::{Event, Tag};
 use memlay::message::NostrMessage;
 use memlay::store::{EventStore, StoreConfig};
-use memlay::subscription::{Filter, FilterMatch, Subscription, SubscriptionManager};
+use memlay::subscription::{Filter, FilterMatch, SubscriptionManager};
 use rand::prelude::*;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -453,14 +453,14 @@ fn bench_subscription_add_remove(c: &mut Criterion) {
 
     c.bench_function("subscription_add_remove", |b| {
         b.iter(|| {
-            let sub = Subscription {
-                id: "test_sub".to_string(),
-                filters: vec![filter.clone()],
-            };
-            sm.add_subscription(sub);
-            sm.remove_subscription("test_sub");
+            // Registry was removed; this now benches filter preparation, the
+            // per-subscription work done on the connection hot path.
+            let mut f = filter.clone();
+            f.parse_hex_values();
+            black_box(&f);
         });
     });
+    let _ = &sm;
 }
 
 fn bench_subscription_query_filter(c: &mut Criterion) {
@@ -520,14 +520,11 @@ fn bench_subscription_query_multiple_filters(c: &mut Criterion) {
         })
         .collect();
 
-    let sub = Subscription {
-        id: "multi_filter_sub".to_string(),
-        filters,
-    };
-
     c.bench_function("subscription_query_multiple_filters", |b| {
         b.iter(|| {
-            black_box(sm.query_subscriptions());
+            for f in &filters {
+                black_box(sm.query_filter(f));
+            }
         });
     });
 }
