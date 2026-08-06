@@ -1,7 +1,8 @@
 use crate::config::Config;
+use crate::fanout::{BroadcastEvent, Fanout};
 use crate::message::NostrMessage;
 use crate::store::{EventStore, InsertResult, StoreConfig};
-use crate::subscription::{Filter, FilterMatch, SubscriptionManager};
+use crate::subscription::{Filter, SubscriptionManager};
 use axum::{
     Router,
     extract::{ConnectInfo, State, ws::WebSocket},
@@ -13,20 +14,13 @@ use futures_util::{SinkExt, stream::StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::{Semaphore, broadcast};
-
-/// Capacity of the relay-wide new-event broadcast channel.
-/// Sized to absorb bursts without lagging readers, but not so large that a
-/// lagged reader replays a huge backlog. Slow peers are additionally handled
-/// by the per-connection drop counter.
-const BROADCAST_CAP: usize = 16384;
+use tokio::sync::Semaphore;
 
 /// Capacity of per-connection send channels (backpressure for slow clients).
-/// Increased to handle burst traffic without dropping events.
-const CONN_SEND_CAP: usize = 4096;
-
-/// Maximum consecutive dropped events before disconnecting a slow peer.
-const SLOW_PEER_MAX_DROPPED: usize = 100;
+/// Sized to absorb a sync/import burst without dropping. Live delivery is
+/// routed per-connection by `Fanout`, so this is the only queue an event sits
+/// in and it is never shared with unrelated connections.
+const CONN_SEND_CAP: usize = 16384;
 
 /// Maximum inbound WebSocket text frame size (bytes) we will parse. Larger
 /// frames are rejected to bound per-message CPU/allocation.
@@ -46,7 +40,7 @@ fn verify_permits() -> usize {
 struct AppState {
     events: Arc<EventStore>,
     subscriptions: Arc<SubscriptionManager>,
-    tx: broadcast::Sender<Arc<crate::event::Event>>,
+    fanout: Arc<Fanout>,
     config: Config,
     connection_count: Arc<AtomicUsize>,
     verify_sem: Arc<Semaphore>,
@@ -55,8 +49,9 @@ struct AppState {
 pub struct Relay {
     pub events: Arc<EventStore>,
     pub subscriptions: Arc<SubscriptionManager>,
-    /// Sender side of the relay-wide broadcast for newly accepted events.
-    tx: broadcast::Sender<Arc<crate::event::Event>>,
+    /// Live-event router: only connections with matching subscriptions are
+    /// touched when an event is accepted.
+    fanout: Arc<Fanout>,
     config: Config,
     /// Count of active WebSocket connections
     connection_count: Arc<AtomicUsize>,
@@ -64,6 +59,9 @@ pub struct Relay {
 
 impl Relay {
     pub fn new(config: Config) -> Self {
+        // Export every metric at zero from startup.
+        crate::metrics::init();
+
         // Create store config with persistence if enabled
         let store_config = if let Some(ref path) = config.persistence_path {
             StoreConfig::with_persistence(config.target_ram_percent, path.clone())
@@ -90,7 +88,7 @@ impl Relay {
         }
 
         let subscriptions = Arc::new(SubscriptionManager::new(events.clone()));
-        let (tx, _) = broadcast::channel(BROADCAST_CAP);
+        let fanout = Arc::new(Fanout::new());
         let connection_count = Arc::new(AtomicUsize::new(0));
 
         // Always start metrics collection for active connections
@@ -105,7 +103,7 @@ impl Relay {
         Self {
             events,
             subscriptions,
-            tx,
+            fanout,
             config,
             connection_count,
         }
@@ -115,7 +113,7 @@ impl Relay {
         let app_state = Arc::new(AppState {
             events: self.events.clone(),
             subscriptions: self.subscriptions.clone(),
-            tx: self.tx.clone(),
+            fanout: self.fanout.clone(),
             config: self.config.clone(),
             connection_count: self.connection_count.clone(),
             verify_sem: Arc::new(Semaphore::new(verify_permits())),
@@ -154,7 +152,7 @@ async fn root_handler(
     match ws {
         Ok(ws) => {
             let subscriptions = state.subscriptions.clone();
-            let tx = state.tx.clone();
+            let fanout = state.fanout.clone();
             let conn_count = state.connection_count.clone();
             let verify_sem = state.verify_sem.clone();
             let config = state.config.clone();
@@ -166,7 +164,7 @@ async fn root_handler(
                     socket,
                     addr,
                     subscriptions,
-                    tx,
+                    fanout,
                     conn_count,
                     verify_sem,
                     config,
@@ -214,7 +212,9 @@ fn nip11_handler(config: &Config) -> impl IntoResponse {
         "supported_nips": [1, 11],
         "limitation": {
             "max_subscriptions": config.max_subscriptions,
-            "max_limit": config.max_limit
+            "max_limit": config.max_limit,
+            "max_message_length": MAX_MESSAGE_BYTES,
+            "idle_timeout": config.idle_timeout
         }
     });
 
@@ -286,7 +286,7 @@ async fn handle_socket(
     socket: WebSocket,
     addr: SocketAddr,
     subscriptions: Arc<SubscriptionManager>,
-    tx: broadcast::Sender<Arc<crate::event::Event>>,
+    fanout: Arc<Fanout>,
     connection_count: Arc<AtomicUsize>,
     verify_sem: Arc<Semaphore>,
     config: Config,
@@ -298,20 +298,28 @@ async fn handle_socket(
 
     let (mut ws_send, mut ws_recv) = socket.split();
 
-    // Per-connection subscription state: sub_id → filters (already clamped/parsed).
-    let mut conn_subs: std::collections::HashMap<String, Vec<Filter>> =
-        std::collections::HashMap::new();
-
     // Per-connection send channel for async event delivery (prevents slow clients from blocking).
     let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<String>(CONN_SEND_CAP);
 
-    let mut rx = tx.subscribe();
+    // Register with the live-event router. No events are routed here until a
+    // REQ opens a subscription, so idle connections cost the publisher nothing.
+    let conn = fanout.register(send_tx.clone());
 
-    let mut consecutive_dropped = 0usize;
-    let mut events_sent = 0usize;
-    let mut events_dropped = 0usize;
     let mut subs_opened = 0usize;
     let mut subs_closed = 0usize;
+
+    // Idle reaper: a connection that never sends a REQ or an EVENT is holding a
+    // slot, a task and a send buffer for nothing. Production logs showed heavy
+    // churn of exactly these (`sent=0, subs_opened=0`). Transport-level
+    // ping/pong does not count as activity — only client-originated frames do.
+    let idle_enabled = config.idle_timeout > 0;
+    let mut client_active = false;
+    let idle_timer = tokio::time::sleep(std::time::Duration::from_secs(if idle_enabled {
+        config.idle_timeout
+    } else {
+        0
+    }));
+    tokio::pin!(idle_timer);
 
     // Track spawned REQ task handles for cleanup on disconnect / CLOSE.
     let mut req_task_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
@@ -341,6 +349,7 @@ async fn handle_socket(
 
                 match msg {
                     axum::extract::ws::Message::Text(text) => {
+                        client_active = true;
                         if text.len() > MAX_MESSAGE_BYTES {
                             let notice = NostrMessage::Notification {
                                 message: "message too large".to_string(),
@@ -359,7 +368,7 @@ async fn handle_socket(
                                 // responsive to REQ/CLOSE/broadcast traffic.
                                 let text_owned = text.to_string();
                                 let store = subscriptions.store.clone();
-                                let tx2 = tx.clone();
+                                let fanout2 = fanout.clone();
                                 let send_tx2 = send_tx.clone();
                                 let sem = verify_sem.clone();
                                 tokio::spawn(async move {
@@ -368,7 +377,7 @@ async fn handle_socket(
                                         Err(_) => return, // semaphore closed → shutting down
                                     };
                                     let outcome = tokio::task::spawn_blocking(move || {
-                                        process_event_message(&text_owned, &store, &tx2)
+                                        process_event_message(&text_owned, &store, &fanout2)
                                     })
                                     .await
                                     .ok()
@@ -392,8 +401,8 @@ async fn handle_socket(
                                             continue;
                                         }
                                         // Enforce max concurrent subscriptions per connection.
-                                        if !conn_subs.contains_key(&id)
-                                            && conn_subs.len() >= config.max_subscriptions
+                                        if !fanout.has_sub(&conn, &id)
+                                            && fanout.sub_count(&conn) >= config.max_subscriptions
                                         {
                                             let closed = NostrMessage::Notification {
                                                 message: format!(
@@ -406,7 +415,7 @@ async fn handle_socket(
                                         }
 
                                         prepare_filters(&mut filters, config.max_limit);
-                                        conn_subs.insert(id.clone(), filters.clone());
+                                        fanout.set_sub(&conn, &id, filters.clone());
                                         subs_opened += 1;
 
                                         // Abort any prior task reusing this sub id.
@@ -458,7 +467,7 @@ async fn handle_socket(
                                 if let Ok(NostrMessage::Close { id }) =
                                     NostrMessage::from_json(&text)
                                 {
-                                    conn_subs.remove(&id);
+                                    fanout.remove_sub(&conn, &id);
                                     if let Some(handle) = req_task_handles.remove(&id) {
                                         handle.abort();
                                     }
@@ -476,6 +485,7 @@ async fn handle_socket(
                         }
                     }
                     axum::extract::ws::Message::Binary(_) => {
+                        client_active = true;
                         let notice = NostrMessage::Notification {
                             message: "binary messages are not supported".to_string(),
                         };
@@ -487,58 +497,54 @@ async fn handle_socket(
                 }
             }
 
-            // ── new event broadcast from another connection ───────────────
-            event = rx.recv() => {
-                match event {
-                    Ok(event) => {
-                        // Skip all work if this connection has no active subscriptions.
-                        if conn_subs.is_empty() {
-                            continue;
-                        }
-                        let event_json = String::from_utf8_lossy(&event.raw);
-                        let mut dropped_for_event = 0;
-
-                        for (sub_id, filters) in &conn_subs {
-                            for filter in filters {
-                                if filter.matches_event(&event) {
-                                    let mut msg = String::with_capacity(
-                                        sub_id.len() + event_json.len() + 13,
-                                    );
-                                    msg.push_str("[\"EVENT\",\"");
-                                    msg.push_str(sub_id);
-                                    msg.push_str("\",");
-                                    msg.push_str(&event_json);
-                                    msg.push(']');
-                                    if send_tx.try_send(msg).is_err() {
-                                        dropped_for_event += 1;
-                                        events_dropped += 1;
-                                        consecutive_dropped += 1;
-                                        if consecutive_dropped >= SLOW_PEER_MAX_DROPPED {
-                                            tracing::warn!(%addr, "disconnecting slow peer after {} dropped events", consecutive_dropped);
-                                            break;
-                                        }
-                                    } else {
-                                        events_sent += 1;
-                                        consecutive_dropped = 0;
-                                    }
-                                    crate::metrics::inc_events_output();
-                                    break; // one send per subscription
-                                }
-                            }
-                            if consecutive_dropped >= SLOW_PEER_MAX_DROPPED {
-                                break;
-                            }
-                        }
-
-                        if dropped_for_event > 0 {
-                            tracing::debug!(%addr, "dropped {} events for this broadcast", dropped_for_event);
-                        }
+            // ── live delivery overflowed for one or more subscriptions ────
+            _ = conn.notified() => {
+                // A full send queue means this client cannot keep up. Rather
+                // than silently dropping events (the old broadcast-lag
+                // behaviour), close the affected subscriptions per NIP-01 so
+                // the client knows it must resubscribe to resync.
+                for sub_id in conn.take_overflowed() {
+                    fanout.remove_sub(&conn, &sub_id);
+                    if let Some(handle) = req_task_handles.remove(&*sub_id) {
+                        handle.abort();
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(%addr, "broadcast lagged by {} events", n);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    subs_closed += 1;
+                    let closed = NostrMessage::Closed {
+                        id: sub_id.to_string(),
+                        message: "error: client too slow, resubscribe to resync".to_string(),
+                    };
+                    tracing::warn!(%addr, sub = %sub_id, "subscription overflowed; sent CLOSED");
+                    let _ = send_tx.try_send(closed.to_json());
                 }
+
+                if conn.should_disconnect() {
+                    tracing::warn!(
+                        %addr,
+                        dropped = conn.dropped(),
+                        "disconnecting slow peer (drop rate exceeded)"
+                    );
+                    break;
+                }
+            }
+
+            // ── idle connection reaper ──────────────────────────────────
+            _ = &mut idle_timer, if idle_enabled && !client_active => {
+                tracing::debug!(
+                    %addr,
+                    "closing idle connection: no REQ or EVENT within {}s",
+                    config.idle_timeout
+                );
+                crate::metrics::inc_idle_disconnects();
+                let notice = NostrMessage::Notification {
+                    message: format!(
+                        "idle: no REQ or EVENT within {}s, closing",
+                        config.idle_timeout
+                    ),
+                };
+                let _ = send_tx.try_send(notice.to_json());
+                // Let the sender task flush the NOTICE before we tear it down.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                break;
             }
 
             // ── sender task failure ───────────────────────────────────────
@@ -547,12 +553,10 @@ async fn handle_socket(
                 break;
             }
         }
-
-        if consecutive_dropped >= SLOW_PEER_MAX_DROPPED {
-            tracing::warn!(%addr, "disconnecting slow peer ({} dropped events)", consecutive_dropped);
-            break;
-        }
     }
+
+    // Unregister first so no further events are routed to this connection.
+    fanout.unregister(&conn);
 
     // Abort all spawned REQ tasks and the sender task.
     for (_, handle) in req_task_handles {
@@ -563,7 +567,14 @@ async fn handle_socket(
     connection_count.fetch_sub(1, Ordering::Relaxed);
     crate::metrics::ACTIVE_CONNECTIONS.dec();
 
-    tracing::info!(%addr, "client disconnected: sent={}, dropped={}, subs_opened={}, subs_closed={}", events_sent, events_dropped, subs_opened, subs_closed);
+    tracing::info!(
+        %addr,
+        "client disconnected: sent={}, dropped={}, subs_opened={}, subs_closed={}",
+        conn.sent(),
+        conn.dropped(),
+        subs_opened,
+        subs_closed
+    );
 }
 
 /// Parse, verify, store and broadcast an EVENT message. Runs on the blocking
@@ -572,7 +583,7 @@ async fn handle_socket(
 fn process_event_message(
     text: &str,
     store: &Arc<EventStore>,
-    tx: &broadcast::Sender<Arc<crate::event::Event>>,
+    fanout: &Arc<Fanout>,
 ) -> Option<String> {
     match NostrMessage::from_json(text) {
         Ok(NostrMessage::Event { event, .. }) => {
@@ -582,7 +593,7 @@ fn process_event_message(
             let ok = match store.insert(ev.clone()) {
                 InsertResult::Ephemeral => {
                     tracing::debug!(id = %event_id, kind = ev.kind, "ephemeral event");
-                    let _ = tx.send(ev);
+                    fanout.publish(BroadcastEvent::new(ev));
                     NostrMessage::Ok {
                         id: event_id,
                         accepted: true,
@@ -604,7 +615,7 @@ fn process_event_message(
                         replaced = replaced.len(),
                         "event stored"
                     );
-                    let _ = tx.send(event);
+                    fanout.publish(BroadcastEvent::new(event));
                     NostrMessage::Ok {
                         id: event_id,
                         accepted: true,

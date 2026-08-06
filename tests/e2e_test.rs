@@ -7,12 +7,17 @@ use tungstenite::{Message, connect};
 
 /// Spawn a relay on a random available port and return the ws:// URL.
 async fn spawn_relay() -> String {
+    spawn_relay_with(Config::default()).await
+}
+
+/// Spawn a relay with an explicit config.
+async fn spawn_relay_with(config: Config) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
     let url = format!("ws://127.0.0.1:{}", addr.port());
-    let relay = Relay::new(Config::default());
+    let relay = Relay::new(config);
     let router = relay.router();
 
     let tcp = TokioTcpListener::bind(addr).await.unwrap();
@@ -265,4 +270,126 @@ async fn test_empty_query_returns_eose() {
     assert!(events.is_empty(), "expected no events for non-existent id");
 
     client.shutdown().await;
+}
+
+// ── idle connection reaping ───────────────────────────────────────────────────
+
+fn short_idle_config() -> Config {
+    Config {
+        idle_timeout: 1,
+        ..Config::default()
+    }
+}
+
+/// A connection that sends nothing at all must be closed once `idle_timeout`
+/// elapses, after a NOTICE explaining why.
+#[tokio::test]
+async fn test_idle_connection_is_reaped() {
+    let url = spawn_relay_with(short_idle_config()).await;
+
+    tokio::task::spawn_blocking(move || {
+        let (mut ws, _) = connect(&url).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        }
+
+        // Say nothing. Expect a NOTICE, then the socket to close.
+        let text = read_text(&mut ws);
+        let arr: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(arr[0], "NOTICE", "expected idle NOTICE, got: {}", text);
+        assert!(
+            arr[1].as_str().unwrap().contains("idle"),
+            "NOTICE should explain the idle close, got: {}",
+            text
+        );
+
+        // Next read must be a close / EOF rather than more traffic.
+        match ws.read() {
+            Ok(Message::Close(_)) | Err(_) => {}
+            Ok(other) => panic!("expected close after idle NOTICE, got: {:?}", other),
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// A write-only publisher (EVENT, never REQ) must NOT be reaped.
+#[tokio::test]
+async fn test_publisher_connection_is_not_reaped() {
+    let url = spawn_relay_with(short_idle_config()).await;
+
+    let keys = Keys::generate();
+    let event = EventBuilder::text_note("publisher keeps the connection")
+        .build(keys.public_key())
+        .sign(&keys)
+        .await
+        .unwrap();
+    let event_json = event.as_json();
+    let event_id = event.id.to_hex();
+
+    tokio::task::spawn_blocking(move || {
+        let (mut ws, _) = connect(&url).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        }
+
+        ws.send(Message::Text(format!(r#"["EVENT",{}]"#, event_json).into()))
+            .unwrap();
+        let text = read_text(&mut ws);
+        assert!(text.starts_with(r#"["OK""#), "expected OK, got: {}", text);
+
+        // Sit well past the idle window without sending a REQ.
+        std::thread::sleep(Duration::from_millis(2500));
+
+        // Connection must still be usable.
+        ws.send(Message::Text(
+            format!(r#"["REQ","late",{{"ids":["{}"]}}]"#, event_id).into(),
+        ))
+        .unwrap();
+        let text = read_text(&mut ws);
+        let arr: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            arr[0], "EVENT",
+            "publisher connection was reaped or broken, got: {}",
+            text
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// A subscriber must not be reaped either, even with no further traffic.
+#[tokio::test]
+async fn test_subscriber_connection_is_not_reaped() {
+    let url = spawn_relay_with(short_idle_config()).await;
+
+    tokio::task::spawn_blocking(move || {
+        let (mut ws, _) = connect(&url).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        }
+
+        ws.send(Message::Text(r#"["REQ","s",{"kinds":[1]}]"#.into()))
+            .unwrap();
+        let text = read_text(&mut ws);
+        assert!(
+            text.starts_with(r#"["EOSE""#),
+            "expected EOSE, got: {}",
+            text
+        );
+
+        std::thread::sleep(Duration::from_millis(2500));
+
+        ws.send(Message::Text(r#"["CLOSE","s"]"#.into())).unwrap();
+        ws.send(Message::Text(r#"["REQ","s2",{"kinds":[1]}]"#.into()))
+            .unwrap();
+        let text = read_text(&mut ws);
+        assert!(
+            text.starts_with(r#"["EOSE""#),
+            "subscriber connection was reaped, got: {}",
+            text
+        );
+    })
+    .await
+    .unwrap();
 }

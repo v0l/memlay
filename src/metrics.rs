@@ -1,21 +1,42 @@
-use prometheus::{Counter, Encoder, Gauge, Histogram, TextEncoder, register_histogram};
+use prometheus::{
+    Counter, Encoder, Gauge, Histogram, TextEncoder, register_counter, register_gauge,
+    register_histogram,
+};
 
-// Gauge: Number of active WebSocket connections
+// NOTE: these must use the `register_*` macros, not `Gauge::new`/`Counter::new`.
+// The plain constructors do not attach the metric to the default registry, so
+// `prometheus::gather()` never sees them and they silently never appear on
+// /metrics.
 lazy_static::lazy_static! {
-    pub static ref ACTIVE_CONNECTIONS: Gauge = Gauge::new(
+    pub static ref ACTIVE_CONNECTIONS: Gauge = register_gauge!(
         "memlay_active_connections",
-        "Number of active WebSocket connections",
+        "Number of active WebSocket connections"
     ).expect("Failed to register active_connections gauge");
 
-    pub static ref EVENTS_SAVED: Counter = Counter::new(
+    pub static ref EVENTS_SAVED: Counter = register_counter!(
         "memlay_events_saved_total",
-        "Total number of events saved",
+        "Total number of events saved"
     ).expect("Failed to register events_saved counter");
 
-    pub static ref EVENTS_OUTPUT: Counter = Counter::new(
+    pub static ref EVENTS_OUTPUT: Counter = register_counter!(
         "memlay_events_output_total",
-        "Total number of events output",
+        "Total number of events output"
     ).expect("Failed to register events_output counter");
+
+    pub static ref IDLE_DISCONNECTS: Counter = register_counter!(
+        "memlay_idle_disconnects_total",
+        "Connections closed for sending no REQ or EVENT within the idle timeout"
+    ).expect("Failed to register idle_disconnects counter");
+
+    pub static ref SUBS_OVERFLOWED: Counter = register_counter!(
+        "memlay_subscriptions_overflowed_total",
+        "Subscriptions closed because the client could not keep up with live delivery"
+    ).expect("Failed to register subscriptions_overflowed counter");
+
+    pub static ref EVENTS_DROPPED: Counter = register_counter!(
+        "memlay_events_dropped_total",
+        "Live events dropped because a connection's send queue was full"
+    ).expect("Failed to register events_dropped counter");
 
     pub static ref WRITE_DELAY: Histogram = register_histogram!(
         "memlay_write_delay_seconds",
@@ -46,6 +67,21 @@ pub fn inc_events_output() {
     EVENTS_OUTPUT.inc();
 }
 
+/// Increment the idle-disconnect counter
+pub fn inc_idle_disconnects() {
+    IDLE_DISCONNECTS.inc();
+}
+
+/// Increment the overflowed-subscription counter
+pub fn inc_subs_overflowed() {
+    SUBS_OVERFLOWED.inc();
+}
+
+/// Increment the dropped live-event counter
+pub fn inc_events_dropped() {
+    EVENTS_DROPPED.inc();
+}
+
 /// Record a write delay
 pub fn observe_write_delay(duration: std::time::Duration) {
     WRITE_DELAY.observe(duration.as_secs_f64());
@@ -59,6 +95,21 @@ pub fn observe_tteose(duration: std::time::Duration) {
 /// Record disk persistence time
 pub fn observe_disk_persistence(duration: std::time::Duration) {
     DISK_PERSISTENCE_TIME.observe(duration.as_secs_f64());
+}
+
+/// Force-initialise every lazily-registered metric so they are exported at
+/// zero from startup instead of appearing only after the first occurrence.
+/// Without this, dashboards and alerts see a missing series rather than 0.
+pub fn init() {
+    lazy_static::initialize(&ACTIVE_CONNECTIONS);
+    lazy_static::initialize(&EVENTS_SAVED);
+    lazy_static::initialize(&EVENTS_OUTPUT);
+    lazy_static::initialize(&IDLE_DISCONNECTS);
+    lazy_static::initialize(&SUBS_OVERFLOWED);
+    lazy_static::initialize(&EVENTS_DROPPED);
+    lazy_static::initialize(&WRITE_DELAY);
+    lazy_static::initialize(&TTEOSE);
+    lazy_static::initialize(&DISK_PERSISTENCE_TIME);
 }
 
 /// Get Prometheus metrics in text format

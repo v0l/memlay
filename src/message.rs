@@ -32,6 +32,13 @@ pub enum NostrMessage {
         accepted: bool,
         message: String,
     },
+    /// ["CLOSED", "<sub_id>", "<message>"] — server-initiated subscription
+    /// termination (NIP-01). Used when a subscription is dropped because the
+    /// client could not keep up with live delivery.
+    Closed {
+        id: String,
+        message: String,
+    },
 }
 
 impl NostrMessage {
@@ -166,6 +173,9 @@ impl NostrMessage {
                     accepted,
                     json_str(message)
                 )
+            }
+            NostrMessage::Closed { id, message } => {
+                format!(r#"["CLOSED",{},{}]"#, json_str(id), json_str(message))
             }
         }
     }
