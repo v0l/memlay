@@ -1,5 +1,11 @@
 use crate::event::Event;
 
+/// Serialize a string as a JSON string literal (with surrounding quotes),
+/// properly escaping quotes, backslashes and control characters.
+fn json_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 /// Nostr protocol message types
 #[derive(Debug, Clone)]
 pub enum NostrMessage {
@@ -26,96 +32,104 @@ pub enum NostrMessage {
         accepted: bool,
         message: String,
     },
+    /// ["CLOSED", "<sub_id>", "<message>"] — server-initiated subscription
+    /// termination (NIP-01). Used when a subscription is dropped because the
+    /// client could not keep up with live delivery.
+    Closed {
+        id: String,
+        message: String,
+    },
 }
 
 impl NostrMessage {
-    /// Parse a Nostr message from a JSON string
+    /// Parse a Nostr message from a JSON string.
+    ///
+    /// Uses `RawValue` so the embedded event object is sliced out of the
+    /// original bytes and parsed exactly once (no intermediate `Value` tree,
+    /// no re-serialization on the hot ingest path).
     pub fn from_json(json: &str) -> Result<Self, String> {
-        let value: serde_json::Value =
+        use serde_json::value::RawValue;
+
+        let arr: Vec<&RawValue> =
             serde_json::from_str(json).map_err(|e| format!("JSON parse error: {}", e))?;
 
-        if let serde_json::Value::Array(arr) = value {
-            if arr.is_empty() {
-                return Err("Empty array".to_string());
-            }
+        if arr.is_empty() {
+            return Err("Empty array".to_string());
+        }
 
-            let msg_type = arr[0].as_str().ok_or("Invalid message type")?;
+        let msg_type: &str =
+            serde_json::from_str(arr[0].get()).map_err(|_| "Invalid message type".to_string())?;
 
-            match msg_type {
-                "EVENT" => {
-                    if arr.len() < 2 {
-                        return Err("Missing event data".to_string());
-                    }
-                    let event_json = &arr[1];
-                    let event = Event::from_json(
-                        &serde_json::to_vec(event_json)
-                            .map_err(|e| format!("Event serialise error: {}", e))?,
-                    )
-                    .map_err(|e| format!("{}", e))?;
-                    Ok(NostrMessage::Event {
-                        event,
-                        sub_id: None,
-                    })
+        match msg_type {
+            "EVENT" => {
+                if arr.len() < 2 {
+                    return Err("Missing event data".to_string());
                 }
-                "REQ" => {
-                    if arr.len() < 3 {
-                        return Err("Missing filters".to_string());
-                    }
-                    let id = arr[1]
-                        .as_str()
-                        .ok_or("Missing subscription ID")?
-                        .to_string();
-                    // NIP-01: ["REQ", "<id>", <filter1>, <filter2>, ...]
-                    let mut filters = Vec::new();
-                    for filter_json in &arr[2..] {
-                        let filter: crate::subscription::Filter =
-                            serde_json::from_value(filter_json.clone())
-                                .map_err(|e| format!("Invalid filter: {}", e))?;
-                        filters.push(filter);
-                    }
-                    Ok(NostrMessage::Request { id, filters })
-                }
-                "CLOSE" => {
-                    if arr.len() < 2 {
-                        return Err("Missing subscription ID".to_string());
-                    }
-                    let id = arr[1]
-                        .as_str()
-                        .ok_or("Invalid subscription ID")?
-                        .to_string();
-                    Ok(NostrMessage::Close { id })
-                }
-                "EOSE" => {
-                    if arr.len() < 2 {
-                        return Err("Missing EOSE id".to_string());
-                    }
-                    let id = arr[1].as_str().ok_or("Invalid EOSE id")?.to_string();
-                    Ok(NostrMessage::EndOfStoredEvents { id })
-                }
-                "NOTICE" => {
-                    if arr.len() < 2 {
-                        return Err("Missing notice message".to_string());
-                    }
-                    let message = arr[1].as_str().ok_or("Invalid notice message")?.to_string();
-                    Ok(NostrMessage::Notification { message })
-                }
-                "OK" => {
-                    if arr.len() < 4 {
-                        return Err("Missing OK fields".to_string());
-                    }
-                    let id = arr[1].as_str().ok_or("Invalid OK id")?.to_string();
-                    let accepted = arr[2].as_bool().ok_or("Invalid OK accepted field")?;
-                    let message = arr[3].as_str().ok_or("Invalid OK message")?.to_string();
-                    Ok(NostrMessage::Ok {
-                        id,
-                        accepted,
-                        message,
-                    })
-                }
-                _ => Err(format!("Unknown message type: {}", msg_type)),
+                // Parse straight from the event's original JSON bytes.
+                let event =
+                    Event::from_json(arr[1].get().as_bytes()).map_err(|e| format!("{}", e))?;
+                Ok(NostrMessage::Event {
+                    event,
+                    sub_id: None,
+                })
             }
-        } else {
-            Err("Expected JSON array".to_string())
+            "REQ" => {
+                if arr.len() < 3 {
+                    return Err("Missing filters".to_string());
+                }
+                let id: String = serde_json::from_str(arr[1].get())
+                    .map_err(|_| "Missing subscription ID".to_string())?;
+                // NIP-01: ["REQ", "<id>", <filter1>, <filter2>, ...]
+                let mut filters = Vec::with_capacity(arr.len() - 2);
+                for filter_json in &arr[2..] {
+                    let filter: crate::subscription::Filter =
+                        serde_json::from_str(filter_json.get())
+                            .map_err(|e| format!("Invalid filter: {}", e))?;
+                    filters.push(filter);
+                }
+                Ok(NostrMessage::Request { id, filters })
+            }
+            "CLOSE" => {
+                if arr.len() < 2 {
+                    return Err("Missing subscription ID".to_string());
+                }
+                let id: String = serde_json::from_str(arr[1].get())
+                    .map_err(|_| "Invalid subscription ID".to_string())?;
+                Ok(NostrMessage::Close { id })
+            }
+            "EOSE" => {
+                if arr.len() < 2 {
+                    return Err("Missing EOSE id".to_string());
+                }
+                let id: String = serde_json::from_str(arr[1].get())
+                    .map_err(|_| "Invalid EOSE id".to_string())?;
+                Ok(NostrMessage::EndOfStoredEvents { id })
+            }
+            "NOTICE" => {
+                if arr.len() < 2 {
+                    return Err("Missing notice message".to_string());
+                }
+                let message: String = serde_json::from_str(arr[1].get())
+                    .map_err(|_| "Invalid notice message".to_string())?;
+                Ok(NostrMessage::Notification { message })
+            }
+            "OK" => {
+                if arr.len() < 4 {
+                    return Err("Missing OK fields".to_string());
+                }
+                let id: String =
+                    serde_json::from_str(arr[1].get()).map_err(|_| "Invalid OK id".to_string())?;
+                let accepted: bool = serde_json::from_str(arr[2].get())
+                    .map_err(|_| "Invalid OK accepted field".to_string())?;
+                let message: String = serde_json::from_str(arr[3].get())
+                    .map_err(|_| "Invalid OK message".to_string())?;
+                Ok(NostrMessage::Ok {
+                    id,
+                    accepted,
+                    message,
+                })
+            }
+            _ => Err(format!("Unknown message type: {}", msg_type)),
         }
     }
 
@@ -135,23 +149,33 @@ impl NostrMessage {
             }
             NostrMessage::Request { id, filters } => {
                 let filters_json = serde_json::to_string(filters).unwrap_or_default();
-                format!(r#"["REQ","{}",{}]"#, id, filters_json)
+                format!(r#"["REQ",{},{}]"#, json_str(id), filters_json)
             }
             NostrMessage::Close { id } => {
-                format!(r#"["CLOSE","{}"]"#, id)
+                format!(r#"["CLOSE",{}]"#, json_str(id))
             }
             NostrMessage::EndOfStoredEvents { id } => {
-                format!(r#"["EOSE","{}"]"#, id)
+                format!(r#"["EOSE",{}]"#, json_str(id))
             }
             NostrMessage::Notification { message } => {
-                format!(r#"["NOTICE","{}"]"#, message)
+                // message may contain client-supplied text (e.g. parse errors);
+                // escape it via serde to avoid emitting malformed JSON.
+                format!(r#"["NOTICE",{}]"#, json_str(message))
             }
             NostrMessage::Ok {
                 id,
                 accepted,
                 message,
             } => {
-                format!(r#"["OK","{}",{},"{}"]"#, id, accepted, message)
+                format!(
+                    r#"["OK",{},{},{}]"#,
+                    json_str(id),
+                    accepted,
+                    json_str(message)
+                )
+            }
+            NostrMessage::Closed { id, message } => {
+                format!(r#"["CLOSED",{},{}]"#, json_str(id), json_str(message))
             }
         }
     }

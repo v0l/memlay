@@ -1,5 +1,6 @@
 pub mod config;
 pub mod event;
+pub mod fanout;
 pub mod message;
 pub mod metrics;
 pub mod relay;

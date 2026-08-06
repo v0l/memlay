@@ -155,18 +155,6 @@ impl Event {
         })
     }
 
-    /// Approximate memory size of this event
-    pub fn size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.raw.len()
-            + self.content.len()
-            + self
-                .tags
-                .iter()
-                .map(|t| t.name.len() + t.values.iter().map(|v| v.len()).sum::<usize>())
-                .sum::<usize>()
-    }
-
     /// Check if this is an ephemeral event (kind 20000-29999)
     /// Ephemeral events should NOT be stored, only broadcast to active subscribers
     pub fn is_ephemeral(&self) -> bool {

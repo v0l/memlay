@@ -15,6 +15,11 @@ max_subscriptions: 300
 # Maximum value a client may request for `limit` in a filter
 max_limit: 5000
 
+# Seconds a connection may stay completely silent (no REQ, no EVENT) before it
+# is closed. Reaps probe / half-open connection churn. Transport ping/pong does
+# not count as activity. Set to 0 to disable.
+idle_timeout: 10
+
 # Event persistence to disk (optional)
 # When set, events are saved to this directory and restored on restart
 # Set to null to disable persistence
@@ -28,3 +33,8 @@ max_limit: 5000
 # When set, /metrics endpoint will proxy requests to this Prometheus server
 # The landing page will also show a link to view metrics
 # prometheus_url: "http://localhost:9090/api/v1/query?query=up"
+
+# Directory for the rotating log file (optional)
+# When unset, logs are written to stdout only. When set, logs also go to
+# <log_dir>/memlay.log
+# log_dir: "/data"

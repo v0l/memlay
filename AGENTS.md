@@ -19,6 +19,7 @@ src/
 ├── message.rs       # Nostr message types (EVENT, REQ, CLOSE, EOSE, OK, NOTICE)
 ├── event.rs         # Event parsing, verification, serialization
 ├── subscription.rs  # Filter parsing, subscription management, query optimization
+├── fanout.rs        # Live-event router: connection registry + kind inverted index
 ├── config.rs        # Configuration loading (TOML/YAML/JSON + env vars)
 ├── store/
 │   ├── mod.rs       # Event store with LRU eviction
@@ -49,9 +50,16 @@ Query plan picks most selective index first:
 - Cross-filter: **AND** logic (must match all specified constraints)
 
 ### WebSocket Connection Handling
-- Per-connection subscription state stored in `conn_subs`
-- Relay-wide broadcast channel (`tx: broadcast::Sender`) for new events
-- Events pushed to all matching subscriptions across connections
+- Per-connection subscription state lives in `fanout::ConnState` (shared with the publisher)
+- Live delivery is **publisher-side**: `Fanout::publish` walks a kind inverted index and
+  touches only connections that could match. Idle connections cost nothing.
+- Event JSON is UTF-8 validated once per event (`BroadcastEvent.json: Arc<str>`), not per connection
+- Each connection has a bounded mpsc send queue (`CONN_SEND_CAP`); on overflow the affected
+  subscription gets a NIP-01 `CLOSED` so the client resubscribes instead of silently losing events
+- Slow peers are disconnected on a **drop rate** (drops per 10s window), not a raw counter
+- Connections that send **no client frame at all** (no REQ, no EVENT) within `idle_timeout`
+  seconds are closed with a NOTICE. Transport ping/pong does not count as activity, so
+  write-only publishers and quiet subscribers are unaffected. Set `idle_timeout: 0` to disable.
 - EOSE sent after initial query results
 
 ## Development Commands
@@ -327,7 +335,21 @@ RUST_LOG=debug cargo run --release
 ```bash
 curl -H "Accept: application/nostr+json" http://localhost:8080/
 curl http://localhost:8080/stats
+curl http://localhost:8080/metrics
 ```
+
+### Operational metrics
+| metric | meaning |
+|---|---|
+| `memlay_active_connections` | live WebSocket connections |
+| `memlay_events_output_total` | events written to client send queues |
+| `memlay_events_dropped_total` | live events dropped on a full connection queue |
+| `memlay_subscriptions_overflowed_total` | subs closed with `CLOSED` because the client fell behind |
+| `memlay_idle_disconnects_total` | connections reaped by `idle_timeout` |
+
+Note: counters/gauges must be created with `register_counter!` / `register_gauge!`, **not**
+`Counter::new` / `Gauge::new` — the plain constructors never attach to the default registry,
+so `prometheus::gather()` silently omits them.
 
 ## NIP-01 Filter Syntax Examples
 
@@ -363,12 +385,27 @@ curl http://localhost:8080/stats
 - Efficient memory usage for shared references
 - Clone is cheap (reference count increment)
 
-### Why broadcast channel for event delivery?
-- One-to-many fanout to all connections
-- Simple implementation
-- Backpressure via `lagged` error detection
+### Why publisher-side fanout instead of a broadcast channel?
+The original design gave every connection a `tokio::sync::broadcast` receiver. That woke
+*every* connection task for *every* event and re-validated the event body once per
+connection. In production it collapsed: 245 connections all lagged past the 16k channel
+buffer inside one second (~145k events missed) and the runtime spent all its time on wakeups,
+which showed up as connection churn and apparent hangs.
+
+`Fanout` inverts this: connections register, and the publishing thread routes an event only
+to connections whose subscriptions could match (kind inverted index). Measured with
+`cargo bench --bench fanout_bench`:
+
+| connections | old broadcast | new router | speedup |
+|---|---|---|---|
+| 1000 (50% idle) | 112 µs/event | 8.5 µs/event | **13x** |
+| 5000 (50% idle) | 568 µs/event | 50 µs/event | **11x** |
+| 5000 (all idle) | 217 µs/event | 0.16 µs/event | **1300x** |
+
+...and that excludes the per-connection task wakeup the old design paid on top.
 
 ### Why separate per-connection subscription state?
 - Connections can have multiple subscriptions
 - Isolation between connections
 - Clean disconnect handling
+- Kept in `Arc<ConnState>` so the publisher can match without touching the connection's task

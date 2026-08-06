@@ -90,3 +90,7 @@ harness = false
 [[bench]]
 name = "concurrent_map_bench"
 harness = false
+
+[[bench]]
+name = "fanout_bench"
+harness = false

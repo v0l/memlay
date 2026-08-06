@@ -16,6 +16,11 @@ pub struct Config {
     /// Maximum value a client may request for `limit` in a filter (advertised in NIP-11)
     #[serde(default = "default_max_limit")]
     pub max_limit: usize,
+    /// Seconds a connection may stay completely silent (no REQ, no EVENT) after
+    /// connecting before it is closed. Reaps probe/half-open connection churn
+    /// that would otherwise hold a slot and a task. 0 disables the timer.
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout: u64,
     /// Enable event persistence to disk (optional path)
     #[serde(default)]
     pub persistence_path: Option<String>,
@@ -26,6 +31,9 @@ pub struct Config {
     /// When set, /metrics endpoint will proxy to this server
     #[serde(default)]
     pub prometheus_url: Option<String>,
+    /// Directory for the rotating log file. When unset, logs go to stdout only.
+    #[serde(default)]
+    pub log_dir: Option<String>,
 }
 
 impl Config {
@@ -55,6 +63,10 @@ fn default_max_limit() -> usize {
     5000
 }
 
+fn default_idle_timeout() -> u64 {
+    10
+}
+
 fn default_persistence_interval() -> u64 {
     60
 }
@@ -67,9 +79,11 @@ impl Default for Config {
             max_bytes: 0,
             max_subscriptions: default_max_subscriptions(),
             max_limit: default_max_limit(),
+            idle_timeout: default_idle_timeout(),
             persistence_path: None,
             persistence_interval: default_persistence_interval(),
             prometheus_url: None,
+            log_dir: None,
         }
     }
 }

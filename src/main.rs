@@ -12,61 +12,93 @@ struct Cli {
     config: String,
 }
 
+/// Initialize tracing. Always logs to stdout; additionally writes to
+/// `<log_dir>/memlay.log` when `log_dir` is configured.
+fn init_logging(log_dir: Option<&str>) {
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_target(true);
+
+    let file_layer = log_dir.and_then(|dir| {
+        if let Err(e) = fs::create_dir_all(dir) {
+            eprintln!("Warning: failed to create log directory {dir}: {e}");
+            return None;
+        }
+        let log_file = Path::new(dir).join("memlay.log");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&log_file)
+        {
+            Ok(file) => Some(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(file)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_thread_ids(true)
+                    .with_target(true),
+            ),
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to open log file {}: {e}",
+                    log_file.display()
+                );
+                None
+            }
+        }
+    });
+
+    tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env())
+        .with(stdout_layer)
+        .with(file_layer)
+        .init();
+}
+
+/// Resolve when either SIGINT (Ctrl-C) or SIGTERM (container stop) arrives.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT"),
+        _ = terminate => tracing::info!("received SIGTERM"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    // Initialize file logging
-    let log_dir = "/data";
-    let log_file = Path::new(log_dir).join("memlay.log");
+    let cli = Cli::parse();
 
-    // Ensure log directory exists
-    if let Err(e) = fs::create_dir_all(log_dir) {
-        eprintln!("Warning: Failed to create log directory {}: {}", log_dir, e);
-    }
+    let config = Config::load(&cli.config).unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to load config from {}: {e}, using defaults",
+            cli.config
+        );
+        Config::default()
+    });
 
-    // Try to open log file, fallback to stdout only if failed
-    let file_result = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&log_file);
-
-    match file_result {
-        Ok(file) => {
-            // Set up file logging layer
-            let file_layer = tracing_subscriber::fmt::layer()
-                .with_writer(file)
-                .with_file(true)
-                .with_line_number(true)
-                .with_thread_ids(true)
-                .with_target(true);
-
-            // Set up stdout logging layer
-            let stdout_layer = tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stdout)
-                .with_file(true)
-                .with_line_number(true)
-                .with_thread_ids(true)
-                .with_target(true);
-
-            // Combine layers with env filter
-            tracing_subscriber::registry()
-                .with(EnvFilter::from_default_env())
-                .with(file_layer)
-                .with(stdout_layer)
-                .init();
-        }
-        Err(e) => {
-            eprintln!(
-                "Warning: Failed to open log file {}: {}",
-                log_file.display(),
-                e
-            );
-            // Fallback to stdout only
-            tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env())
-                .init();
-        }
-    }
+    init_logging(config.log_dir.as_deref());
 
     // Set file descriptor limits
     if let Ok((soft, hard)) = rlimit::getrlimit(rlimit::Resource::NOFILE) {
@@ -75,20 +107,9 @@ async fn main() {
                 tracing::warn!("Failed to set file descriptor limit: {}", e);
             }
         }
-
         let (soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap_or((soft, hard));
         tracing::info!("File descriptor limits: soft={}, hard={}", soft, hard);
     }
-
-    let cli = Cli::parse();
-
-    let config = Config::load(&cli.config).unwrap_or_else(|e| {
-        tracing::warn!(
-            "Failed to load config from {}: {e}, using defaults",
-            cli.config
-        );
-        Config::default()
-    });
 
     tracing::info!("Starting memlay relay on {}", config.bind_addr);
     tracing::debug!("Config: {config:?}");
@@ -101,9 +122,6 @@ async fn main() {
         .await
         .expect("Failed to bind");
 
-    // Graceful shutdown with persistence
-    let shutdown = tokio::signal::ctrl_c();
-
     tokio::select! {
         res = axum::serve(
             listener,
@@ -113,18 +131,22 @@ async fn main() {
                 tracing::error!("Server error: {}", e);
             }
         }
-        _ = shutdown => {
-            tracing::info!("Received shutdown signal");
+        _ = shutdown_signal() => {
+            tracing::info!("Shutting down");
         }
     }
 
-    // Save events to disk on shutdown
-    if let Some(ref path) = config.persistence_path {
-        tracing::info!(path, "Saving events to disk before shutdown...");
-        if let Err(e) = events.save_to_disk() {
-            tracing::error!(error = %e, "Failed to save events to disk");
-        } else {
-            tracing::info!(count = events.len(), "Events saved successfully");
+    // Persist on shutdown. A checkpoint folds the WAL into a fresh snapshot so
+    // the next start skips replaying a large log; fall back to a plain flush.
+    if config.persistence_path.is_some() {
+        tracing::info!("Persisting events to disk before shutdown...");
+        let result = events.checkpoint().or_else(|e| {
+            tracing::warn!(error = %e, "checkpoint failed, falling back to WAL flush");
+            events.save_to_disk()
+        });
+        match result {
+            Ok(_) => tracing::info!(count = events.len(), "events persisted successfully"),
+            Err(e) => tracing::error!(error = %e, "failed to persist events to disk"),
         }
     }
 }
