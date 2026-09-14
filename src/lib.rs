@@ -1,4 +1,5 @@
 pub mod config;
+pub mod deletion;
 pub mod event;
 pub mod fanout;
 pub mod message;

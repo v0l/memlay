@@ -52,6 +52,9 @@ pub enum InsertResult {
     Ephemeral,
     /// Event was a duplicate (already exists)
     Duplicate,
+    /// Event was previously deleted by a NIP-09 deletion request; rejected to
+    /// prevent resurrection of deleted events.
+    Deleted,
     /// Event was stored successfully
     Stored {
         /// The newly inserted event
@@ -311,6 +314,18 @@ impl EventStore {
         self.index.get(id).is_some()
     }
 
+    /// Write a NIP-09 delete record to the WAL before removing the event from
+    /// memory. On restart, replaying this record prevents a deleted event from
+    /// being resurrected from the snapshot: `delete_by_id` re-inserts the
+    /// tombstone, and insert() refuses tombstoned IDs.
+    pub fn record_deletion(&self, id: &[u8; 32]) {
+        if let Some(ref wal) = self.wal {
+            if let Err(e) = wal.delete(id) {
+                tracing::error!(error = %e, "failed to write NIP-09 delete to WAL");
+            }
+        }
+    }
+
     /// Insert a single event
     ///
     /// Returns InsertResult indicating:
@@ -334,6 +349,9 @@ impl EventStore {
         match outcome {
             InsertOutcome::Duplicate | InsertOutcome::LostRace => {
                 return InsertResult::Duplicate;
+            }
+            InsertOutcome::Deleted => {
+                return InsertResult::Deleted;
             }
             InsertOutcome::Inserted { replaced } => {
                 // Write to WAL if available
@@ -401,6 +419,7 @@ impl EventStore {
                     }
                 }
                 InsertOutcome::Duplicate | InsertOutcome::LostRace => {}
+                InsertOutcome::Deleted => {}
             }
         }
 
@@ -718,6 +737,11 @@ impl EventStore {
                 }
             },
             WalOp::Delete(id) => {
+                // NIP-09: a delete record re-arms the tombstone, so an event
+                // restored from the snapshot cannot be resurrected after
+                // restart. (Inserts replayed from the WAL after the delete are
+                // refused by the tombstone check in index.insert.)
+                self.index.tombstone(&id);
                 self.index.remove(&id);
                 applied += 1;
             }

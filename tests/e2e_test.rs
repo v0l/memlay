@@ -240,6 +240,187 @@ async fn test_wire_protocol() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn test_nip09_delete_by_id() {
+    let url = spawn_relay().await;
+    let client = make_client(&url).await;
+
+    // Publish a note.
+    let note = client
+        .send_event_builder(EventBuilder::text_note("delete me"))
+        .await
+        .unwrap();
+
+    // Deletion request referencing the note by ID (e-tag).
+    let del = client
+        .send_event_builder(EventBuilder::delete(
+            EventDeletionRequest::new().id(note.val),
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The deleted note must be gone.
+    let filter = Filter::new().id(note.val);
+    let events = client
+        .fetch_events(filter, Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert!(events.is_empty(), "note should be deleted after kind-5");
+
+    // The deletion request itself should be stored.
+    let filter = Filter::new().id(del.val);
+    let events = client
+        .fetch_events(filter, Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1, "deletion request should be stored");
+
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_nip09_deleted_event_cannot_be_republished() {
+    let url = spawn_relay().await;
+    let keys = Keys::generate();
+    let client = Client::new(keys.clone());
+    client.add_relay(url).await.unwrap();
+    client.connect().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Sign once, send — then re-send the identical event bytes.
+    let event = EventBuilder::text_note("gone")
+        .sign_with_keys(&keys)
+        .unwrap();
+    client.send_event(&event).await.unwrap();
+    let event_id = event.id;
+
+    client
+        .send_event_builder(EventBuilder::delete(
+            EventDeletionRequest::new().id(event_id),
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Re-publish the exact same event bytes over the wire — the relay must
+    // refuse to resurrect it (NIP-09 tombstone, OK=false).
+    let republish = client.send_event(&event).await.unwrap();
+    // nostr-sdk reports which relays accepted; the single relay should have
+    // rejected (tombstone), so its set must be empty.
+    assert!(
+        republish.success.is_empty(),
+        "relay must reject re-publication of a deleted event"
+    );
+
+    let events = client
+        .fetch_events(Filter::new().id(event_id), Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert!(events.is_empty(), "deleted note must stay deleted");
+
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_nip09_delete_by_coordinate() {
+    let url = spawn_relay().await;
+    let keys = Keys::generate();
+    let client = Client::new(keys.clone());
+    client.add_relay(url.clone()).await.unwrap();
+    client.connect().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Publish an addressable event (kind 30023, d-tag "post-1").
+    let addr = client
+        .send_event_builder(
+            EventBuilder::new(Kind::Custom(30023), "body").tag(Tag::identifier("post-1")),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let filter = Filter::new().kind(Kind::Custom(30023));
+    let events = client
+        .fetch_events(filter.clone(), Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "addressable event should exist before deletion"
+    );
+
+    // Delete by a-tag coordinate.
+    let coord = Coordinate::new(Kind::Custom(30023), keys.public_key()).identifier("post-1");
+    client
+        .send_event_builder(EventBuilder::delete(
+            EventDeletionRequest::new().coordinate(coord),
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let events = client
+        .fetch_events(filter, Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert!(
+        events.is_empty(),
+        "addressable event should be deleted by a-tag"
+    );
+
+    // Sanity: the original event ID no longer resolves either.
+    let by_id = client
+        .fetch_events(Filter::new().id(addr.val), Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert!(by_id.is_empty());
+
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_nip09_cannot_delete_another_authors_event() {
+    let url = spawn_relay().await;
+    let alice = make_client(&url).await;
+
+    let note = alice
+        .send_event_builder(EventBuilder::text_note("alice's note"))
+        .await
+        .unwrap();
+
+    // Bob (different keys) sends a deletion request for Alice's event.
+    let bob_keys = Keys::generate();
+    let bob = Client::new(bob_keys);
+    bob.add_relay(url).await.unwrap();
+    bob.connect().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    bob.send_event_builder(EventBuilder::delete(
+        EventDeletionRequest::new().id(note.val),
+    ))
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Alice's event must survive: NIP-09 only allows deleting your own events.
+    let filter = Filter::new().id(note.val);
+    let events = alice
+        .fetch_events(filter, Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1, "foreign deletion request must be ignored");
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
 fn read_text(
     ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
 ) -> String {

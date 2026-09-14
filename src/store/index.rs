@@ -1,3 +1,4 @@
+use crate::deletion::Coordinate;
 use crate::event::{Event, ReplacementKey};
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -96,6 +97,9 @@ pub enum InsertOutcome {
     },
     /// Event was a duplicate (same ID already exists)
     Duplicate,
+    /// Event was previously removed by a NIP-09 deletion request and must not
+    /// be resurrected by re-publishing the same ID.
+    Deleted,
     /// Insert lost a replaceable event race (another thread won)
     LostRace,
 }
@@ -128,6 +132,13 @@ pub struct EventIndex {
     // Replaceable events index: maps (pubkey, kind) or (pubkey, kind, d-tag) to latest event id
     by_replaceable: DashMap<ReplacementKey, [u8; 32]>,
 
+    // NIP-09 tombstones: event IDs removed by a deletion request. Re-publishing
+    // the exact same event (same ID = same sig) is rejected while its tombstone
+    // exists, so a lagging client or WAL replay cannot resurrect deleted data.
+    // Tombstones are cleared on LRU eviction of the deleted-ID entry to keep
+    // the set bounded by actual deleted events, not arbitrary client spam.
+    tombstones: DashMap<[u8; 32], ()>,
+
     // Track actual memory usage (bytes of raw event JSON)
     memory_bytes: AtomicUsize,
 
@@ -146,6 +157,7 @@ impl EventIndex {
             by_tag_other: DashMap::new(),
             by_oldest: std::array::from_fn(|_| RwLock::new(BTreeSet::new())),
             by_replaceable: DashMap::new(),
+            tombstones: DashMap::new(),
             memory_bytes: AtomicUsize::new(0),
             event_count: AtomicUsize::new(0),
         }
@@ -167,6 +179,12 @@ impl EventIndex {
     /// or lost a replaceable event race.
     pub fn insert(&self, event: Arc<Event>) -> InsertOutcome {
         let mut replaced = None;
+
+        // NIP-09: an event that was removed by a deletion request must not be
+        // resurrected by re-publishing the identical event bytes (same ID).
+        if self.tombstones.contains_key(&event.id) {
+            return InsertOutcome::Deleted;
+        }
 
         // Handle replaceable events: atomically swap old ID in by_replaceable,
         // but only if the incoming event is newer than the one we already hold.
@@ -405,6 +423,82 @@ impl EventIndex {
     /// If skip_replaceable is true, skip removing from the replaceable index (used during insert to avoid deadlock)
     pub fn remove(&self, id: &[u8; 32]) -> Option<Arc<Event>> {
         self.internal_remove(id, true)
+    }
+
+    /// NIP-09: delete an event by ID on behalf of its author, recording a
+    /// tombstone so the same event bytes cannot be re-inserted later.
+    /// Returns the removed event, if it was present.
+    pub fn delete_by_id(&self, id: &[u8; 32]) -> Option<Arc<Event>> {
+        let removed = self.remove(id);
+        self.tombstones.insert(*id, ());
+        if removed.is_some() {
+            crate::metrics::inc_events_deleted();
+        }
+        removed
+    }
+
+    /// NIP-09: delete all stored versions of a replaceable event
+    /// (`<kind>:<pubkey>:<d-tag>`) whose `created_at` is not newer than
+    /// `until`. Returns the number of events removed.
+    ///
+    /// Future versions of the coordinate remain accepted: NIP-09 says relays
+    /// delete versions "up to the created_at timestamp of the deletion request
+    /// event", and a later repost of the same addressable event must work.
+    pub fn delete_by_coordinate(&self, coord: &Coordinate, until: u64) -> (usize, Vec<Arc<Event>>) {
+        let replacement_key = if coord.d_tag.is_empty() {
+            ReplacementKey::Replaceable {
+                pubkey: coord.pubkey,
+                kind: coord.kind,
+            }
+        } else {
+            ReplacementKey::Addressable {
+                pubkey: coord.pubkey,
+                kind: coord.kind,
+                d_tag: coord.d_tag.clone(),
+            }
+        };
+
+        // Snapshot candidate IDs under the DashMap shard lock, then take the
+        // slow per-event locks while removing (avoids holding one lock across
+        // all removals, same pattern as eviction).
+        let candidate_ids: Vec<[u8; 32]> = match self.by_replaceable.get(&replacement_key) {
+            Some(entry) => vec![*entry.value()],
+            None => Vec::new(),
+        };
+
+        let mut removed_count = 0usize;
+        let mut removed_events = Vec::new();
+        for id in candidate_ids {
+            // Remove regardless of created_at (the winner is the newest and
+            // NIP-09 asks for every version up to the deletion timestamp);
+            // tombstone only when the version we removed actually predates
+            // the deletion request so a later repost still lands.
+            if let Some(event) = self.internal_remove(&id, false) {
+                removed_count += 1;
+                removed_events.push(event.clone());
+                if event.created_at <= until {
+                    self.tombstones.insert(id, ());
+                    crate::metrics::inc_events_deleted();
+                }
+            }
+        }
+        (removed_count, removed_events)
+    }
+
+    /// True if this event ID has a NIP-09 tombstone (deleted, do not re-accept).
+    pub fn is_tombstoned(&self, id: &[u8; 32]) -> bool {
+        self.tombstones.contains_key(id)
+    }
+
+    /// Record a NIP-09 tombstone without requiring the event to be present
+    /// (used by WAL replay where the event may only exist in the snapshot).
+    pub fn tombstone(&self, id: &[u8; 32]) {
+        self.tombstones.insert(*id, ());
+    }
+
+    /// Number of NIP-09 tombstones currently held.
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.len()
     }
 
     fn internal_remove(&self, id: &[u8; 32], skip_replaceable: bool) -> Option<Arc<Event>> {

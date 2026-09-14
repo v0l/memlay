@@ -38,6 +38,16 @@ lazy_static::lazy_static! {
         "Live events dropped because a connection's send queue was full"
     ).expect("Failed to register events_dropped counter");
 
+    pub static ref EVENTS_DELETED: Counter = register_counter!(
+        "memlay_events_deleted_total",
+        "Events removed by NIP-09 deletion requests"
+    ).expect("Failed to register events_deleted counter");
+
+    pub static ref DELETION_REQUESTS: Counter = register_counter!(
+        "memlay_deletion_requests_total",
+        "NIP-09 kind-5 deletion requests accepted"
+    ).expect("Failed to register deletion_requests counter");
+
     pub static ref WRITE_DELAY: Histogram = register_histogram!(
         "memlay_write_delay_seconds",
         "Histogram of write delay in seconds",
@@ -82,6 +92,16 @@ pub fn inc_events_dropped() {
     EVENTS_DROPPED.inc();
 }
 
+/// Increment the NIP-09 deleted-events counter
+pub fn inc_events_deleted() {
+    EVENTS_DELETED.inc();
+}
+
+/// Increment the NIP-09 accepted-deletion-requests counter
+pub fn inc_deletion_requests() {
+    DELETION_REQUESTS.inc();
+}
+
 /// Record a write delay
 pub fn observe_write_delay(duration: std::time::Duration) {
     WRITE_DELAY.observe(duration.as_secs_f64());
@@ -107,6 +127,8 @@ pub fn init() {
     lazy_static::initialize(&IDLE_DISCONNECTS);
     lazy_static::initialize(&SUBS_OVERFLOWED);
     lazy_static::initialize(&EVENTS_DROPPED);
+    lazy_static::initialize(&EVENTS_DELETED);
+    lazy_static::initialize(&DELETION_REQUESTS);
     lazy_static::initialize(&WRITE_DELAY);
     lazy_static::initialize(&TTEOSE);
     lazy_static::initialize(&DISK_PERSISTENCE_TIME);
