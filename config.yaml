@@ -20,6 +20,12 @@ max_limit: 5000
 # not count as activity. Set to 0 to disable.
 idle_timeout: 10
 
+# Reverse proxies whose X-Forwarded-For / X-Real-IP headers may be believed,
+# as CIDRs or bare IPs. Leave empty when clients connect directly: the headers
+# are trivially forged, so they are only read when the peer address matches.
+# trusted_proxies:
+#   - "10.244.0.0/16"
+
 # Event persistence to disk (optional)
 # When set, events are saved to this directory and restored on restart
 # Set to null to disable persistence

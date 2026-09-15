@@ -4,6 +4,7 @@ pub mod event;
 pub mod fanout;
 pub mod message;
 pub mod metrics;
+pub mod proxy;
 pub mod relay;
 pub mod store;
 pub mod subscription;

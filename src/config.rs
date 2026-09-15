@@ -27,6 +27,12 @@ pub struct Config {
     /// Background persistence interval in seconds (default: 60)
     #[serde(default = "default_persistence_interval")]
     pub persistence_interval: u64,
+    /// CIDRs (or plain IPs) of reverse proxies whose `X-Forwarded-For` /
+    /// `X-Real-IP` headers may be believed. Empty means the peer address of
+    /// the TCP connection is always used, which is the safe default: a client
+    /// can send any header it likes.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
     /// Prometheus server URL to proxy metrics requests (optional)
     /// When set, /metrics endpoint will proxy to this server
     #[serde(default)]
@@ -82,6 +88,7 @@ impl Default for Config {
             idle_timeout: default_idle_timeout(),
             persistence_path: None,
             persistence_interval: default_persistence_interval(),
+            trusted_proxies: Vec::new(),
             prometheus_url: None,
             log_dir: None,
         }

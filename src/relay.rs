@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::event::Event;
 use crate::fanout::{BroadcastEvent, Fanout};
 use crate::message::NostrMessage;
+use crate::proxy::TrustedProxies;
 use crate::store::{EventStore, InsertResult, StoreConfig};
 use crate::subscription::{Filter, SubscriptionManager};
 use axum::{
@@ -45,6 +46,7 @@ struct AppState {
     config: Config,
     connection_count: Arc<AtomicUsize>,
     verify_sem: Arc<Semaphore>,
+    trusted_proxies: TrustedProxies,
 }
 
 pub struct Relay {
@@ -118,6 +120,7 @@ impl Relay {
             config: self.config.clone(),
             connection_count: self.connection_count.clone(),
             verify_sem: Arc::new(Semaphore::new(verify_permits())),
+            trusted_proxies: TrustedProxies::parse(&self.config.trusted_proxies),
         });
 
         Router::new()
@@ -149,6 +152,8 @@ async fn root_handler(
     if wants_info {
         return nip11_handler(&state.config).into_response();
     }
+
+    let addr = state.trusted_proxies.client_addr(addr, &headers);
 
     match ws {
         Ok(ws) => {
