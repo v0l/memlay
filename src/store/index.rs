@@ -722,6 +722,13 @@ impl EventIndex {
         self.memory_bytes.load(AtomicOrdering::Relaxed)
     }
 
+    /// Inflate the payload accounting without storing events, so memory-budget
+    /// behaviour can be exercised without allocating gigabytes.
+    #[cfg(test)]
+    pub fn add_memory_bytes_for_test(&self, bytes: usize) {
+        self.memory_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+    }
+
     /// Get event count (lock-free)
     pub fn event_count(&self) -> usize {
         self.event_count.load(AtomicOrdering::Relaxed)

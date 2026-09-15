@@ -263,10 +263,14 @@ impl EventStore {
         if payload < MIN_AMPLIFICATION_SAMPLE_BYTES || rss == 0 {
             return;
         }
-        let observed = (rss.saturating_mul(1000) / payload).clamp(1000, 16_000);
-        let previous = self.amplification_milli.load(Ordering::Relaxed);
-        let smoothed = previous + (observed as i64 - previous as i64) as u64 / 8;
-        self.amplification_milli.store(smoothed, Ordering::Relaxed);
+        let observed = (rss.saturating_mul(1000) / payload).clamp(1000, 16_000) as i64;
+        let previous = self.amplification_milli.load(Ordering::Relaxed) as i64;
+        // Signed throughout: a falling ratio makes the delta negative, and
+        // doing this in u64 wraps to an astronomical amplification that zeroes
+        // the budget.
+        let smoothed = (previous + (observed - previous) / 8).clamp(1000, 16_000);
+        self.amplification_milli
+            .store(smoothed as u64, Ordering::Relaxed);
     }
 
     /// Payload bytes the store may hold before the process is expected to reach
@@ -1653,6 +1657,36 @@ mod tests {
         // which would over-commit rather than under-commit.
         store.amplification_milli.store(1, Ordering::Relaxed);
         assert_eq!(store.payload_budget(), 1024);
+    }
+
+    #[test]
+    fn amplification_converges_from_both_directions() {
+        let store = store_with_limit(8 * 1024 * 1024 * 1024);
+        let payload = 1024 * 1024 * 1024u64; // 1 GiB, over the sample threshold
+
+        // Force the payload accounting up to the sample threshold.
+        store.index.add_memory_bytes_for_test(payload as usize);
+
+        // Falling ratio: RSS below the current 4.0 estimate must not wrap.
+        for _ in 0..64 {
+            store.sample_amplification(payload * 2);
+        }
+        assert!(
+            (store.amplification() - 2.0).abs() < 0.1,
+            "got {}",
+            store.amplification()
+        );
+        assert!(store.payload_budget() > 0);
+
+        // Rising ratio converges too.
+        for _ in 0..64 {
+            store.sample_amplification(payload * 6);
+        }
+        assert!(
+            (store.amplification() - 6.0).abs() < 0.1,
+            "got {}",
+            store.amplification()
+        );
     }
 
     #[test]
