@@ -205,13 +205,16 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     (headers, axum::Json(body))
 }
 
+/// NIPs this relay implements, advertised in NIP-11 and on the landing page.
+const SUPPORTED_NIPS: &[u16] = &[1, 9, 11];
+
 fn nip11_handler(config: &Config) -> impl IntoResponse {
     let body = serde_json::json!({
         "name": "memlay",
         "description": "High-performance in-memory Nostr relay",
         "software": "https://github.com/v0l/memlay",
         "version": env!("CARGO_PKG_VERSION"),
-        "supported_nips": [1, 9, 11],
+        "supported_nips": SUPPORTED_NIPS,
         "limitation": {
             "max_subscriptions": config.max_subscriptions,
             "max_limit": config.max_limit,
@@ -250,6 +253,12 @@ fn landing_page(_config: &Config) -> impl IntoResponse {
     </div>
   </section>"#;
     html = html.replace("{{METRICS_SECTION}}", metrics_section);
+
+    let nips: String = SUPPORTED_NIPS
+        .iter()
+        .map(|nip| format!("<span class=\"pill\">NIP-{nip:02}</span>"))
+        .collect();
+    html = html.replace("{{NIPS}}", &nips);
 
     let mut headers = HeaderMap::new();
     headers.insert(
