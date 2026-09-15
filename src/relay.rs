@@ -201,6 +201,8 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         "tombstones": events.tombstone_count(),
         "store_bytes": store_memory,
         "max_bytes": cfg.max_bytes,
+        "payload_budget": events.payload_budget(),
+        "amplification": events.amplification(),
         "process_memory": events.cached_process_memory(),
         "memory_limit": cfg.max_bytes,
         "memory_used": store_memory,

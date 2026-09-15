@@ -40,6 +40,14 @@ fn get_total_memory() -> u64 {
     sys.total_memory()
 }
 
+/// Starting guess for the RSS / payload-bytes ratio, used until the store
+/// holds enough events to measure one. Deliberately conservative: guessing too
+/// low over-commits memory, guessing too high only costs capacity.
+const DEFAULT_AMPLIFICATION_MILLI: u64 = 4000;
+
+/// Payload bytes required before the amplification measurement is trusted.
+const MIN_AMPLIFICATION_SAMPLE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Adaptive eviction state
 struct EvictionState {
     interval_seconds: AtomicUsize,
@@ -74,6 +82,11 @@ pub struct EventStore {
     /// Cached RSS in bytes, updated by a background task. Avoids expensive
     /// `refresh_processes()` calls in the hot eviction path.
     cached_rss_bytes: AtomicU64,
+    /// Measured RSS / payload-bytes ratio, in thousandths. Indexes, allocator
+    /// slack and per-event `Arc` overhead mean the process is several times
+    /// larger than the raw JSON the store accounts for; production runs sit
+    /// near 3.8x. Sampled alongside RSS and used to size the payload budget.
+    amplification_milli: AtomicU64,
 }
 
 impl StoreConfig {
@@ -153,6 +166,7 @@ impl EventStore {
             },
             wal,
             cached_rss_bytes: AtomicU64::new(Self::read_rss_bytes()),
+            amplification_milli: AtomicU64::new(DEFAULT_AMPLIFICATION_MILLI),
         }
     }
 
@@ -191,6 +205,7 @@ impl EventStore {
                 loop {
                     let rss = Self::read_rss_bytes();
                     store.cached_rss_bytes.store(rss, Ordering::Relaxed);
+                    store.sample_amplification(rss);
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             });
@@ -236,6 +251,46 @@ impl EventStore {
         sys.process(pid).map(|p| p.memory()).unwrap_or(0)
     }
 
+    /// Update the RSS / payload ratio from a fresh RSS sample.
+    ///
+    /// Only sampled once the store holds enough to be representative: with a
+    /// near-empty store the binary's own footprint dominates and the ratio is
+    /// meaningless. Moves in eighths so a transient spike cannot collapse the
+    /// budget, and is clamped to a range that keeps the budget sane even if the
+    /// measurement is wrong.
+    fn sample_amplification(&self, rss: u64) {
+        let payload = self.index.memory_bytes() as u64;
+        if payload < MIN_AMPLIFICATION_SAMPLE_BYTES || rss == 0 {
+            return;
+        }
+        let observed = (rss.saturating_mul(1000) / payload).clamp(1000, 16_000);
+        let previous = self.amplification_milli.load(Ordering::Relaxed);
+        let smoothed = previous + (observed as i64 - previous as i64) as u64 / 8;
+        self.amplification_milli.store(smoothed, Ordering::Relaxed);
+    }
+
+    /// Payload bytes the store may hold before the process is expected to reach
+    /// `max_bytes` of RSS.
+    ///
+    /// `max_bytes` is derived from `target_ram_percent` of the cgroup limit, so
+    /// it is a budget for the *process*, not for event JSON. Comparing it
+    /// directly against payload bytes over-commits by whatever the measured
+    /// amplification is (3.8x in production), which leaves RSS as the only real
+    /// backstop and makes eviction fire far too late.
+    pub fn payload_budget(&self) -> usize {
+        let max_bytes = self.config.max_bytes;
+        if max_bytes == 0 {
+            return 0;
+        }
+        let amp = self.amplification_milli.load(Ordering::Relaxed).max(1000);
+        ((max_bytes as u64 * 1000) / amp) as usize
+    }
+
+    /// Measured RSS / payload ratio, for `/stats`.
+    pub fn amplification(&self) -> f64 {
+        self.amplification_milli.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+
     /// Background eviction check with adaptive interval and batch eviction.
     /// Uses cached_rss_bytes (updated by background sampler) instead of
     /// calling refresh_processes() directly, eliminating the Mutex bottleneck.
@@ -250,23 +305,26 @@ impl EventStore {
 
         // Use cached RSS from background sampler (lock-free, no refresh_processes)
         let process_mem = self.cached_rss_bytes.load(Ordering::Relaxed);
+        let budget = self.payload_budget();
 
         // Adaptive interval: evict more frequently when close to limit
-        let new_interval = if current_mem >= max_bytes * 70 / 100 || process_mem >= max_bytes as u64
-        {
-            1 // 1s when over 70% or RSS over limit
-        } else if current_mem >= max_bytes * 50 / 100 {
-            2 // 2s when 50-70% of limit
+        let new_interval = if current_mem >= budget * 90 / 100 || process_mem >= max_bytes as u64 {
+            1 // 1s when near the payload budget or RSS over limit
+        } else if current_mem >= budget * 70 / 100 {
+            2 // 2s when 70-90% of budget
         } else {
-            5 // 5s when under 50% of limit
+            5 // 5s when under 70% of budget
         };
         self.state
             .interval_seconds
             .store(new_interval, Ordering::Relaxed);
 
-        let target = max_bytes * 50 / 100;
+        // Evict down to a little under the budget rather than halving the
+        // store: the budget already accounts for index overhead, so a deep cut
+        // just throws away events that fit.
+        let target = budget * 90 / 100;
 
-        // Evict if tracked memory is over target OR if actual process memory exceeds limit
+        // Evict if payload is over target OR if actual process memory exceeds limit
         if current_mem > target || process_mem > max_bytes as u64 {
             let batch_size = if process_mem > max_bytes as u64 {
                 5000
@@ -1562,5 +1620,49 @@ mod tests {
         }
         // Leftover segment is cleaned up after recovery.
         assert!(!old_wal.exists(), "rotated segment removed after recovery");
+    }
+
+    fn store_with_limit(max_bytes: usize) -> EventStore {
+        EventStore::new(StoreConfig {
+            max_bytes,
+            persistence_path: None,
+            use_wal: false,
+        })
+    }
+
+    #[test]
+    fn payload_budget_discounts_index_overhead() {
+        let store = store_with_limit(8 * 1024 * 1024 * 1024);
+
+        // Before any measurement the conservative default applies.
+        assert_eq!(store.amplification(), 4.0);
+        assert_eq!(store.payload_budget(), 2 * 1024 * 1024 * 1024);
+
+        // A process twice the size of its payload may hold half the limit.
+        store.amplification_milli.store(2000, Ordering::Relaxed);
+        assert_eq!(store.payload_budget(), 4 * 1024 * 1024 * 1024);
+
+        // No limit configured means no budget to enforce.
+        assert_eq!(store_with_limit(0).payload_budget(), 0);
+    }
+
+    #[test]
+    fn payload_budget_never_exceeds_the_limit() {
+        let store = store_with_limit(1024);
+        // A ratio below 1.0 would imply payload larger than the whole process,
+        // which would over-commit rather than under-commit.
+        store.amplification_milli.store(1, Ordering::Relaxed);
+        assert_eq!(store.payload_budget(), 1024);
+    }
+
+    #[test]
+    fn amplification_ignores_an_empty_store() {
+        let store = store_with_limit(8 * 1024 * 1024 * 1024);
+        store.sample_amplification(900 * 1024 * 1024);
+        assert_eq!(
+            store.amplification(),
+            4.0,
+            "ratio from a near-empty store is the binary's own footprint"
+        );
     }
 }
