@@ -19,23 +19,49 @@ const OLDEST_SHARDS: usize = 64;
 /// means a very old deleted event could be re-published.
 const MAX_TOMBSTONES: usize = 262_144;
 
+/// Hasher for keys that are already uniformly random (event IDs). Takes the
+/// first 8 bytes instead of running SipHash over all 32.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.len() >= 8 {
+            self.0 = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type IdHashBuilder = std::hash::BuildHasherDefault<IdHasher>;
+
 /// Bounded FIFO set of deleted event IDs (NIP-09 anti-resurrection).
+///
+/// `contains` sits on the insert hot path, so the common case (no deletions
+/// yet) is a single relaxed load and the rest is an identity-hashed lookup.
 struct Tombstones {
-    ids: DashMap<[u8; 32], ()>,
+    count: AtomicUsize,
+    ids: DashMap<[u8; 32], (), IdHashBuilder>,
     order: Mutex<VecDeque<[u8; 32]>>,
 }
 
 impl Tombstones {
     fn new() -> Self {
         Self {
-            ids: DashMap::new(),
+            count: AtomicUsize::new(0),
+            ids: DashMap::with_hasher(IdHashBuilder::default()),
             order: Mutex::new(VecDeque::new()),
         }
     }
 
     #[inline]
     fn contains(&self, id: &[u8; 32]) -> bool {
-        self.ids.contains_key(id)
+        self.count.load(AtomicOrdering::Relaxed) != 0 && self.ids.contains_key(id)
     }
 
     fn insert(&self, id: &[u8; 32]) {
@@ -49,6 +75,7 @@ impl Tombstones {
                 self.ids.remove(&evicted);
             }
         }
+        self.count.store(self.ids.len(), AtomicOrdering::Relaxed);
     }
 
     fn len(&self) -> usize {
@@ -1121,15 +1148,17 @@ mod tests {
     #[test]
     fn test_tombstones_are_capped() {
         let tombstones = Tombstones::new();
+        // Event IDs are SHA-256 outputs; spread the test ids the same way so
+        // the identity hasher behaves as it does in production.
         let first = {
-            let mut arr = [0u8; 32];
-            arr[0] = 1;
-            arr
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+            id
         };
         tombstones.insert(&first);
         for i in 0..MAX_TOMBSTONES as u64 {
             let mut id = [0u8; 32];
-            id[8..16].copy_from_slice(&i.to_le_bytes());
+            id[..8].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
             tombstones.insert(&id);
             tombstones.insert(&id); // repeats must not consume capacity
         }
