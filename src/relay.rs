@@ -193,6 +193,7 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     let store_memory = events.memory_bytes();
     let body = serde_json::json!({
         "events": events.len(),
+        "tombstones": events.tombstone_count(),
         "store_bytes": store_memory,
         "max_bytes": cfg.max_bytes,
         "process_memory": events.cached_process_memory(),
@@ -659,47 +660,29 @@ fn apply_deletion_request(
     fanout: &Arc<Fanout>,
 ) -> String {
     let event_id = hex::encode(ev.id);
+
+    // Replaying a deletion request must not re-run the (unbounded) reference
+    // walk: once we hold it, or once it has itself been deleted, answer from
+    // the store alone.
+    if store.contains(&ev.id) {
+        return NostrMessage::Ok {
+            id: event_id,
+            accepted: true,
+            message: "duplicate: already have this event".to_string(),
+        }
+        .to_json();
+    }
+    if store.is_tombstoned(&ev.id) {
+        return NostrMessage::Ok {
+            id: event_id,
+            accepted: false,
+            message: "deleted: this event was removed by a deletion request".to_string(),
+        }
+        .to_json();
+    }
+
     let req = ev.deletion_request();
-    let mut outcome = crate::deletion::DeletionOutcome::default();
-
-    // e-tags: delete by ID, but only events authored by the requester
-    // (NIP-09: relays delete events with an identical pubkey only).
-    for id in &req.ids {
-        let is_foreign = match store.get(id) {
-            Some(existing) => existing.pubkey != ev.pubkey,
-            None => true,
-        };
-        if is_foreign {
-            // Not present, or belongs to someone else — nothing to remove.
-            if store.get(id).is_some() {
-                outcome.skipped_foreign += 1;
-            }
-            continue;
-        }
-        // Write a WAL delete record first so a crash between the WAL append
-        // and the in-memory removal replays the delete on restart.
-        store.record_deletion(id);
-        if store.index.delete_by_id(id).is_some() {
-            outcome.deleted_ids.push(*id);
-        }
-    }
-
-    // a-tags: delete every version of the coordinate up to this event's
-    // created_at (NIP-09 §a tags).
-    for coord in &req.coordinates {
-        if coord.pubkey != ev.pubkey {
-            outcome.skipped_foreign += 1;
-            continue;
-        }
-        let (count, removed) = store.index.delete_by_coordinate(coord, ev.created_at);
-        if count == 0 {
-            outcome.unknown_coordinates += 1;
-        }
-        for event in &removed {
-            store.record_deletion(&event.id);
-        }
-        outcome.deleted_ids.extend(removed.iter().map(|e| e.id));
-    }
+    let outcome = store.apply_deletion(&req, &ev.pubkey, ev.created_at);
 
     crate::metrics::inc_deletion_requests();
 
@@ -715,7 +698,12 @@ fn apply_deletion_request(
     // hold the referenced events learn about the deletion (NIP-09: relays
     // SHOULD continue to publish deletion requests indefinitely).
     let ok = match store.insert(ev.clone()) {
-        InsertResult::Ephemeral | InsertResult::Duplicate | InsertResult::Deleted => {
+        InsertResult::Deleted => NostrMessage::Ok {
+            id: event_id,
+            accepted: false,
+            message: "deleted: this event was removed by a deletion request".to_string(),
+        },
+        InsertResult::Ephemeral | InsertResult::Duplicate => {
             fanout.publish(BroadcastEvent::new(ev.clone()));
             NostrMessage::Ok {
                 id: event_id,

@@ -385,6 +385,51 @@ async fn test_nip09_delete_by_coordinate() {
 }
 
 #[tokio::test]
+async fn test_nip09_older_deletion_request_spares_newer_version() {
+    let url = spawn_relay().await;
+    let keys = Keys::generate();
+    let client = Client::new(keys.clone());
+    client.add_relay(url.clone()).await.unwrap();
+    client.connect().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let now = Timestamp::now();
+    let addr = client
+        .send_event_builder(
+            EventBuilder::new(Kind::Custom(30023), "v2")
+                .tag(Tag::identifier("post-1"))
+                .custom_created_at(now),
+        )
+        .await
+        .unwrap();
+
+    // A deletion request stamped before the stored version must not remove it:
+    // NIP-09 deletes versions up to the request's created_at.
+    let coord = Coordinate::new(Kind::Custom(30023), keys.public_key()).identifier("post-1");
+    client
+        .send_event_builder(
+            EventBuilder::delete(EventDeletionRequest::new().coordinate(coord))
+                .custom_created_at(now - 3600u64),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let events = client
+        .fetch_events(Filter::new().id(addr.val), Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "a version newer than the deletion request must survive"
+    );
+
+    client.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_nip09_cannot_delete_another_authors_event() {
     let url = spawn_relay().await;
     let alice = make_client(&url).await;

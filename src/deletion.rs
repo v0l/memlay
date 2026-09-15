@@ -10,7 +10,8 @@
 //!   References to other users' events are ignored.
 //! - `e` tags remove the referenced event by ID.
 //! - `a` tags remove every stored version of the replaceable event up to the
-//!   deletion request's `created_at` timestamp.
+//!   deletion request's `created_at` timestamp. A version newer than the
+//!   request survives, so a repost still lands after a late delete.
 //! - The deletion request event itself is stored and served like any other
 //!   event, so clients that already have the referenced events can hide them
 //!   (NIP-09: relays SHOULD continue to publish deletion requests).
@@ -18,9 +19,18 @@
 //!   has no effect beyond removing that request event itself.
 //!
 //! Anti-resurrection: once an event ID has been deleted, a re-publish of the
-//! same ID is rejected as a duplicate. Without this, a lagging client (or a
-//! WAL replay after restart) could restore a deleted event, which would defeat
-//! the whole point of the deletion request.
+//! same ID is rejected. Without this, a lagging client (or a WAL replay after
+//! restart) could restore a deleted event, which would defeat the whole point
+//! of the deletion request. Two limits are deliberate:
+//!
+//! - Tombstones are a bounded FIFO (see `MAX_TOMBSTONES` in `store::index`),
+//!   so a very old deleted event can be re-published once its tombstone ages
+//!   out. They are also not part of the snapshot, so a checkpoint plus restart
+//!   forgets them; the deleted events are gone from the snapshot either way.
+//! - Deleting an event the relay does not hold records nothing, because anyone
+//!   can name any event ID and tombstoning on hearsay would let a client flush
+//!   the bounded set. A deletion request that arrives *before* its event does
+//!   not stop that event from landing.
 
 use crate::event::Event;
 use std::collections::HashSet;
