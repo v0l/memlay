@@ -18,6 +18,9 @@ pub enum WalOp {
     Insert(Vec<u8>),
     /// Delete an event by ID (32 bytes)
     Delete([u8; 32]),
+    /// NIP-09 deletion of an event by ID (32 bytes). Replayed as a delete that
+    /// also re-arms the tombstone, unlike a replacement or eviction delete.
+    Tombstone([u8; 32]),
 }
 
 /// Write-Ahead Log for persistent event storage
@@ -75,6 +78,7 @@ impl WriteAheadLog {
         match op {
             WalOp::Insert(_) => file.write_all(&[0u8])?,
             WalOp::Delete(_) => file.write_all(&[1u8])?,
+            WalOp::Tombstone(_) => file.write_all(&[2u8])?,
         }
 
         match op {
@@ -85,7 +89,7 @@ impl WriteAheadLog {
                 // Write data
                 file.write_all(data)?;
             }
-            WalOp::Delete(id) => {
+            WalOp::Delete(id) | WalOp::Tombstone(id) => {
                 // Write 32-byte ID
                 file.write_all(id)?;
             }
@@ -104,7 +108,7 @@ impl WriteAheadLog {
         // Record-type byte (1) + payload (length prefix + data, or 32-byte id).
         let written = 1 + match op {
             WalOp::Insert(data) => 4 + data.len() as u64,
-            WalOp::Delete(_) => 32,
+            WalOp::Delete(_) | WalOp::Tombstone(_) => 32,
         };
         self.bytes_written.fetch_add(written, Ordering::Relaxed);
 
@@ -163,6 +167,11 @@ impl WriteAheadLog {
     /// Append a delete operation
     pub fn delete(&self, id: &[u8; 32]) -> anyhow::Result<()> {
         self.append(&WalOp::Delete(*id))
+    }
+
+    /// Record a NIP-09 deletion of an event by ID
+    pub fn tombstone(&self, id: &[u8; 32]) -> anyhow::Result<()> {
+        self.append(&WalOp::Tombstone(*id))
     }
 
     /// Replay all operations from the WAL
@@ -230,6 +239,13 @@ impl WriteAheadLog {
                     reader.read_exact(&mut id)?;
 
                     f(WalOp::Delete(id));
+                }
+                2 => {
+                    // NIP-09 deletion
+                    let mut id = [0u8; 32];
+                    reader.read_exact(&mut id)?;
+
+                    f(WalOp::Tombstone(id));
                 }
                 _ => {
                     tracing::warn!(op_type = op_type[0], "unknown WAL operation type");
@@ -337,8 +353,10 @@ impl WriteAheadLog {
                         removed += 1;
                     }
                 }
-                1 => {
-                    // Delete ops are no longer needed after compaction
+                // Delete and NIP-09 tombstone ops are no longer needed after
+                // compaction: the events they refer to are not in live_ids, so
+                // no insert survives for them to undo.
+                1 | 2 => {
                     let mut id = [0u8; 32];
                     if reader.read_exact(&mut id).is_err() {
                         break;
@@ -406,19 +424,23 @@ mod tests {
 
         // Append delete
         wal.delete(&event_id).unwrap();
+        wal.tombstone(&event_id).unwrap();
 
         // Replay
         let mut inserts = 0;
         let mut deletes = 0;
+        let mut tombstones = 0;
 
         wal.replay(|op| match op {
             WalOp::Insert(_) => inserts += 1,
             WalOp::Delete(_) => deletes += 1,
+            WalOp::Tombstone(_) => tombstones += 1,
         })
         .unwrap();
 
         assert_eq!(inserts, 1);
         assert_eq!(deletes, 1);
+        assert_eq!(tombstones, 1);
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod wal;
 pub use index::{EventIndex, EventRef, InsertOutcome};
 pub use wal::{WalOp, WriteAheadLog};
 
+use crate::deletion::{DeletionOutcome, DeletionRequest};
 use crate::event::Event;
 
 /// Configuration for the event store
@@ -52,6 +53,9 @@ pub enum InsertResult {
     Ephemeral,
     /// Event was a duplicate (already exists)
     Duplicate,
+    /// Event was previously deleted by a NIP-09 deletion request; rejected to
+    /// prevent resurrection of deleted events.
+    Deleted,
     /// Event was stored successfully
     Stored {
         /// The newly inserted event
@@ -311,6 +315,82 @@ impl EventStore {
         self.index.get(id).is_some()
     }
 
+    /// Write a NIP-09 delete record to the WAL before removing the event from
+    /// memory. On restart, replaying this record prevents a deleted event from
+    /// being resurrected from the snapshot: the replay re-arms the tombstone,
+    /// and insert() refuses tombstoned IDs.
+    fn record_deletion(&self, id: &[u8; 32]) {
+        if let Some(ref wal) = self.wal
+            && let Err(e) = wal.tombstone(id)
+        {
+            tracing::error!(error = %e, "failed to write NIP-09 delete to WAL");
+        }
+    }
+
+    /// True if this event ID was removed by a NIP-09 deletion request.
+    pub fn is_tombstoned(&self, id: &[u8; 32]) -> bool {
+        self.index.is_tombstoned(id)
+    }
+
+    /// Number of NIP-09 tombstones currently held.
+    pub fn tombstone_count(&self) -> usize {
+        self.index.tombstone_count()
+    }
+
+    /// Apply a NIP-09 deletion request on behalf of `author`.
+    ///
+    /// Only events authored by `author` are removed; references to other
+    /// pubkeys are ignored. Each removal writes its WAL delete record *before*
+    /// the in-memory removal, so a crash in the middle replays as a delete
+    /// rather than resurrecting the event.
+    ///
+    /// A reference to an event the relay does not hold is a no-op: no tombstone
+    /// is recorded, because unknown IDs are unauthenticated (any pubkey can
+    /// name any ID) and would let a client flush the bounded tombstone set. A
+    /// deletion request that arrives before the event it deletes therefore does
+    /// not stop that event from landing afterwards.
+    pub fn apply_deletion(
+        &self,
+        req: &DeletionRequest,
+        author: &[u8; 32],
+        until: u64,
+    ) -> DeletionOutcome {
+        let mut outcome = DeletionOutcome::default();
+
+        for id in &req.ids {
+            match self.index.get(id) {
+                Some(existing) if existing.pubkey == *author => {
+                    self.record_deletion(id);
+                    if self.index.delete_by_id(id).is_some() {
+                        outcome.deleted_ids.push(*id);
+                    }
+                }
+                Some(_) => outcome.skipped_foreign += 1,
+                None => {}
+            }
+        }
+
+        for coord in &req.coordinates {
+            if coord.pubkey != *author {
+                outcome.skipped_foreign += 1;
+                continue;
+            }
+            let targets = self.index.coordinate_targets(coord, until);
+            if targets.is_empty() {
+                outcome.unknown_coordinates += 1;
+                continue;
+            }
+            for id in targets {
+                self.record_deletion(&id);
+                if self.index.delete_by_id(&id).is_some() {
+                    outcome.deleted_ids.push(id);
+                }
+            }
+        }
+
+        outcome
+    }
+
     /// Insert a single event
     ///
     /// Returns InsertResult indicating:
@@ -334,6 +414,9 @@ impl EventStore {
         match outcome {
             InsertOutcome::Duplicate | InsertOutcome::LostRace => {
                 return InsertResult::Duplicate;
+            }
+            InsertOutcome::Deleted => {
+                return InsertResult::Deleted;
             }
             InsertOutcome::Inserted { replaced } => {
                 // Write to WAL if available
@@ -401,6 +484,7 @@ impl EventStore {
                     }
                 }
                 InsertOutcome::Duplicate | InsertOutcome::LostRace => {}
+                InsertOutcome::Deleted => {}
             }
         }
 
@@ -718,6 +802,16 @@ impl EventStore {
                 }
             },
             WalOp::Delete(id) => {
+                self.index.remove(&id);
+                applied += 1;
+            }
+            WalOp::Tombstone(id) => {
+                // NIP-09: re-arm the tombstone so an event restored from the
+                // snapshot cannot be resurrected after restart. (Inserts
+                // replayed from the WAL after the delete are refused by the
+                // tombstone check in index.insert.) Replacement and eviction
+                // deletes use WalOp::Delete and must not tombstone.
+                self.index.tombstone(&id);
                 self.index.remove(&id);
                 applied += 1;
             }
@@ -1174,6 +1268,57 @@ mod tests {
         assert!(store2.get(&event1_id).is_none());
         // Event2 should still be there
         assert!(store2.get(&event2_id).is_some());
+        // A plain delete (replacement/eviction) must not tombstone the id.
+        assert!(!store2.is_tombstoned(&event1_id));
+        assert!(matches!(
+            store2.insert(event1.clone()),
+            InsertResult::Stored { .. }
+        ));
+    }
+
+    #[test]
+    fn test_nip09_tombstone_survives_wal_replay() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+
+        let store = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        let event = make_event(1, 1, 1, 1000);
+        store.insert(event.clone());
+        store.save_to_disk().unwrap();
+
+        let mut req = crate::deletion::DeletionRequest::default();
+        req.ids.insert(event.id);
+        let outcome = store.apply_deletion(&req, &event.pubkey, 2000);
+        assert_eq!(outcome.deleted_ids, vec![event.id]);
+        store.save_to_disk().unwrap();
+
+        let store2 = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        store2.load_from_disk().unwrap();
+
+        assert!(store2.get(&event.id).is_none());
+        assert!(store2.is_tombstoned(&event.id));
+        assert!(matches!(store2.insert(event), InsertResult::Deleted));
+    }
+
+    #[test]
+    fn test_apply_deletion_ignores_foreign_and_unknown() {
+        let store = EventStore::new(StoreConfig::default());
+        let mine = make_event(1, 1, 1, 1000);
+        let theirs = make_event(2, 2, 1, 1000);
+        store.insert(mine.clone());
+        store.insert(theirs.clone());
+
+        let mut req = crate::deletion::DeletionRequest::default();
+        req.ids.insert(theirs.id);
+        req.ids.insert([9u8; 32]);
+        let outcome = store.apply_deletion(&req, &mine.pubkey, 2000);
+
+        assert!(outcome.deleted_ids.is_empty());
+        assert_eq!(outcome.skipped_foreign, 1);
+        assert!(store.get(&theirs.id).is_some());
+        // An unknown id must not be tombstoned: it would let anyone flush the
+        // bounded tombstone set with ids they do not own.
+        assert!(!store.is_tombstoned(&[9u8; 32]));
     }
 
     #[test]

@@ -1,8 +1,9 @@
+use crate::deletion::Coordinate;
 use crate::event::{Event, ReplacementKey};
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -10,6 +11,77 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 /// Each shard has its own RwLock, so inserts/removes to different shards
 /// never contend. Events are assigned to shards by hashing the event ID.
 const OLDEST_SHARDS: usize = 64;
+
+/// Upper bound on NIP-09 tombstones kept in memory. Tombstones are not covered
+/// by `max_bytes`, and a client can mint one per publish+delete cycle, so the
+/// set is a FIFO with a hard cap: roughly 80 bytes per entry across the map and
+/// the queue, i.e. ~20 MiB at this size. Evicting the oldest tombstone only
+/// means a very old deleted event could be re-published.
+const MAX_TOMBSTONES: usize = 262_144;
+
+/// Hasher for keys that are already uniformly random (event IDs). Takes the
+/// first 8 bytes instead of running SipHash over all 32.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.len() >= 8 {
+            self.0 = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type IdHashBuilder = std::hash::BuildHasherDefault<IdHasher>;
+
+/// Bounded FIFO set of deleted event IDs (NIP-09 anti-resurrection).
+///
+/// `contains` sits on the insert hot path, so the common case (no deletions
+/// yet) is a single relaxed load and the rest is an identity-hashed lookup.
+struct Tombstones {
+    count: AtomicUsize,
+    ids: DashMap<[u8; 32], (), IdHashBuilder>,
+    order: Mutex<VecDeque<[u8; 32]>>,
+}
+
+impl Tombstones {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            ids: DashMap::with_hasher(IdHashBuilder::default()),
+            order: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    #[inline]
+    fn contains(&self, id: &[u8; 32]) -> bool {
+        self.count.load(AtomicOrdering::Relaxed) != 0 && self.ids.contains_key(id)
+    }
+
+    fn insert(&self, id: &[u8; 32]) {
+        if self.ids.insert(*id, ()).is_some() {
+            return;
+        }
+        let mut order = self.order.lock();
+        order.push_back(*id);
+        while order.len() > MAX_TOMBSTONES {
+            if let Some(evicted) = order.pop_front() {
+                self.ids.remove(&evicted);
+            }
+        }
+        self.count.store(self.ids.len(), AtomicOrdering::Relaxed);
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
 
 /// Tag letter used as key in `by_tag_other`.
 type TagLetter = char;
@@ -96,6 +168,9 @@ pub enum InsertOutcome {
     },
     /// Event was a duplicate (same ID already exists)
     Duplicate,
+    /// Event was previously removed by a NIP-09 deletion request and must not
+    /// be resurrected by re-publishing the same ID.
+    Deleted,
     /// Insert lost a replaceable event race (another thread won)
     LostRace,
 }
@@ -128,6 +203,11 @@ pub struct EventIndex {
     // Replaceable events index: maps (pubkey, kind) or (pubkey, kind, d-tag) to latest event id
     by_replaceable: DashMap<ReplacementKey, [u8; 32]>,
 
+    // NIP-09 tombstones: event IDs removed by a deletion request. Re-publishing
+    // the exact same event (same ID = same sig) is rejected while its tombstone
+    // exists, so a lagging client or WAL replay cannot resurrect deleted data.
+    tombstones: Tombstones,
+
     // Track actual memory usage (bytes of raw event JSON)
     memory_bytes: AtomicUsize,
 
@@ -146,6 +226,7 @@ impl EventIndex {
             by_tag_other: DashMap::new(),
             by_oldest: std::array::from_fn(|_| RwLock::new(BTreeSet::new())),
             by_replaceable: DashMap::new(),
+            tombstones: Tombstones::new(),
             memory_bytes: AtomicUsize::new(0),
             event_count: AtomicUsize::new(0),
         }
@@ -167,6 +248,12 @@ impl EventIndex {
     /// or lost a replaceable event race.
     pub fn insert(&self, event: Arc<Event>) -> InsertOutcome {
         let mut replaced = None;
+
+        // NIP-09: an event that was removed by a deletion request must not be
+        // resurrected by re-publishing the identical event bytes (same ID).
+        if self.tombstones.contains(&event.id) {
+            return InsertOutcome::Deleted;
+        }
 
         // Handle replaceable events: atomically swap old ID in by_replaceable,
         // but only if the incoming event is newer than the one we already hold.
@@ -405,6 +492,75 @@ impl EventIndex {
     /// If skip_replaceable is true, skip removing from the replaceable index (used during insert to avoid deadlock)
     pub fn remove(&self, id: &[u8; 32]) -> Option<Arc<Event>> {
         self.internal_remove(id, true)
+    }
+
+    /// NIP-09: delete an event by ID on behalf of its author, recording a
+    /// tombstone so the same event bytes cannot be re-inserted later.
+    /// Returns the removed event, if it was present.
+    pub fn delete_by_id(&self, id: &[u8; 32]) -> Option<Arc<Event>> {
+        let removed = self.internal_remove(id, false);
+        self.tombstones.insert(id);
+        if removed.is_some() {
+            crate::metrics::inc_events_deleted();
+        }
+        removed
+    }
+
+    /// NIP-09: stored versions of a replaceable event
+    /// (`<kind>:<pubkey>:<d-tag>`) whose `created_at` is not newer than
+    /// `until`, without removing anything.
+    ///
+    /// A version newer than the deletion request is left alone: NIP-09 deletes
+    /// versions "up to the created_at timestamp of the deletion request event",
+    /// so a repost that is newer than a late-arriving delete must survive.
+    ///
+    /// The caller removes these via [`EventIndex::delete_by_id`] after writing
+    /// the WAL delete records, so a crash mid-delete replays the removal.
+    pub fn coordinate_targets(&self, coord: &Coordinate, until: u64) -> Vec<[u8; 32]> {
+        let replacement_key = if coord.d_tag.is_empty() {
+            ReplacementKey::Replaceable {
+                pubkey: coord.pubkey,
+                kind: coord.kind,
+            }
+        } else {
+            ReplacementKey::Addressable {
+                pubkey: coord.pubkey,
+                kind: coord.kind,
+                d_tag: coord.d_tag.clone(),
+            }
+        };
+
+        // Snapshot candidate IDs under the DashMap shard lock and drop it
+        // before the caller takes the slow per-event locks.
+        let candidate_ids: Vec<[u8; 32]> = match self.by_replaceable.get(&replacement_key) {
+            Some(entry) => vec![*entry.value()],
+            None => Vec::new(),
+        };
+
+        candidate_ids
+            .into_iter()
+            .filter(|id| {
+                self.by_id
+                    .get(id)
+                    .is_some_and(|event| event.created_at <= until)
+            })
+            .collect()
+    }
+
+    /// True if this event ID has a NIP-09 tombstone (deleted, do not re-accept).
+    pub fn is_tombstoned(&self, id: &[u8; 32]) -> bool {
+        self.tombstones.contains(id)
+    }
+
+    /// Record a NIP-09 tombstone without requiring the event to be present
+    /// (used by WAL replay where the event may only exist in the snapshot).
+    pub fn tombstone(&self, id: &[u8; 32]) {
+        self.tombstones.insert(id);
+    }
+
+    /// Number of NIP-09 tombstones currently held (capped at [`MAX_TOMBSTONES`]).
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.len()
     }
 
     fn internal_remove(&self, id: &[u8; 32], skip_replaceable: bool) -> Option<Arc<Event>> {
@@ -941,5 +1097,73 @@ mod tests {
         assert_eq!(results[0].created_at, 3000);
         assert_eq!(results[1].created_at, 2000);
         assert_eq!(results[2].created_at, 1000);
+    }
+
+    fn id_bytes(byte: u8) -> [u8; 32] {
+        let mut arr = [0u8; 32];
+        arr[31] = byte;
+        arr
+    }
+
+    #[test]
+    fn test_delete_by_id_blocks_reinsert_and_clears_replaceable() {
+        let index = EventIndex::new();
+        let event = make_event(1, 7, 10002, 5000);
+        index.insert(event.clone());
+
+        assert!(index.delete_by_id(&event.id).is_some());
+        assert!(index.is_tombstoned(&event.id));
+        assert!(matches!(
+            index.insert(event.clone()),
+            InsertOutcome::Deleted
+        ));
+        assert!(index.get(&event.id).is_none());
+
+        // The replaceable mapping must not keep pointing at the deleted id.
+        let newer = make_event(2, 7, 10002, 6000);
+        assert!(matches!(
+            index.insert(newer.clone()),
+            InsertOutcome::Inserted { .. }
+        ));
+        assert!(index.get(&newer.id).is_some());
+    }
+
+    #[test]
+    fn test_coordinate_targets_spares_newer_versions() {
+        let index = EventIndex::new();
+        let event = make_event(1, 7, 10002, 5000);
+        index.insert(event.clone());
+
+        let coord = Coordinate {
+            kind: 10002,
+            pubkey: id_bytes(7),
+            d_tag: String::new(),
+        };
+
+        // A deletion request older than the stored version deletes nothing.
+        assert!(index.coordinate_targets(&coord, 4999).is_empty());
+        assert_eq!(index.coordinate_targets(&coord, 5000), vec![event.id]);
+    }
+
+    #[test]
+    fn test_tombstones_are_capped() {
+        let tombstones = Tombstones::new();
+        // Event IDs are SHA-256 outputs; spread the test ids the same way so
+        // the identity hasher behaves as it does in production.
+        let first = {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+            id
+        };
+        tombstones.insert(&first);
+        for i in 0..MAX_TOMBSTONES as u64 {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+            tombstones.insert(&id);
+            tombstones.insert(&id); // repeats must not consume capacity
+        }
+
+        assert_eq!(tombstones.len(), MAX_TOMBSTONES);
+        assert!(!tombstones.contains(&first), "oldest entry should age out");
     }
 }

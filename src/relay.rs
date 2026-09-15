@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::event::Event;
 use crate::fanout::{BroadcastEvent, Fanout};
 use crate::message::NostrMessage;
 use crate::store::{EventStore, InsertResult, StoreConfig};
@@ -192,6 +193,7 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     let store_memory = events.memory_bytes();
     let body = serde_json::json!({
         "events": events.len(),
+        "tombstones": events.tombstone_count(),
         "store_bytes": store_memory,
         "max_bytes": cfg.max_bytes,
         "process_memory": events.cached_process_memory(),
@@ -209,7 +211,7 @@ fn nip11_handler(config: &Config) -> impl IntoResponse {
         "description": "High-performance in-memory Nostr relay",
         "software": "https://github.com/v0l/memlay",
         "version": env!("CARGO_PKG_VERSION"),
-        "supported_nips": [1, 11],
+        "supported_nips": [1, 9, 11],
         "limitation": {
             "max_subscriptions": config.max_subscriptions,
             "max_limit": config.max_limit,
@@ -590,6 +592,14 @@ fn process_event_message(
             let event_id = hex::encode(event.id);
             let ev = Arc::new(event);
 
+            // NIP-09: a kind-5 event is a deletion request, not content. Apply
+            // it (delete referenced same-pubkey events), store the request
+            // itself so clients that already hold the referenced events can
+            // hide them, and publish it to live subscribers.
+            if ev.is_deletion_request() {
+                return Some(apply_deletion_request(&ev, store, fanout));
+            }
+
             let ok = match store.insert(ev.clone()) {
                 InsertResult::Ephemeral => {
                     tracing::debug!(id = %event_id, kind = ev.kind, "ephemeral event");
@@ -606,6 +616,18 @@ fn process_event_message(
                         id: event_id,
                         accepted: true,
                         message: "duplicate: already have this event".to_string(),
+                    }
+                }
+                InsertResult::Deleted => {
+                    // NIP-09: the identical event bytes were removed by a
+                    // deletion request. Reject with OK=false so the client
+                    // learns the event is gone.
+                    tracing::debug!(id = %event_id, "rejected: tombstoned by NIP-09 deletion");
+                    NostrMessage::Ok {
+                        id: event_id,
+                        accepted: false,
+                        message: "deleted: this event was removed by a deletion request"
+                            .to_string(),
                     }
                 }
                 InsertResult::Stored { event, replaced } => {
@@ -628,4 +650,75 @@ fn process_event_message(
         Ok(_) => None,
         Err(e) => Some(NostrMessage::Notification { message: e }.to_json()),
     }
+}
+
+/// Apply a NIP-09 kind-5 deletion request, store the request event itself and
+/// publish it to live subscribers. Returns the OK reply JSON.
+fn apply_deletion_request(
+    ev: &Arc<Event>,
+    store: &Arc<EventStore>,
+    fanout: &Arc<Fanout>,
+) -> String {
+    let event_id = hex::encode(ev.id);
+
+    // Replaying a deletion request must not re-run the (unbounded) reference
+    // walk: once we hold it, or once it has itself been deleted, answer from
+    // the store alone.
+    if store.contains(&ev.id) {
+        return NostrMessage::Ok {
+            id: event_id,
+            accepted: true,
+            message: "duplicate: already have this event".to_string(),
+        }
+        .to_json();
+    }
+    if store.is_tombstoned(&ev.id) {
+        return NostrMessage::Ok {
+            id: event_id,
+            accepted: false,
+            message: "deleted: this event was removed by a deletion request".to_string(),
+        }
+        .to_json();
+    }
+
+    let req = ev.deletion_request();
+    let outcome = store.apply_deletion(&req, &ev.pubkey, ev.created_at);
+
+    crate::metrics::inc_deletion_requests();
+
+    tracing::debug!(
+        id = %event_id,
+        deleted = outcome.deleted_ids.len(),
+        foreign = outcome.skipped_foreign,
+        unknown_coords = outcome.unknown_coordinates,
+        "applied NIP-09 deletion request"
+    );
+
+    // Persist + broadcast the deletion request itself so clients that already
+    // hold the referenced events learn about the deletion (NIP-09: relays
+    // SHOULD continue to publish deletion requests indefinitely).
+    let ok = match store.insert(ev.clone()) {
+        InsertResult::Deleted => NostrMessage::Ok {
+            id: event_id,
+            accepted: false,
+            message: "deleted: this event was removed by a deletion request".to_string(),
+        },
+        InsertResult::Ephemeral | InsertResult::Duplicate => {
+            fanout.publish(BroadcastEvent::new(ev.clone()));
+            NostrMessage::Ok {
+                id: event_id,
+                accepted: true,
+                message: String::new(),
+            }
+        }
+        InsertResult::Stored { event, .. } => {
+            fanout.publish(BroadcastEvent::new(event));
+            NostrMessage::Ok {
+                id: event_id,
+                accepted: true,
+                message: format!("deleted {} event(s)", outcome.deleted_ids.len()),
+            }
+        }
+    };
+    ok.to_json()
 }

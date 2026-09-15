@@ -18,6 +18,7 @@
 | NIP | Status | Notes |
 |-----|--------|-------|
 | NIP-01 | ✅ Complete | Core protocol |
+| NIP-09 | ✅ Complete | Event deletion: e/a tags, same-pubkey enforcement, tombstones, WAL persistence |
 | NIP-11 | ✅ Complete | Full relay info document |
 | NIP-42 | ⏳ TODO | Authentication (challenge-response) |
 | NIP-50 | ⏳ TODO | Search filters |
