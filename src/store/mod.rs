@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 mod index;
+mod pressure;
 mod wal;
+
+use pressure::RssPressure;
 
 pub use index::{EventIndex, EventRef, InsertOutcome};
 pub use wal::{WalOp, WriteAheadLog};
@@ -52,6 +55,7 @@ const MIN_AMPLIFICATION_SAMPLE_BYTES: u64 = 64 * 1024 * 1024;
 struct EvictionState {
     interval_seconds: AtomicUsize,
     consecutive_evictions: AtomicUsize,
+    rss_pressure: RssPressure,
 }
 
 /// Result of inserting an event into the store
@@ -87,6 +91,7 @@ pub struct EventStore {
     /// larger than the raw JSON the store accounts for; production runs sit
     /// near 3.8x. Sampled alongside RSS and used to size the payload budget.
     amplification_milli: AtomicU64,
+    peak_payload: AtomicU64,
 }
 
 impl StoreConfig {
@@ -163,10 +168,12 @@ impl EventStore {
             state: EvictionState {
                 interval_seconds: AtomicUsize::new(10),
                 consecutive_evictions: AtomicUsize::new(0),
+                rss_pressure: RssPressure::new(),
             },
             wal,
             cached_rss_bytes: AtomicU64::new(Self::read_rss_bytes()),
             amplification_milli: AtomicU64::new(DEFAULT_AMPLIFICATION_MILLI),
+            peak_payload: AtomicU64::new(0),
         }
     }
 
@@ -263,6 +270,13 @@ impl EventStore {
         if payload < MIN_AMPLIFICATION_SAMPLE_BYTES || rss == 0 {
             return;
         }
+        let peak = self
+            .peak_payload
+            .fetch_max(payload, Ordering::Relaxed)
+            .max(payload);
+        if payload.saturating_mul(10) < peak.saturating_mul(9) {
+            return;
+        }
         let observed = (rss.saturating_mul(1000) / payload).clamp(1000, 16_000) as i64;
         let previous = self.amplification_milli.load(Ordering::Relaxed) as i64;
         // Signed throughout: a falling ratio makes the delta negative, and
@@ -310,9 +324,16 @@ impl EventStore {
         // Use cached RSS from background sampler (lock-free, no refresh_processes)
         let process_mem = self.cached_rss_bytes.load(Ordering::Relaxed);
         let budget = self.payload_budget();
+        let over_rss = process_mem >= max_bytes as u64;
+        let rss_ceiling = self.state.rss_pressure.payload_ceiling(
+            current_mem,
+            process_mem,
+            max_bytes,
+            budget / 2,
+        );
 
         // Adaptive interval: evict more frequently when close to limit
-        let new_interval = if current_mem >= budget * 90 / 100 || process_mem >= max_bytes as u64 {
+        let new_interval = if current_mem >= budget * 90 / 100 || over_rss {
             1 // 1s when near the payload budget or RSS over limit
         } else if current_mem >= budget * 70 / 100 {
             2 // 2s when 70-90% of budget
@@ -326,31 +347,21 @@ impl EventStore {
         // Evict down to a little under the budget rather than halving the
         // store: the budget already accounts for index overhead, so a deep cut
         // just throws away events that fit.
-        let target = budget * 90 / 100;
+        let target =
+            rss_ceiling.map_or(budget * 90 / 100, |ceiling| ceiling.min(budget * 90 / 100));
 
-        // Evict if payload is over target OR if actual process memory exceeds limit
-        if current_mem > target || process_mem > max_bytes as u64 {
-            let batch_size = if process_mem > max_bytes as u64 {
-                5000
-            } else {
-                1000
-            };
+        if current_mem > target {
+            let batch_size = if over_rss { 5000 } else { 1000 };
             let mut removed = 0;
 
             let oldest = self.index.get_oldest(batch_size);
 
-            // Evict in small sub-batches, re-checking memory after each
-            // to avoid starving other tasks with a long hold on locks.
-            const EVICT_CHUNK: usize = 100;
-            for chunk in oldest.chunks(EVICT_CHUNK) {
-                for event_ref in chunk {
-                    self.index.remove(&event_ref.id);
-                    removed += 1;
-                }
-                // After each chunk, check if we've freed enough
-                if self.index.memory_bytes() <= target && process_mem <= max_bytes as u64 {
+            for event_ref in &oldest {
+                if self.index.memory_bytes() <= target {
                     break;
                 }
+                self.index.remove(&event_ref.id);
+                removed += 1;
             }
 
             if removed > 0 {
@@ -721,6 +732,10 @@ impl EventStore {
         let data_dir = Path::new(path);
         fs::create_dir_all(data_dir)?;
 
+        if !self.guard_snapshot_shrink(data_dir, wal)? {
+            return wal.group_commit().map(|_| ());
+        }
+
         // 1. Rotate the WAL to get a clean cut point.
         let old_wal = wal.rotate()?;
 
@@ -739,6 +754,34 @@ impl EventStore {
             "checkpoint complete (snapshot written, WAL reset)"
         );
         Ok(())
+    }
+
+    fn guard_snapshot_shrink(&self, data_dir: &Path, wal: &WriteAheadLog) -> anyhow::Result<bool> {
+        let snapshot_file = data_dir.join("events.jsonl");
+        let snapshot_bytes = fs::metadata(&snapshot_file).map(|m| m.len()).unwrap_or(0);
+        let live_bytes = self.index.memory_bytes() as u64;
+        if live_bytes.saturating_mul(2) >= snapshot_bytes {
+            return Ok(true);
+        }
+        let wal_bytes = wal.pending_bytes();
+        if wal_bytes < snapshot_bytes {
+            tracing::warn!(
+                snapshot_bytes,
+                live_bytes,
+                wal_bytes,
+                "live set is under half the snapshot, holding checkpoint"
+            );
+            return Ok(false);
+        }
+        let previous = data_dir.join("events.jsonl.prev");
+        let _ = fs::remove_file(&previous);
+        fs::hard_link(&snapshot_file, &previous)?;
+        tracing::warn!(
+            snapshot_bytes,
+            live_bytes,
+            "live set is under half the snapshot, kept it as events.jsonl.prev"
+        );
+        Ok(true)
     }
 
     /// Minimum WAL size before a size-triggered checkpoint is considered.
@@ -788,17 +831,9 @@ impl EventStore {
         };
         let data_dir = Path::new(path);
 
-        let max_bytes = self.config.max_bytes;
-        let eviction_threshold = if max_bytes > 0 {
-            max_bytes * 90 / 100
-        } else {
-            0
-        };
-        let eviction_target = if max_bytes > 0 {
-            max_bytes * 70 / 100
-        } else {
-            0
-        };
+        let budget = self.payload_budget();
+        let eviction_threshold = budget * 90 / 100;
+        let eviction_target = budget * 70 / 100;
 
         let mut applied = 0usize;
         let mut errors = 0usize;
@@ -1470,7 +1505,7 @@ mod tests {
         // Phase 2: Create new store with a tiny memory limit (1KB)
         // This simulates the prod scenario where WAL has more data than we can store
         let config2 = StoreConfig {
-            max_bytes: 1024, // Only 1KB limit
+            max_bytes: 4 * 1024, // Only 1KB of payload at the default amplification
             persistence_path: Some(path.clone()),
             use_wal: true,
         };
@@ -1698,5 +1733,112 @@ mod tests {
             4.0,
             "ratio from a near-empty store is the binary's own footprint"
         );
+    }
+
+    #[test]
+    fn amplification_ignores_a_store_below_its_peak() {
+        let store = store_with_limit(8 * 1024 * 1024 * 1024);
+        let payload = 1024 * 1024 * 1024u64;
+        store.index.add_memory_bytes_for_test(payload as usize);
+        store.peak_payload.store(payload * 4, Ordering::Relaxed);
+        for _ in 0..64 {
+            store.sample_amplification(payload * 16);
+        }
+        assert_eq!(
+            store.amplification(),
+            4.0,
+            "RSS retained from the peak must not read as amplification"
+        );
+    }
+
+    fn payload_of(count: u64) -> usize {
+        let store = store_with_limit(0);
+        for i in 0..count {
+            store.insert(make_event(0, 1, 1, 1000 + i));
+        }
+        store.memory_bytes()
+    }
+
+    #[test]
+    fn stuck_rss_over_the_limit_does_not_drain_the_store() {
+        let payload = payload_of(20);
+        let max_bytes = payload * 4 * 12 / 10;
+        let store = store_with_limit(max_bytes);
+        for i in 0..20 {
+            store.insert(make_event(0, 1, 1, 1000 + i));
+        }
+        store
+            .cached_rss_bytes
+            .store(max_bytes as u64 * 2, Ordering::Relaxed);
+
+        store.maybe_evict();
+        let after_cut = store.len();
+        assert!(after_cut < 20, "RSS over the limit trims the store");
+        assert!(after_cut >= 17, "one trim takes about 10%, got {after_cut}");
+
+        for _ in 0..100 {
+            store.maybe_evict();
+        }
+        assert_eq!(
+            store.len(),
+            after_cut,
+            "RSS that does not move must not keep evicting"
+        );
+    }
+
+    #[test]
+    fn checkpoint_holds_a_snapshot_the_live_set_would_shrink() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let store = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        for i in 0..20 {
+            store.insert(make_event(0, 1, 1, 1000 + i));
+        }
+        store.checkpoint().unwrap();
+
+        for er in store.index.get_oldest(15) {
+            store.index.remove(&er.id);
+        }
+        store.checkpoint().unwrap();
+
+        let store2 = EventStore::new(StoreConfig::with_persistence(0, path));
+        store2.load_from_disk().unwrap();
+        assert_eq!(
+            store2.len(),
+            20,
+            "a drained store must not overwrite the snapshot"
+        );
+    }
+
+    #[test]
+    fn checkpoint_keeps_the_old_snapshot_once_the_wal_outgrows_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let store = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        for i in 0..20 {
+            store.insert(make_event(0, 1, 1, 1000 + i));
+        }
+        store.checkpoint().unwrap();
+        for er in store.index.get_oldest(20) {
+            store.index.remove(&er.id);
+        }
+
+        for i in 0..21 {
+            store.insert(make_event(0, 1, 1, 2000 + i));
+        }
+        for er in store.index.get_oldest(19) {
+            store.index.remove(&er.id);
+        }
+        store.checkpoint().unwrap();
+
+        let dir = std::path::Path::new(&path);
+        let lines = |name: &str| {
+            std::fs::read_to_string(dir.join(name))
+                .unwrap()
+                .lines()
+                .count()
+        };
+        assert_eq!(lines("events.jsonl"), 2);
+        assert_eq!(lines("events.jsonl.prev"), 20);
     }
 }
