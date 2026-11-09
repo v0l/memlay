@@ -1,3 +1,4 @@
+use crate::analytics::{Analytics, CanonicalReq, ClientInfo, ConnHandle, Sort, measure_cpu};
 use crate::config::Config;
 use crate::event::Event;
 use crate::fanout::{BroadcastEvent, Fanout};
@@ -47,6 +48,7 @@ struct AppState {
     connection_count: Arc<AtomicUsize>,
     verify_sem: Arc<Semaphore>,
     trusted_proxies: TrustedProxies,
+    analytics: Arc<Analytics>,
 }
 
 pub struct Relay {
@@ -58,6 +60,7 @@ pub struct Relay {
     config: Config,
     /// Count of active WebSocket connections
     connection_count: Arc<AtomicUsize>,
+    analytics: Arc<Analytics>,
 }
 
 impl Relay {
@@ -107,8 +110,9 @@ impl Relay {
             events,
             subscriptions,
             fanout,
-            config,
             connection_count,
+            analytics: Analytics::new(config.analytics_max_entries),
+            config,
         }
     }
 
@@ -121,9 +125,11 @@ impl Relay {
             connection_count: self.connection_count.clone(),
             verify_sem: Arc::new(Semaphore::new(verify_permits())),
             trusted_proxies: TrustedProxies::parse(&self.config.trusted_proxies),
+            analytics: self.analytics.clone(),
         });
 
         Router::new()
+            .route("/analytics", get(analytics_handler))
             .route("/stats", get(stats_handler))
             .route("/", get(root_handler))
             .route("/metrics", get(metrics_handler))
@@ -162,6 +168,8 @@ async fn root_handler(
             let conn_count = state.connection_count.clone();
             let verify_sem = state.verify_sem.clone();
             let config = state.config.clone();
+            let analytics = state.analytics.clone();
+            let client = ClientInfo::from_headers(&headers);
             ws.on_failed_upgrade(move |err| {
                 tracing::warn!(%addr, "WebSocket upgrade failed: {}", err);
             })
@@ -174,6 +182,7 @@ async fn root_handler(
                     conn_count,
                     verify_sem,
                     config,
+                    analytics.open_connection(addr.ip(), client),
                 )
             })
             .into_response()
@@ -190,6 +199,25 @@ async fn metrics_handler(State(_state): State<Arc<AppState>>) -> impl IntoRespon
         HeaderValue::from_static("text/plain; version=0.0.4"),
     );
     (headers, metrics)
+}
+
+async fn analytics_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    if let Some(token) = &state.config.analytics_token {
+        let supplied = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if supplied != Some(token.as_str()) {
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+    let top = params.get("top").and_then(|v| v.parse().ok()).unwrap_or(20);
+    let sort = Sort::parse(params.get("sort").map(String::as_str));
+    axum::Json(state.analytics.report(top, sort)).into_response()
 }
 
 async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -308,7 +336,9 @@ async fn handle_socket(
     connection_count: Arc<AtomicUsize>,
     verify_sem: Arc<Semaphore>,
     config: Config,
+    stats: ConnHandle,
 ) {
+    let stats = Arc::new(stats);
     connection_count.fetch_add(1, Ordering::Relaxed);
     crate::metrics::ACTIVE_CONNECTIONS.inc();
 
@@ -368,7 +398,9 @@ async fn handle_socket(
                 match msg {
                     axum::extract::ws::Message::Text(text) => {
                         client_active = true;
+                        stats.add_bytes(text.len());
                         if text.len() > MAX_MESSAGE_BYTES {
+                            stats.reject();
                             let notice = NostrMessage::Notification {
                                 message: "message too large".to_string(),
                             };
@@ -389,17 +421,24 @@ async fn handle_socket(
                                 let fanout2 = fanout.clone();
                                 let send_tx2 = send_tx.clone();
                                 let sem = verify_sem.clone();
+                                let stats2 = stats.clone();
+                                let received = std::time::Instant::now();
+                                stats2.start_publish();
                                 tokio::spawn(async move {
                                     let _permit = match sem.acquire_owned().await {
                                         Ok(p) => p,
                                         Err(_) => return, // semaphore closed → shutting down
                                     };
-                                    let outcome = tokio::task::spawn_blocking(move || {
-                                        process_event_message(&text_owned, &store, &fanout2)
+                                    let ((outcome, accepted), cpu) = tokio::task::spawn_blocking(move || {
+                                        measure_cpu(|| {
+                                            let reply = process_event_message(&text_owned, &store, &fanout2);
+                                            let accepted = reply.as_deref().is_some_and(|r| r.contains("true"));
+                                            (reply, accepted)
+                                        })
                                     })
                                     .await
-                                    .ok()
-                                    .flatten();
+                                    .unwrap_or_default();
+                                    stats2.finish_publish(accepted, cpu, received.elapsed());
                                     if let Some(reply) = outcome {
                                         let _ = send_tx2.send(reply).await;
                                     }
@@ -409,6 +448,7 @@ async fn handle_socket(
                                 match NostrMessage::from_json(&text) {
                                     Ok(NostrMessage::Request { id, mut filters }) => {
                                         if filters.len() > MAX_FILTERS_PER_REQ {
+                                            stats.reject();
                                             let notice = NostrMessage::Notification {
                                                 message: format!(
                                                     "too many filters (max {})",
@@ -422,6 +462,7 @@ async fn handle_socket(
                                         if !fanout.has_sub(&conn, &id)
                                             && fanout.sub_count(&conn) >= config.max_subscriptions
                                         {
+                                            stats.reject();
                                             let closed = NostrMessage::Notification {
                                                 message: format!(
                                                     "subscription limit reached (max {})",
@@ -446,26 +487,43 @@ async fn handle_socket(
                                         let id_clone = id.clone();
                                         let sub_start = std::time::Instant::now();
 
+                                        let (canon, canon_cpu) =
+                                            measure_cpu(|| CanonicalReq::from_filters(&filters));
+                                        let ticket = stats.start_req(&canon);
+                                        let stats3 = stats.clone();
+
                                         let handle = tokio::spawn(async move {
+                                            let mut cpu = canon_cpu;
+                                            let mut sent = 0u64;
                                             // Stream matched events directly from stored
                                             // raw bytes (no deep clone, no Vec buffering).
                                             for filter in &filters {
-                                                for event in subs.query_filter(filter) {
-                                                    let raw = String::from_utf8_lossy(&event.raw);
-                                                    let mut msg = String::with_capacity(
-                                                        id_clone.len() + raw.len() + 16,
-                                                    );
-                                                    msg.push_str("[\"EVENT\",\"");
-                                                    msg.push_str(&id_clone);
-                                                    msg.push_str("\",");
-                                                    msg.push_str(&raw);
-                                                    msg.push(']');
+                                                let (events, q_cpu) =
+                                                    measure_cpu(|| subs.query_filter(filter));
+                                                cpu += q_cpu;
+                                                for event in events {
+                                                    let (msg, f_cpu) = measure_cpu(|| {
+                                                        let raw = String::from_utf8_lossy(&event.raw);
+                                                        let mut msg = String::with_capacity(
+                                                            id_clone.len() + raw.len() + 16,
+                                                        );
+                                                        msg.push_str("[\"EVENT\",\"");
+                                                        msg.push_str(&id_clone);
+                                                        msg.push_str("\",");
+                                                        msg.push_str(&raw);
+                                                        msg.push(']');
+                                                        msg
+                                                    });
+                                                    cpu += f_cpu;
                                                     if send_tx.send(msg).await.is_err() {
+                                                        stats3.finish_req(&ticket, sent, cpu, sub_start.elapsed());
                                                         return;
                                                     }
+                                                    sent += 1;
                                                     crate::metrics::inc_events_output();
                                                 }
                                             }
+                                            stats3.finish_req(&ticket, sent, cpu, sub_start.elapsed());
                                             crate::metrics::observe_tteose(sub_start.elapsed());
                                             let eose =
                                                 NostrMessage::EndOfStoredEvents { id: id_clone };

@@ -1,6 +1,6 @@
 use prometheus::{
-    Counter, Encoder, Gauge, Histogram, TextEncoder, register_counter, register_gauge,
-    register_histogram,
+    Counter, Encoder, Gauge, Histogram, HistogramVec, TextEncoder, register_counter,
+    register_gauge, register_histogram, register_histogram_vec,
 };
 
 // NOTE: these must use the `register_*` macros, not `Gauge::new`/`Counter::new`.
@@ -60,6 +60,20 @@ lazy_static::lazy_static! {
         vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0]
     ).expect("Failed to register tteose histogram");
 
+    pub static ref REQUEST_CPU: HistogramVec = register_histogram_vec!(
+        "memlay_request_cpu_seconds",
+        "CPU time spent handling a client request, by kind (req or event)",
+        &["kind"],
+        vec![0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0]
+    ).expect("Failed to register request_cpu histogram");
+
+    pub static ref REQUEST_WALL: HistogramVec = register_histogram_vec!(
+        "memlay_request_response_seconds",
+        "Wall clock response time of a client request, by kind (req or event)",
+        &["kind"],
+        vec![0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+    ).expect("Failed to register request_wall histogram");
+
     pub static ref DISK_PERSISTENCE_TIME: Histogram = register_histogram!(
         "memlay_disk_persistence_seconds",
         "Time to persist events to disk in seconds",
@@ -112,6 +126,15 @@ pub fn observe_tteose(duration: std::time::Duration) {
     TTEOSE.observe(duration.as_secs_f64());
 }
 
+pub fn observe_request(kind: &str, cpu: std::time::Duration, wall: std::time::Duration) {
+    REQUEST_CPU
+        .with_label_values(&[kind])
+        .observe(cpu.as_secs_f64());
+    REQUEST_WALL
+        .with_label_values(&[kind])
+        .observe(wall.as_secs_f64());
+}
+
 /// Record disk persistence time
 pub fn observe_disk_persistence(duration: std::time::Duration) {
     DISK_PERSISTENCE_TIME.observe(duration.as_secs_f64());
@@ -132,6 +155,10 @@ pub fn init() {
     lazy_static::initialize(&WRITE_DELAY);
     lazy_static::initialize(&TTEOSE);
     lazy_static::initialize(&DISK_PERSISTENCE_TIME);
+    for kind in ["req", "event"] {
+        REQUEST_CPU.with_label_values(&[kind]);
+        REQUEST_WALL.with_label_values(&[kind]);
+    }
 }
 
 /// Get Prometheus metrics in text format

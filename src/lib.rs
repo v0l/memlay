@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod config;
 pub mod deletion;
 pub mod event;

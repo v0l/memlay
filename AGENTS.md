@@ -346,6 +346,15 @@ curl http://localhost:8080/metrics
 | `memlay_events_dropped_total` | live events dropped on a full connection queue |
 | `memlay_subscriptions_overflowed_total` | subs closed with `CLOSED` because the client fell behind |
 | `memlay_idle_disconnects_total` | connections reaped by `idle_timeout` |
+| `memlay_request_cpu_seconds{kind}` | histogram of thread CPU time per REQ / EVENT |
+| `memlay_request_response_seconds{kind}` | histogram of wall time per REQ (to EOSE) / EVENT (to OK) |
+
+### Analytics (`GET /analytics?top=20&sort=count|cpu|wall|events`)
+JSON report for diagnosing abusive request patterns. REQs are canonicalised (filters
+sorted, deduped, hex lowercased) and keyed by hash, so reordered or repeated REQs
+collapse. Reports top REQs, REQ shapes (values stripped), clients (header fingerprint,
+UA, origin), IPs and live connections, each with CPU and response time histograms.
+Tracking is capped by `analytics_max_entries`; `analytics_token` requires a bearer token.
 
 Note: counters/gauges must be created with `register_counter!` / `register_gauge!`, **not**
 `Counter::new` / `Gauge::new` — the plain constructors never attach to the default registry,

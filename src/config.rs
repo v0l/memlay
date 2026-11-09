@@ -37,6 +37,12 @@ pub struct Config {
     /// When set, /metrics endpoint will proxy to this server
     #[serde(default)]
     pub prometheus_url: Option<String>,
+    /// Maximum distinct REQs, clients and IPs tracked by /analytics. Least recently seen are pruned.
+    #[serde(default = "default_analytics_max_entries")]
+    pub analytics_max_entries: usize,
+    /// Bearer token required for /analytics. When unset the endpoint is open.
+    #[serde(default)]
+    pub analytics_token: Option<String>,
     /// Directory for the rotating log file. When unset, logs go to stdout only.
     #[serde(default)]
     pub log_dir: Option<String>,
@@ -73,6 +79,10 @@ fn default_idle_timeout() -> u64 {
     10
 }
 
+fn default_analytics_max_entries() -> usize {
+    10_000
+}
+
 fn default_persistence_interval() -> u64 {
     60
 }
@@ -90,6 +100,8 @@ impl Default for Config {
             persistence_interval: default_persistence_interval(),
             trusted_proxies: Vec::new(),
             prometheus_url: None,
+            analytics_max_entries: default_analytics_max_entries(),
+            analytics_token: None,
             log_dir: None,
         }
     }

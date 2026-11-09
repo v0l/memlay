@@ -35,6 +35,11 @@ idle_timeout: 10
 # Events are automatically saved to disk at this interval
 # persistence_interval: 60
 
+# /analytics endpoint: per-REQ, per-client and per-IP usage with CPU and
+# response time histograms. Cap on tracked entries, and an optional bearer token.
+# analytics_max_entries: 10000
+# analytics_token: "change-me"
+
 # Prometheus server URL for metrics proxy (optional)
 # When set, /metrics endpoint will proxy requests to this Prometheus server
 # The landing page will also show a link to view metrics

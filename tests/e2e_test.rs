@@ -619,3 +619,46 @@ async fn test_subscriber_connection_is_not_reaped() {
     .await
     .unwrap();
 }
+
+/// Two REQs with the same filters in different order collapse into one
+/// canonical entry on /analytics, with CPU and response histograms filled.
+#[tokio::test]
+async fn test_analytics_canonicalizes_reqs() {
+    let url = spawn_relay().await;
+    let http = url.replace("ws://", "");
+
+    tokio::task::spawn_blocking(move || {
+        let (mut ws, _) = connect(&url).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        }
+        ws.send(Message::Text(
+            r#"["REQ","a",{"kinds":[3,1],"limit":5}]"#.into(),
+        ))
+        .unwrap();
+        assert!(read_text(&mut ws).starts_with(r#"["EOSE""#));
+        ws.send(Message::Text(
+            r#"["REQ","b",{"limit":5,"kinds":[1,3,1]}]"#.into(),
+        ))
+        .unwrap();
+        assert!(read_text(&mut ws).starts_with(r#"["EOSE""#));
+        std::thread::sleep(Duration::from_millis(100));
+
+        use std::io::{Read, Write};
+        let mut tcp = std::net::TcpStream::connect(&http).unwrap();
+        tcp.write_all(b"GET /analytics?sort=cpu HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut body = String::new();
+        tcp.read_to_string(&mut body).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(body.split("\r\n\r\n").nth(1).unwrap().trim()).unwrap();
+        let reqs = json["top_reqs"].as_array().unwrap();
+        assert_eq!(reqs.len(), 1, "{json}");
+        assert_eq!(reqs[0]["started"], 2);
+        assert_eq!(reqs[0]["cpu_hist"]["count"], 2);
+        assert_eq!(reqs[0]["wall_hist"]["count"], 2);
+        assert_eq!(json["top_clients"].as_array().unwrap().len(), 1);
+    })
+    .await
+    .unwrap();
+}
