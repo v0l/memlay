@@ -69,12 +69,22 @@ fn fnv1a(parts: &[&str]) -> u64 {
     hash
 }
 
-fn count_bucket(n: usize) -> usize {
-    if n == 0 {
-        0
-    } else {
-        (usize::BITS - n.leading_zeros()) as usize
+const KIND_BUCKET_EDGES: [usize; 6] = [1, 2, 3, 5, 10, 25];
+const SET_BUCKET_EDGES: [usize; 5] = [1, 10, 50, 200, 1000];
+
+fn count_bucket(n: usize, edges: &[usize]) -> String {
+    let mut low = 1;
+    for &edge in edges {
+        if n <= edge {
+            return if low == edge {
+                edge.to_string()
+            } else {
+                format!("{low}-{edge}")
+            };
+        }
+        low = edge + 1;
     }
+    format!("{low}+")
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -137,17 +147,28 @@ impl CanonFilter {
     fn shape(&self) -> String {
         let mut parts = Vec::new();
         if !self.ids.is_empty() {
-            parts.push(format!("ids:{}", count_bucket(self.ids.len())));
+            parts.push(format!(
+                "ids:{}",
+                count_bucket(self.ids.len(), &SET_BUCKET_EDGES)
+            ));
         }
         if !self.authors.is_empty() {
-            parts.push(format!("authors:{}", count_bucket(self.authors.len())));
+            parts.push(format!(
+                "authors:{}",
+                count_bucket(self.authors.len(), &SET_BUCKET_EDGES)
+            ));
         }
         if !self.kinds.is_empty() {
-            let kinds: Vec<String> = self.kinds.iter().map(|k| k.to_string()).collect();
-            parts.push(format!("kinds:{}", kinds.join(",")));
+            parts.push(format!(
+                "kinds:{}",
+                count_bucket(self.kinds.len(), &KIND_BUCKET_EDGES)
+            ));
         }
         for (key, values) in &self.tags {
-            parts.push(format!("{key}:{}", count_bucket(values.len())));
+            parts.push(format!(
+                "{key}:{}",
+                count_bucket(values.len(), &SET_BUCKET_EDGES)
+            ));
         }
         if self.since.is_some() {
             parts.push("since".to_string());
@@ -888,6 +909,30 @@ mod tests {
         assert_ne!(a.key, b.key);
         assert_eq!(a.shape, b.shape);
         assert_eq!(a.shape, "kinds:1 since");
+    }
+
+    #[test]
+    fn shape_buckets_kinds_finer_than_authors_and_tags() {
+        let authors = |n: usize| {
+            (0..n)
+                .map(|i| format!("\"{i:064x}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let kinds = |n: u32| (1..=n).map(|k| k.to_string()).collect::<Vec<_>>().join(",");
+        let shape = |a: usize, k: u32| {
+            CanonicalReq::from_filters(&[filter(&format!(
+                r#"{{"authors":[{}],"kinds":[{}]}}"#,
+                authors(a),
+                kinds(k)
+            ))])
+            .shape
+        };
+        assert_eq!(shape(4, 2), shape(9, 2));
+        assert_ne!(shape(4, 2), shape(4, 3));
+        assert_eq!(shape(4, 2), "authors:2-10 kinds:2");
+        assert_eq!(shape(11, 4), "authors:11-50 kinds:4-5");
+        assert_eq!(shape(2000, 30), "authors:1001+ kinds:26+");
     }
 
     #[test]
