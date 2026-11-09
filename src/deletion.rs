@@ -81,17 +81,14 @@ impl Event {
     pub fn deletion_request(&self) -> DeletionRequest {
         let mut req = DeletionRequest::default();
 
-        for tag in &self.tags {
-            let Some(value) = tag.value() else {
-                continue;
-            };
-            match tag.name.as_str() {
-                "e" => {
+        for (letter, value) in self.tags() {
+            match letter {
+                'e' => {
                     if let Some(id) = parse_hex_32_pub(value) {
                         req.ids.insert(id);
                     }
                 }
-                "a" => {
+                'a' => {
                     if let Some(coord) = parse_coordinate(value) {
                         req.coordinates.push(coord);
                     }

@@ -357,19 +357,12 @@ impl EventIndex {
 
         // Generic tag index for all other single-letter tags
         {
-            for tag in &event.tags {
-                let mut chars = tag.name.chars();
-                if let (Some(letter), None) = (chars.next(), chars.next())
-                    && letter != 'e'
-                    && letter != 'p'
-                    && let Some(value) = tag.value()
-                {
-                    let inner_map = self.by_tag_other.entry(letter).or_insert_with(DashMap::new);
-                    let set_lock = inner_map
-                        .entry(value.to_string())
-                        .or_insert_with(|| RwLock::new(BTreeSet::new()));
-                    set_lock.write().insert(EventRef::new(event.clone()));
-                }
+            for (letter, value) in event.generic_tags() {
+                let inner_map = self.by_tag_other.entry(letter).or_insert_with(DashMap::new);
+                let set_lock = inner_map
+                    .entry(value.to_string())
+                    .or_insert_with(|| RwLock::new(BTreeSet::new()));
+                set_lock.write().insert(EventRef::new(event.clone()));
             }
         }
 
@@ -465,17 +458,10 @@ impl EventIndex {
         }
 
         {
-            for tag in &event.tags {
-                let mut chars = tag.name.chars();
-                if let (Some(letter), None) = (chars.next(), chars.next())
-                    && letter != 'e'
-                    && letter != 'p'
-                    && let Some(value) = tag.value()
-                {
-                    if let Some(inner_map) = self.by_tag_other.get(&letter) {
-                        if let Some(set_lock) = inner_map.get(value) {
-                            set_lock.write().remove(&er);
-                        }
+            for (letter, value) in event.generic_tags() {
+                if let Some(inner_map) = self.by_tag_other.get(&letter) {
+                    if let Some(set_lock) = inner_map.get(value) {
+                        set_lock.write().remove(&er);
                     }
                 }
             }
@@ -615,17 +601,10 @@ impl EventIndex {
         }
 
         {
-            for tag in &event.tags {
-                let mut chars = tag.name.chars();
-                if let (Some(letter), None) = (chars.next(), chars.next())
-                    && letter != 'e'
-                    && letter != 'p'
-                    && let Some(value) = tag.value()
-                {
-                    if let Some(inner_map) = self.by_tag_other.get(&letter) {
-                        if let Some(set_lock) = inner_map.get(value) {
-                            set_lock.write().remove(&er);
-                        }
+            for (letter, value) in event.generic_tags() {
+                if let Some(inner_map) = self.by_tag_other.get(&letter) {
+                    if let Some(set_lock) = inner_map.get(value) {
+                        set_lock.write().remove(&er);
                     }
                 }
             }

@@ -1,23 +1,23 @@
 use bytes::Bytes;
 use hex::FromHex;
 use secp256k1::{XOnlyPublicKey, schnorr::Signature};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(test)]
+use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::fmt;
 
-/// A parsed tag from a Nostr event.
-/// First element is the tag type (e.g., "e", "p", "t"), rest are values.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Tag {
-    pub name: String,
-    pub values: Vec<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TagValue {
+    Span { start: u32, len: u32 },
+    Owned(Box<str>),
 }
 
-impl Tag {
-    /// Get the first value (most common case: ["e", "<event_id>"])
-    pub fn value(&self) -> Option<&str> {
-        self.values.first().map(|s| s.as_str())
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexedTag {
+    letter: char,
+    value: TagValue,
 }
 
 /// A Nostr event with both parsed fields and raw JSON bytes.
@@ -31,7 +31,7 @@ pub struct Event {
     pub pubkey: [u8; 32],
     pub created_at: u64,
     pub kind: u32,
-    pub tags: Vec<Tag>,
+    tags: Box<[IndexedTag]>,
 
     // Original JSON for zero-copy response
     pub raw: Bytes,
@@ -43,110 +43,86 @@ impl Event {
     /// WAL replay is safe because we're reading our own persisted data.
     #[cfg(any(test, feature = "unchecked", feature = "wal"))]
     pub fn from_json_unchecked(json: &[u8]) -> Result<Self, EventParseError> {
-        let raw_event: RawEvent = serde_json::from_slice(json)?;
-        let id = parse_hex_32(&raw_event.id).ok_or(EventParseError::InvalidId)?;
-        let pubkey = parse_hex_32(&raw_event.pubkey).ok_or(EventParseError::InvalidPubkey)?;
-        parse_hex_64(&raw_event.sig).ok_or(EventParseError::InvalidSignature)?;
-        let tags = raw_event
-            .tags
-            .iter()
-            .filter_map(|tag_arr| {
-                if tag_arr.is_empty() {
-                    return None;
-                }
-                Some(Tag {
-                    name: tag_arr[0].clone(),
-                    values: tag_arr[1..].to_vec(),
-                })
-            })
-            .collect();
-        Ok(Event {
-            id,
-            pubkey,
-            created_at: raw_event.created_at,
-            kind: raw_event.kind,
-            tags,
-            raw: Bytes::copy_from_slice(json),
-        })
+        Self::parse(json, false)
     }
 
     /// Parse an event from JSON bytes and verify its id and signature.
     pub fn from_json(json: &[u8]) -> Result<Self, EventParseError> {
+        Self::parse(json, true)
+    }
+
+    fn parse(json: &[u8], verify: bool) -> Result<Self, EventParseError> {
         let raw_event: RawEvent = serde_json::from_slice(json)?;
 
-        let id = parse_hex_32(&raw_event.id).ok_or(EventParseError::InvalidId)?;
-        let pubkey = parse_hex_32(&raw_event.pubkey).ok_or(EventParseError::InvalidPubkey)?;
+        let id = parse_hex_32(raw_event.id.as_bytes()).ok_or(EventParseError::InvalidId)?;
+        let pubkey =
+            parse_hex_32(raw_event.pubkey.as_bytes()).ok_or(EventParseError::InvalidPubkey)?;
         let sig = parse_hex_64(&raw_event.sig).ok_or(EventParseError::InvalidSignature)?;
 
-        let tags: Vec<Tag> = raw_event
-            .tags
-            .iter()
-            .filter_map(|tag_arr| {
-                if tag_arr.is_empty() {
-                    return None;
-                }
-                Some(Tag {
-                    name: tag_arr[0].clone(),
-                    values: tag_arr[1..].to_vec(),
-                })
-            })
-            .collect();
-
-        // Verify event id = SHA-256([0, pubkey, created_at, kind, tags, content])
-        // Serialize the tuple directly to avoid building an intermediate
-        // serde_json::Value tree.
-        let serialised = serde_json::to_vec(&(
-            0u8,
-            &raw_event.pubkey,
-            raw_event.created_at,
-            raw_event.kind,
-            &raw_event.tags,
-            &raw_event.content,
-        ))
-        .map_err(EventParseError::Json)?;
-        let computed: [u8; 32] = Sha256::digest(&serialised).into();
-        if computed != id {
-            return Err(EventParseError::IdMismatch);
+        if verify {
+            raw_event.verify(&id, &pubkey, &sig)?;
         }
-
-        // Verify Schnorr signature
-        let xonly =
-            XOnlyPublicKey::from_byte_array(pubkey).map_err(|_| EventParseError::InvalidPubkey)?;
-        let schnorr_sig = Signature::from_byte_array(sig);
-        secp256k1::global::SECP256K1
-            .verify_schnorr(&schnorr_sig, &id, &xonly)
-            .map_err(|_| EventParseError::BadSignature)?;
 
         Ok(Event {
             id,
             pubkey,
             created_at: raw_event.created_at,
             kind: raw_event.kind,
-            tags,
+            tags: index_tags(json, &raw_event.tags),
             raw: Bytes::copy_from_slice(json),
         })
     }
 
-    /// Get e-tags (referenced event IDs) as bytes
-    pub fn e_tags(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+    fn tag_bytes<'a>(&'a self, tag: &'a IndexedTag) -> &'a [u8] {
+        match &tag.value {
+            TagValue::Span { start, len } => {
+                let start = *start as usize;
+                &self.raw[start..start + *len as usize]
+            }
+            TagValue::Owned(value) => value.as_bytes(),
+        }
+    }
+
+    /// First value of every single-letter tag, as `(letter, value)`.
+    pub fn tags(&self) -> impl Iterator<Item = (char, &str)> + '_ {
         self.tags.iter().filter_map(|tag| {
-            if tag.name == "e" {
-                tag.value().and_then(parse_hex_32)
-            } else {
-                None
+            std::str::from_utf8(self.tag_bytes(tag))
+                .ok()
+                .map(|value| (tag.letter, value))
+        })
+    }
+
+    /// First value of every single-letter tag other than `e` and `p`.
+    pub fn generic_tags(&self) -> impl Iterator<Item = (char, &str)> + '_ {
+        self.tags()
+            .filter(|(letter, _)| *letter != 'e' && *letter != 'p')
+    }
+
+    /// True when a single-letter tag `letter` has a first value equal to one of `values`.
+    pub fn has_tag_value(&self, letter: char, values: &[String]) -> bool {
+        self.tags.iter().any(|tag| {
+            tag.letter == letter && {
+                let bytes = self.tag_bytes(tag);
+                values.iter().any(|v| v.as_bytes() == bytes)
             }
         })
     }
 
+    fn hex_tags(&self, letter: char) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.tags
+            .iter()
+            .filter(move |tag| tag.letter == letter)
+            .filter_map(|tag| parse_hex_32(self.tag_bytes(tag)))
+    }
+
+    /// Get e-tags (referenced event IDs) as bytes
+    pub fn e_tags(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.hex_tags('e')
+    }
+
     /// Get p-tags (referenced pubkeys) as bytes
     pub fn p_tags(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
-        self.tags.iter().filter_map(|tag| {
-            if tag.name == "p" {
-                tag.value().and_then(parse_hex_32)
-            } else {
-                None
-            }
-        })
+        self.hex_tags('p')
     }
 
     /// Check if this is an ephemeral event (kind 20000-29999)
@@ -173,9 +149,8 @@ impl Event {
         if !self.is_addressable() {
             return None;
         }
-        self.tags
-            .iter()
-            .find_map(|tag| if tag.name == "d" { tag.value() } else { None })
+        self.tags()
+            .find_map(|(letter, value)| (letter == 'd').then_some(value))
     }
 
     /// Get the replacement key for this event
@@ -229,22 +204,93 @@ impl fmt::Debug for Event {
             .field("pubkey", &hex::encode(self.pubkey))
             .field("created_at", &self.created_at)
             .field("kind", &self.kind)
-            .field("tags", &self.tags)
+            .field("tags", &self.tags().collect::<Vec<_>>())
             .field("raw_len", &self.raw.len())
             .finish()
     }
 }
 
-/// Raw JSON structure for parsing
-#[derive(Deserialize, Serialize)]
-struct RawEvent {
-    id: String,
-    pubkey: String,
+/// Raw JSON structure for parsing. Strings borrow from the input unless they
+/// contain escapes, which is what lets tag values be stored as spans of `raw`.
+#[derive(Deserialize)]
+struct RawEvent<'a> {
+    #[serde(borrow)]
+    id: Cow<'a, str>,
+    #[serde(borrow)]
+    pubkey: Cow<'a, str>,
     created_at: u64,
     kind: u32,
-    tags: Vec<Vec<String>>,
-    content: String,
-    sig: String,
+    #[serde(borrow)]
+    tags: Vec<Vec<JsonStr<'a>>>,
+    #[serde(borrow)]
+    content: Cow<'a, str>,
+    #[serde(borrow)]
+    sig: Cow<'a, str>,
+}
+
+impl RawEvent<'_> {
+    fn verify(
+        &self,
+        id: &[u8; 32],
+        pubkey: &[u8; 32],
+        sig: &[u8; 64],
+    ) -> Result<(), EventParseError> {
+        let serialised = serde_json::to_vec(&(
+            0u8,
+            &self.pubkey,
+            self.created_at,
+            self.kind,
+            &self.tags,
+            &self.content,
+        ))
+        .map_err(EventParseError::Json)?;
+        let computed: [u8; 32] = Sha256::digest(&serialised).into();
+        if &computed != id {
+            return Err(EventParseError::IdMismatch);
+        }
+
+        let xonly =
+            XOnlyPublicKey::from_byte_array(*pubkey).map_err(|_| EventParseError::InvalidPubkey)?;
+        let schnorr_sig = Signature::from_byte_array(*sig);
+        secp256k1::global::SECP256K1
+            .verify_schnorr(&schnorr_sig, id, &xonly)
+            .map_err(|_| EventParseError::BadSignature)
+    }
+}
+
+#[derive(Deserialize, serde::Serialize)]
+struct JsonStr<'a>(#[serde(borrow)] Cow<'a, str>);
+
+fn index_tags(json: &[u8], tags: &[Vec<JsonStr<'_>>]) -> Box<[IndexedTag]> {
+    tags.iter()
+        .filter_map(|tag| {
+            let mut name = tag.first()?.0.chars();
+            let letter = name.next()?;
+            if name.next().is_some() {
+                return None;
+            }
+            let value = &tag.get(1)?.0;
+            let stored = match value {
+                Cow::Borrowed(s) => span_in(json, s),
+                Cow::Owned(_) => None,
+            };
+            Some(IndexedTag {
+                letter,
+                value: stored.unwrap_or_else(|| TagValue::Owned(value.as_ref().into())),
+            })
+        })
+        .collect()
+}
+
+fn span_in(json: &[u8], s: &str) -> Option<TagValue> {
+    let start = (s.as_ptr() as usize).checked_sub(json.as_ptr() as usize)?;
+    if start.checked_add(s.len())? > json.len() {
+        return None;
+    }
+    Some(TagValue::Span {
+        start: u32::try_from(start).ok()?,
+        len: u32::try_from(s.len()).ok()?,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -264,7 +310,7 @@ pub enum EventParseError {
 }
 
 /// Parse a 32-byte hex string into bytes
-fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
+fn parse_hex_32(s: &[u8]) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }
@@ -298,7 +344,7 @@ pub struct EventBuilder {
     pubkey: [u8; 32],
     created_at: u64,
     kind: u32,
-    tags: Vec<Tag>,
+    tags: Vec<Vec<String>>,
     content: String,
 }
 
@@ -335,25 +381,14 @@ impl EventBuilder {
     }
 
     pub fn tag(mut self, name: &str, value: &str) -> Self {
-        self.tags.push(Tag {
-            name: name.to_string(),
-            values: vec![value.to_string()],
-        });
+        self.tags.push(vec![name.to_string(), value.to_string()]);
         self
     }
 
     pub fn build(self) -> Event {
         use sha2::{Digest, Sha256};
 
-        let tags: Vec<Vec<String>> = self
-            .tags
-            .iter()
-            .map(|t| {
-                let mut arr = vec![t.name.clone()];
-                arr.extend(t.values.iter().cloned());
-                arr
-            })
-            .collect();
+        let tags = self.tags;
 
         // Compute ID by serializing the content array
         let serialised = serde_json::to_vec(&serde_json::json!([
@@ -409,7 +444,7 @@ mod tests {
         assert_eq!(event.pubkey[31], 2);
         assert_eq!(event.created_at, 1234567890);
         assert_eq!(event.kind, 1);
-        assert_eq!(event.tags.len(), 2);
+        assert_eq!(event.tags().count(), 2);
 
         let e_tags: Vec<_> = event.e_tags().collect();
         assert_eq!(e_tags.len(), 1);
@@ -418,6 +453,103 @@ mod tests {
         let p_tags: Vec<_> = event.p_tags().collect();
         assert_eq!(p_tags.len(), 1);
         assert_eq!(p_tags[0][31], 4);
+    }
+
+    fn event_with_tags(tags: &str) -> Event {
+        let json = format!(
+            r#"{{ "id" : "{}", "pubkey":"{}", "created_at":1, "kind":1, "tags" : {tags} , "content":"x", "sig":"{}" }}"#,
+            "0".repeat(64),
+            "0".repeat(64),
+            "0".repeat(128)
+        );
+        Event::from_json_unchecked(json.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn tag_values_read_from_raw_with_whitespace() {
+        let id = "ab".repeat(32);
+        let event = event_with_tags(&format!(
+            r#"[ [ "e" , "{id}" , "wss://r" ], ["t",  "nostr"] ]"#
+        ));
+        assert_eq!(
+            event.tags().collect::<Vec<_>>(),
+            vec![('e', id.as_str()), ('t', "nostr")]
+        );
+        assert_eq!(event.e_tags().next(), Some([0xab; 32]));
+        assert!(event.has_tag_value('t', &["nostr".to_string()]));
+        assert!(!event.has_tag_value('t', &["nost".to_string()]));
+    }
+
+    #[test]
+    fn escaped_tag_values_are_unescaped() {
+        let event = event_with_tags(r#"[["t","a\"b\u00e9"],["d","x\\y"]]"#);
+        assert_eq!(
+            event.tags().collect::<Vec<_>>(),
+            vec![('t', "a\"bé"), ('d', "x\\y")]
+        );
+        assert!(event.has_tag_value('t', &["a\"bé".to_string()]));
+        assert!(matches!(event.tags[0].value, TagValue::Owned(_)));
+    }
+
+    #[test]
+    fn plain_tag_values_are_spans_into_raw() {
+        let event = event_with_tags(r#"[["t","nostr"],["p","x"]]"#);
+        assert!(
+            event
+                .tags
+                .iter()
+                .all(|t| matches!(t.value, TagValue::Span { .. }))
+        );
+        assert_eq!(std::mem::size_of::<IndexedTag>(), 24);
+    }
+
+    #[test]
+    fn only_first_value_of_single_letter_tags_is_indexed() {
+        let event =
+            event_with_tags(r#"[["expiration","123"],["t"],["t","one","two"],[],["é","accent"]]"#);
+        assert_eq!(
+            event.tags().collect::<Vec<_>>(),
+            vec![('t', "one"), ('é', "accent")]
+        );
+        assert!(!event.has_tag_value('t', &["two".to_string()]));
+    }
+
+    #[test]
+    fn verified_parse_hashes_escaped_tags_and_content() {
+        use secp256k1::{Keypair, Secp256k1, SecretKey};
+
+        let secp = Secp256k1::new();
+        let keypair =
+            Keypair::from_secret_key(&secp, &SecretKey::from_byte_array([7; 32]).unwrap());
+        let pubkey = hex::encode(keypair.x_only_public_key().0.serialize());
+        let tags = serde_json::json!([["t", "q\"uote"], ["p", "cd".repeat(32)]]);
+        let content = "line\nbreak \"quoted\" é";
+        let id: [u8; 32] = Sha256::digest(
+            serde_json::to_vec(&serde_json::json!([0, pubkey, 5, 1, tags, content])).unwrap(),
+        )
+        .into();
+        let sig = secp.sign_schnorr_no_aux_rand(&id, &keypair);
+        let json = serde_json::json!({
+            "id": hex::encode(id),
+            "pubkey": pubkey,
+            "created_at": 5,
+            "kind": 1,
+            "tags": tags,
+            "content": content,
+            "sig": hex::encode(sig.to_byte_array()),
+        })
+        .to_string();
+
+        let event = Event::from_json(json.as_bytes()).unwrap();
+        assert_eq!(event.tags().next(), Some(('t', "q\"uote")));
+        assert_eq!(event.p_tags().next(), Some([0xcd; 32]));
+
+        let tampered = json.replace("q\\\"uote", "q\\\"uotf");
+        assert_ne!(tampered, json);
+        assert!(matches!(
+            Event::from_json(tampered.as_bytes()),
+            Err(EventParseError::IdMismatch)
+        ));
     }
 
     #[test]

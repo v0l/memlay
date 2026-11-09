@@ -448,11 +448,7 @@ impl SubscriptionManager {
                     if has_generic_tags && letter != 'e' && letter != 'p' {
                         return true;
                     }
-                    event.tags.iter().any(|tag| {
-                        let mut chars = tag.name.chars();
-                        matches!((chars.next(), chars.next()), (Some(l), None) if l == letter)
-                            && tag.value().is_some_and(|v| values.iter().any(|fv| fv == v))
-                    })
+                    event.has_tag_value(letter, values)
                 });
 
             if matches && result_ids.insert(event.id) {
@@ -928,12 +924,7 @@ impl FilterMatch for Filter {
         }
         if !self.tag_filters.is_empty() {
             for (&letter, values) in &self.tag_filters {
-                let matched = event.tags.iter().any(|tag| {
-                    let mut chars = tag.name.chars();
-                    matches!((chars.next(), chars.next()), (Some(l), None) if l == letter)
-                        && tag.value().is_some_and(|v| values.iter().any(|fv| fv == v))
-                });
-                if !matched {
+                if !event.has_tag_value(letter, values) {
                     return false;
                 }
             }

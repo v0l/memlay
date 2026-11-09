@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use memlay::event::{Event, Tag};
+use memlay::event::Event;
 use memlay::message::NostrMessage;
 use memlay::store::{EventStore, StoreConfig};
 use memlay::subscription::{Filter, FilterMatch, SubscriptionManager};
@@ -9,6 +9,15 @@ use std::sync::Arc;
 
 /// Generate a random event for benchmarking
 fn generate_random_event(rng: &mut StdRng, id: u64, pubkey_pool: &[[u8; 32]]) -> Event {
+    generate_tagged_event(rng, id, pubkey_pool, None)
+}
+
+fn generate_tagged_event(
+    rng: &mut StdRng,
+    id: u64,
+    pubkey_pool: &[[u8; 32]],
+    tag: Option<(&str, &str)>,
+) -> Event {
     let mut id_bytes = [0u8; 32];
     id_bytes[..8].copy_from_slice(&id.to_be_bytes());
     rng.fill_bytes(&mut id_bytes[8..]);
@@ -20,13 +29,18 @@ fn generate_random_event(rng: &mut StdRng, id: u64, pubkey_pool: &[[u8; 32]]) ->
     let mut sig = [0u8; 64];
     rng.fill_bytes(&mut sig);
 
+    let tags = tag.map_or(String::new(), |(name, value)| {
+        format!(r#"["{name}","{value}"]"#)
+    });
+
     Event::from_json_unchecked(
         format!(
-            r#"{{"id":"{}","pubkey":"{}","created_at":{},"kind":{},"tags":[],"content":"benchmark test content","sig":"{}"}}"#,
+            r#"{{"id":"{}","pubkey":"{}","created_at":{},"kind":{},"tags":[{}],"content":"benchmark test content","sig":"{}"}}"#,
             hex_encode(&id_bytes),
             hex_encode(&pubkey),
             created_at,
             kind,
+            tags,
             hex_encode(&sig)
         )
         .as_bytes(),
@@ -302,17 +316,17 @@ fn bench_store_query_by_e_tag(c: &mut Criterion) {
     // Create events with e-tags
     let mut e_tag_events: Vec<Arc<Event>> = Vec::new();
     for i in 0..10_000 {
-        let mut event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
-        // Add an e-tag referencing a specific event
         let e_tag_event = generate_random_event(
             &mut new_rng((42 + i as u64) * 2 + 100000),
             99999 - i,
             &pubkey_pool,
         );
-        event.tags.push(Tag {
-            name: "e".to_string(),
-            values: vec![hex_encode(&e_tag_event.id)],
-        });
+        let event = generate_tagged_event(
+            &mut new_rng(42 + i as u64),
+            i,
+            &pubkey_pool,
+            Some(("e", &hex_encode(&e_tag_event.id))),
+        );
         let arc = std::sync::Arc::new(event);
         store.insert(arc.clone());
         if i < 100 {
@@ -350,12 +364,12 @@ fn bench_store_query_by_p_tag(c: &mut Criterion) {
     });
 
     for i in 0..100_000 {
-        let mut event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
-        // Add p-tags
-        event.tags.push(Tag {
-            name: "p".to_string(),
-            values: vec![hex_encode(&pubkey_pool[(i % 50) as usize])],
-        });
+        let event = generate_tagged_event(
+            &mut new_rng(42 + i as u64),
+            i,
+            &pubkey_pool,
+            Some(("p", &hex_encode(&pubkey_pool[(i % 50) as usize]))),
+        );
         store.insert(std::sync::Arc::new(event));
     }
 
@@ -387,11 +401,12 @@ fn bench_store_query_by_tag(c: &mut Criterion) {
     let tag_values: [&str; 5] = ["nostr", "bitcoin", "lightning", "defi", "crypto"];
 
     for i in 0..100_000 {
-        let mut event = generate_random_event(&mut new_rng(42 + i as u64), i, &pubkey_pool);
-        event.tags.push(Tag {
-            name: "t".to_string(),
-            values: vec![tag_values[(i % 5) as usize].to_string()],
-        });
+        let event = generate_tagged_event(
+            &mut new_rng(42 + i as u64),
+            i,
+            &pubkey_pool,
+            Some(("t", tag_values[(i % 5) as usize])),
+        );
         store.insert(std::sync::Arc::new(event));
     }
 
