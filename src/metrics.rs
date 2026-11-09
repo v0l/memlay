@@ -72,6 +72,16 @@ lazy_static::lazy_static! {
         vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0]
     ).expect("Failed to register tteose histogram");
 
+    pub static ref BYTES_SENT: Counter = register_counter!(
+        "memlay_transmit_bytes_total",
+        "Bytes of WebSocket text frames written to clients"
+    ).expect("Failed to register transmit_bytes counter");
+
+    pub static ref BYTES_RECEIVED: Counter = register_counter!(
+        "memlay_receive_bytes_total",
+        "Bytes of WebSocket text frames received from clients"
+    ).expect("Failed to register receive_bytes counter");
+
     pub static ref EVENTS_EVICTED: Counter = register_counter!(
         "memlay_events_evicted_total",
         "Events evicted to stay inside the memory budget"
@@ -198,6 +208,14 @@ pub fn observe_saved(kind: u32, bytes: usize) {
         .inc_by(bytes as f64);
 }
 
+pub fn add_bytes_sent(n: usize) {
+    BYTES_SENT.inc_by(n as f64);
+}
+
+pub fn add_bytes_received(n: usize) {
+    BYTES_RECEIVED.inc_by(n as f64);
+}
+
 pub fn inc_events_evicted(n: usize) {
     EVENTS_EVICTED.inc_by(n as f64);
 }
@@ -232,6 +250,8 @@ pub fn init() {
     lazy_static::initialize(&TTEOSE);
     lazy_static::initialize(&DISK_PERSISTENCE_TIME);
     lazy_static::initialize(&EVENTS_EVICTED);
+    lazy_static::initialize(&BYTES_SENT);
+    lazy_static::initialize(&BYTES_RECEIVED);
     lazy_static::initialize(&STORE_EVENTS);
     lazy_static::initialize(&STORE_BYTES);
     lazy_static::initialize(&PAYLOAD_BUDGET);

@@ -1,154 +1,897 @@
 {
   "uid": "memlay",
   "title": "memlay relay",
-  "tags": ["memlay", "nostr"],
+  "tags": [
+    "memlay",
+    "nostr"
+  ],
   "timezone": "browser",
   "refresh": "30s",
-  "time": {"from": "now-24h", "to": "now"},
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
   "schemaVersion": 39,
   "editable": true,
   "graphTooltip": 1,
-  "annotations": {"list": []},
-  "templating": {"list": []},
+  "annotations": {
+    "list": []
+  },
+  "templating": {
+    "list": []
+  },
   "panels": [
-    {"id": 1, "type": "row", "title": "Store", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0}, "panels": []},
-    {"id": 2, "type": "stat", "title": "Events in store", "gridPos": {"h": 4, "w": 4, "x": 0, "y": 1},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "memlay_store_events"}],
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}},
-    {"id": 3, "type": "stat", "title": "Payload", "gridPos": {"h": 4, "w": 4, "x": 4, "y": 1},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "memlay_store_payload_bytes"}],
-      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []}},
-    {"id": 4, "type": "stat", "title": "Avg event size", "gridPos": {"h": 4, "w": 4, "x": 8, "y": 1},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "memlay_store_payload_bytes / memlay_store_events"}],
-      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []}},
-    {"id": 5, "type": "stat", "title": "Memory amplification", "gridPos": {"h": 4, "w": 4, "x": 12, "y": 1},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "memlay_memory_amplification_ratio"}],
-      "fieldConfig": {"defaults": {"unit": "none", "decimals": 2}, "overrides": []}},
-    {"id": 6, "type": "stat", "title": "Connections", "gridPos": {"h": 4, "w": 4, "x": 16, "y": 1},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "memlay_active_connections"}],
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}},
-    {"id": 7, "type": "stat", "title": "Tombstones", "gridPos": {"h": 4, "w": 4, "x": 20, "y": 1},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "memlay_tombstones"}],
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}},
-
-    {"id": 8, "type": "timeseries", "title": "Events in store", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "memlay_store_events", "legendFormat": "events"}],
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}},
-    {"id": 9, "type": "timeseries", "title": "Memory vs budget", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Store",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Events in store",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
       "targets": [
-        {"refId": "A", "expr": "memlay_store_payload_bytes", "legendFormat": "payload"},
-        {"refId": "B", "expr": "memlay_store_payload_budget_bytes", "legendFormat": "payload budget"},
-        {"refId": "C", "expr": "memlay_process_memory_bytes", "legendFormat": "process RSS"},
-        {"refId": "D", "expr": "memlay_memory_limit_bytes", "legendFormat": "memory limit"},
-        {"refId": "E", "expr": "max(container_memory_working_set_bytes{namespace=\"v0l\",pod=~\"memlay.*\",container=\"memlay\"})", "legendFormat": "cgroup working set"}
+        {
+          "refId": "A",
+          "expr": "memlay_store_events"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []}},
-
-    {"id": 10, "type": "row", "title": "Ingest and eviction", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 13}, "panels": []},
-    {"id": 11, "type": "timeseries", "title": "Events saved per second", "gridPos": {"h": 8, "w": 8, "x": 0, "y": 14},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Payload",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
       "targets": [
-        {"refId": "A", "expr": "rate(memlay_events_saved_total[5m])", "legendFormat": "saved"},
-        {"refId": "B", "expr": "rate(memlay_events_evicted_total[5m])", "legendFormat": "evicted"},
-        {"refId": "C", "expr": "rate(memlay_events_deleted_total[5m])", "legendFormat": "deleted (NIP-09)"}
+        {
+          "refId": "A",
+          "expr": "memlay_store_payload_bytes"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []}},
-    {"id": 12, "type": "timeseries", "title": "Saved events per second by kind", "gridPos": {"h": 8, "w": 8, "x": 8, "y": 14},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "sum by (kind) (rate(memlay_events_saved_by_kind_total[5m])) > 0", "legendFormat": "kind {{kind}}"}],
-      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"stacking": {"mode": "normal"}}}, "overrides": []}},
-    {"id": 13, "type": "timeseries", "title": "Saved bytes per second by kind", "gridPos": {"h": 8, "w": 8, "x": 16, "y": 14},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "sum by (kind) (rate(memlay_event_bytes_saved_by_kind_total[5m])) > 0", "legendFormat": "kind {{kind}}"}],
-      "fieldConfig": {"defaults": {"unit": "Bps", "custom": {"stacking": {"mode": "normal"}}}, "overrides": []}},
-    {"id": 14, "type": "bargauge", "title": "Stored bytes by kind (range)", "gridPos": {"h": 8, "w": 8, "x": 0, "y": 22},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "sort_desc(sum by (kind) (increase(memlay_event_bytes_saved_by_kind_total[$__range]))) > 0", "legendFormat": "kind {{kind}}", "instant": true}],
-      "options": {"orientation": "horizontal", "displayMode": "gradient"},
-      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []}},
-    {"id": 15, "type": "timeseries", "title": "Average saved event size by kind", "gridPos": {"h": 8, "w": 8, "x": 8, "y": 22},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "sum by (kind) (rate(memlay_event_bytes_saved_by_kind_total[15m])) / sum by (kind) (rate(memlay_events_saved_by_kind_total[15m]))", "legendFormat": "kind {{kind}}"}],
-      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []}},
-    {"id": 16, "type": "timeseries", "title": "Write delay (insert) quantiles", "gridPos": {"h": 8, "w": 8, "x": 16, "y": 22},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Avg event size",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
       "targets": [
-        {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(memlay_write_delay_seconds_bucket[5m])))", "legendFormat": "p50"},
-        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(memlay_write_delay_seconds_bucket[5m])))", "legendFormat": "p95"},
-        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(memlay_write_delay_seconds_bucket[5m])))", "legendFormat": "p99"}
+        {
+          "refId": "A",
+          "expr": "memlay_store_payload_bytes / memlay_store_events"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}},
-
-    {"id": 20, "type": "row", "title": "Connections and delivery", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 30}, "panels": []},
-    {"id": 21, "type": "timeseries", "title": "Active connections", "gridPos": {"h": 8, "w": 8, "x": 0, "y": 31},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "memlay_active_connections", "legendFormat": "connections"}],
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}},
-    {"id": 22, "type": "timeseries", "title": "Events delivered per second", "gridPos": {"h": 8, "w": 8, "x": 8, "y": 31},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "rate(memlay_events_output_total[5m])", "legendFormat": "output"}],
-      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []}},
-    {"id": 23, "type": "timeseries", "title": "Slow client signals per second", "gridPos": {"h": 8, "w": 8, "x": 16, "y": 31},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Memory amplification",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
       "targets": [
-        {"refId": "A", "expr": "rate(memlay_events_dropped_total[5m])", "legendFormat": "events dropped"},
-        {"refId": "B", "expr": "rate(memlay_subscriptions_overflowed_total[5m])", "legendFormat": "subs overflowed (CLOSED)"},
-        {"refId": "C", "expr": "rate(memlay_idle_disconnects_total[5m])", "legendFormat": "idle disconnects"}
+        {
+          "refId": "A",
+          "expr": "memlay_memory_amplification_ratio"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []}},
-
-    {"id": 30, "type": "row", "title": "Request cost (CPU time and response time)", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 39}, "panels": []},
-    {"id": 31, "type": "timeseries", "title": "REQ CPU time quantiles", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Connections",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
       "targets": [
-        {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(memlay_request_cpu_seconds_bucket{kind=\"req\"}[5m])))", "legendFormat": "p50"},
-        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(memlay_request_cpu_seconds_bucket{kind=\"req\"}[5m])))", "legendFormat": "p95"},
-        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(memlay_request_cpu_seconds_bucket{kind=\"req\"}[5m])))", "legendFormat": "p99"}
+        {
+          "refId": "A",
+          "expr": "memlay_active_connections"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}},
-    {"id": 32, "type": "timeseries", "title": "REQ response time quantiles (to EOSE)", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Tombstones",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
       "targets": [
-        {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(memlay_request_response_seconds_bucket{kind=\"req\"}[5m])))", "legendFormat": "p50"},
-        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(memlay_request_response_seconds_bucket{kind=\"req\"}[5m])))", "legendFormat": "p95"},
-        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(memlay_request_response_seconds_bucket{kind=\"req\"}[5m])))", "legendFormat": "p99"}
+        {
+          "refId": "A",
+          "expr": "memlay_tombstones"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}},
-    {"id": 33, "type": "timeseries", "title": "EVENT CPU time quantiles", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 48},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Events in store",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
       "targets": [
-        {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(memlay_request_cpu_seconds_bucket{kind=\"event\"}[5m])))", "legendFormat": "p50"},
-        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(memlay_request_cpu_seconds_bucket{kind=\"event\"}[5m])))", "legendFormat": "p95"},
-        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(memlay_request_cpu_seconds_bucket{kind=\"event\"}[5m])))", "legendFormat": "p99"}
+        {
+          "refId": "A",
+          "expr": "memlay_store_events",
+          "legendFormat": "events"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}},
-    {"id": 34, "type": "timeseries", "title": "EVENT response time quantiles (to OK)", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 48},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Memory vs budget",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
       "targets": [
-        {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(memlay_request_response_seconds_bucket{kind=\"event\"}[5m])))", "legendFormat": "p50"},
-        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(memlay_request_response_seconds_bucket{kind=\"event\"}[5m])))", "legendFormat": "p95"},
-        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(memlay_request_response_seconds_bucket{kind=\"event\"}[5m])))", "legendFormat": "p99"}
+        {
+          "refId": "A",
+          "expr": "memlay_store_payload_bytes",
+          "legendFormat": "payload"
+        },
+        {
+          "refId": "B",
+          "expr": "memlay_store_payload_budget_bytes",
+          "legendFormat": "payload budget"
+        },
+        {
+          "refId": "C",
+          "expr": "memlay_process_memory_bytes",
+          "legendFormat": "process RSS"
+        },
+        {
+          "refId": "D",
+          "expr": "memlay_memory_limit_bytes",
+          "legendFormat": "memory limit"
+        },
+        {
+          "refId": "E",
+          "expr": "max(container_memory_working_set_bytes{namespace=\"v0l\",pod=~\"memlay.*\",container=\"memlay\"})",
+          "legendFormat": "cgroup working set"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}},
-    {"id": 35, "type": "timeseries", "title": "CPU seconds spent per second, by request kind", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 56},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
-      "targets": [{"refId": "A", "expr": "sum by (kind) (rate(memlay_request_cpu_seconds_sum[5m]))", "legendFormat": "{{kind}}"}],
-      "fieldConfig": {"defaults": {"unit": "s", "custom": {"stacking": {"mode": "normal"}}}, "overrides": []}},
-    {"id": 36, "type": "timeseries", "title": "Time to EOSE quantiles", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 56},
-      "datasource": {"type": "prometheus", "uid": "ef6tps5x5perkf"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Ingest and eviction",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      },
+      "panels": []
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Events saved per second",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 14
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
       "targets": [
-        {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(memlay_tteose_seconds_bucket[5m])))", "legendFormat": "p50"},
-        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(memlay_tteose_seconds_bucket[5m])))", "legendFormat": "p95"},
-        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(memlay_tteose_seconds_bucket[5m])))", "legendFormat": "p99"}
+        {
+          "refId": "A",
+          "expr": "rate(memlay_events_saved_total[5m])",
+          "legendFormat": "saved"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(memlay_events_evicted_total[5m])",
+          "legendFormat": "evicted"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(memlay_events_deleted_total[5m])",
+          "legendFormat": "deleted (NIP-09)"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}}
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Saved events per second by kind",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 14
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(memlay_events_saved_by_kind_total[5m])) > 0",
+          "legendFormat": "kind {{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Saved bytes per second by kind",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 14
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(memlay_event_bytes_saved_by_kind_total[5m])) > 0",
+          "legendFormat": "kind {{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 14,
+      "type": "bargauge",
+      "title": "Stored bytes by kind (range)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 22
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sort_desc(sum by (kind) (increase(memlay_event_bytes_saved_by_kind_total[$__range]))) > 0",
+          "legendFormat": "kind {{kind}}",
+          "instant": true
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Average saved event size by kind",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 22
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(memlay_event_bytes_saved_by_kind_total[15m])) / sum by (kind) (rate(memlay_events_saved_by_kind_total[15m]))",
+          "legendFormat": "kind {{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Write delay (insert) quantiles",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 22
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(memlay_write_delay_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(memlay_write_delay_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(memlay_write_delay_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Connections and delivery",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
+      "panels": []
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Active connections",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 31
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "memlay_active_connections",
+          "legendFormat": "connections"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Events delivered per second",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 31
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(memlay_events_output_total[5m])",
+          "legendFormat": "output"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Network bytes per second",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 39
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(memlay_transmit_bytes_total[5m])",
+          "legendFormat": "transmit"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(memlay_receive_bytes_total[5m])",
+          "legendFormat": "receive"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Average transmit bytes per delivered event",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 39
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(memlay_transmit_bytes_total[15m]) / rate(memlay_events_output_total[15m])",
+          "legendFormat": "bytes per event"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Slow client signals per second",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 31
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(memlay_events_dropped_total[5m])",
+          "legendFormat": "events dropped"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(memlay_subscriptions_overflowed_total[5m])",
+          "legendFormat": "subs overflowed (CLOSED)"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(memlay_idle_disconnects_total[5m])",
+          "legendFormat": "idle disconnects"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Request cost (CPU time and response time)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "panels": []
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "REQ CPU time quantiles",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(memlay_request_cpu_seconds_bucket{kind=\"req\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(memlay_request_cpu_seconds_bucket{kind=\"req\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(memlay_request_cpu_seconds_bucket{kind=\"req\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "REQ response time quantiles (to EOSE)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(memlay_request_response_seconds_bucket{kind=\"req\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(memlay_request_response_seconds_bucket{kind=\"req\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(memlay_request_response_seconds_bucket{kind=\"req\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "EVENT CPU time quantiles",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(memlay_request_cpu_seconds_bucket{kind=\"event\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(memlay_request_cpu_seconds_bucket{kind=\"event\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(memlay_request_cpu_seconds_bucket{kind=\"event\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "EVENT response time quantiles (to OK)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(memlay_request_response_seconds_bucket{kind=\"event\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(memlay_request_response_seconds_bucket{kind=\"event\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(memlay_request_response_seconds_bucket{kind=\"event\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "CPU seconds spent per second, by request kind",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 64
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(memlay_request_cpu_seconds_sum[5m]))",
+          "legendFormat": "{{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Time to EOSE quantiles",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 64
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(memlay_tteose_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(memlay_tteose_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(memlay_tteose_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    }
   ]
 }

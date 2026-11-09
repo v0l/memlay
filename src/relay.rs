@@ -398,6 +398,7 @@ async fn handle_socket(
     // Sender task: drains from send_rx and writes to the socket.
     let mut sender_handle = tokio::spawn(async move {
         while let Some(msg) = send_rx.recv().await {
+            let len = msg.len();
             if ws_send
                 .send(axum::extract::ws::Message::Text(msg.into()))
                 .await
@@ -405,6 +406,7 @@ async fn handle_socket(
             {
                 break;
             }
+            crate::metrics::add_bytes_sent(len);
         }
     });
 
@@ -421,6 +423,7 @@ async fn handle_socket(
                     axum::extract::ws::Message::Text(text) => {
                         client_active = true;
                         stats.add_bytes(text.len());
+                        crate::metrics::add_bytes_received(text.len());
                         if text.len() > MAX_MESSAGE_BYTES {
                             stats.reject();
                             let notice = NostrMessage::Notification {
