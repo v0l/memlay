@@ -776,7 +776,12 @@ impl EventStore {
 
         let mut count = 0;
         for event in self.index.iter_all() {
-            writer.write_all(&event.raw)?;
+            if event.raw.contains(&b'\n') {
+                let value: serde_json::Value = serde_json::from_slice(&event.raw)?;
+                serde_json::to_writer(&mut writer, &value)?;
+            } else {
+                writer.write_all(&event.raw)?;
+            }
             writer.write_all(b"\n")?;
             received.write_all(&event.id)?;
             received.write_all(&event.received_at.to_le_bytes())?;
@@ -1910,6 +1915,31 @@ mod tests {
         let restored = EventStore::new(config(&path));
         restored.load_from_disk().unwrap();
         assert_eq!(restored.len(), before, "restart dropped stored events");
+    }
+
+    #[test]
+    fn pretty_printed_event_survives_snapshot_restart() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let json = format!(
+            "{{\n  \"id\": \"{}\",\n  \"pubkey\": \"{}\",\n  \"created_at\": 7,\n  \"kind\": 1,\n  \"tags\": [],\n  \"content\": \"line one\\nline two\",\n  \"sig\": \"{}\"\n}}",
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(128)
+        );
+        let event = Arc::new(Event::from_json_unchecked(json.as_bytes()).unwrap());
+
+        let store = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        store.insert(event.clone());
+        store.checkpoint().unwrap();
+        drop(store);
+
+        let restored = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        restored.load_from_disk().unwrap();
+        let back = restored
+            .get(&event.id)
+            .expect("multi-line event lost on restart");
+        assert_eq!(back.created_at, 7);
     }
 
     #[test]
