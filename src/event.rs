@@ -32,7 +32,6 @@ pub struct Event {
     pub created_at: u64,
     pub kind: u32,
     pub tags: Vec<Tag>,
-    pub sig: [u8; 64],
 
     // Original JSON for zero-copy response
     pub raw: Bytes,
@@ -47,7 +46,7 @@ impl Event {
         let raw_event: RawEvent = serde_json::from_slice(json)?;
         let id = parse_hex_32(&raw_event.id).ok_or(EventParseError::InvalidId)?;
         let pubkey = parse_hex_32(&raw_event.pubkey).ok_or(EventParseError::InvalidPubkey)?;
-        let sig = parse_hex_64(&raw_event.sig).ok_or(EventParseError::InvalidSignature)?;
+        parse_hex_64(&raw_event.sig).ok_or(EventParseError::InvalidSignature)?;
         let tags = raw_event
             .tags
             .iter()
@@ -67,7 +66,6 @@ impl Event {
             created_at: raw_event.created_at,
             kind: raw_event.kind,
             tags,
-            sig,
             raw: Bytes::copy_from_slice(json),
         })
     }
@@ -125,7 +123,6 @@ impl Event {
             created_at: raw_event.created_at,
             kind: raw_event.kind,
             tags,
-            sig,
             raw: Bytes::copy_from_slice(json),
         })
     }
