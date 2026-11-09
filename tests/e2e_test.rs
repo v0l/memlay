@@ -466,6 +466,52 @@ async fn test_nip09_cannot_delete_another_authors_event() {
     bob.shutdown().await;
 }
 
+/// An event far larger than the WebSocket read/write buffers must still be
+/// accepted and delivered intact, in both directions.
+#[tokio::test]
+async fn test_large_event_round_trips_through_small_buffers() {
+    let url = spawn_relay().await;
+    let client = make_client(&url).await;
+
+    let body = "x".repeat(400 * 1024);
+    let output = client
+        .send_event_builder(EventBuilder::text_note(&body))
+        .await
+        .unwrap();
+    assert!(output.failed.is_empty(), "relay rejected large event");
+
+    let events = client
+        .fetch_events(Filter::new().id(output.val), Duration::from_secs(5))
+        .await
+        .unwrap();
+    let event = events.into_iter().next().expect("large event not returned");
+    assert_eq!(event.content.len(), body.len());
+
+    client.shutdown().await;
+}
+
+/// A frame over the message limit closes the connection instead of being buffered.
+#[tokio::test]
+async fn test_oversized_frame_is_refused() {
+    let url = spawn_relay().await;
+
+    tokio::task::spawn_blocking(move || {
+        let (mut ws, _) = connect(&url).unwrap();
+        let huge = format!(r##"["REQ","s",{{"#t":["{}"]}}]"##, "y".repeat(600 * 1024));
+        let _ = ws.send(Message::Text(huge.into()));
+        let closed = loop {
+            match ws.read() {
+                Ok(Message::Close(_)) | Err(_) => break true,
+                Ok(Message::Text(t)) if t.contains("EOSE") => break false,
+                Ok(_) => {}
+            }
+        };
+        assert!(closed, "oversized frame was processed");
+    })
+    .await
+    .unwrap();
+}
+
 fn read_text(
     ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
 ) -> String {

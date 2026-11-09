@@ -29,6 +29,10 @@ const CONN_SEND_CAP: usize = 16384;
 /// frames are rejected to bound per-message CPU/allocation.
 const MAX_MESSAGE_BYTES: usize = 512 * 1024;
 
+const WS_READ_BUFFER: usize = 8 * 1024;
+
+const WS_WRITE_BUFFER: usize = 8 * 1024;
+
 /// Maximum number of filters accepted in a single REQ.
 const MAX_FILTERS_PER_REQ: usize = 20;
 
@@ -179,22 +183,25 @@ async fn root_handler(
             let config = state.config.clone();
             let analytics = state.analytics.clone();
             let client = ClientInfo::from_headers(&headers);
-            ws.on_failed_upgrade(move |err| {
-                tracing::warn!(%addr, "WebSocket upgrade failed: {}", err);
-            })
-            .on_upgrade(move |socket| {
-                handle_socket(
-                    socket,
-                    addr,
-                    subscriptions,
-                    fanout,
-                    conn_count,
-                    verify_sem,
-                    config,
-                    analytics.open_connection(addr.ip(), client),
-                )
-            })
-            .into_response()
+            ws.read_buffer_size(WS_READ_BUFFER)
+                .write_buffer_size(WS_WRITE_BUFFER)
+                .max_message_size(MAX_MESSAGE_BYTES)
+                .on_failed_upgrade(move |err| {
+                    tracing::warn!(%addr, "WebSocket upgrade failed: {}", err);
+                })
+                .on_upgrade(move |socket| {
+                    handle_socket(
+                        socket,
+                        addr,
+                        subscriptions,
+                        fanout,
+                        conn_count,
+                        verify_sem,
+                        config,
+                        analytics.open_connection(addr.ip(), client),
+                    )
+                })
+                .into_response()
         }
         Err(_) => landing_page(&state.config).into_response(),
     }
