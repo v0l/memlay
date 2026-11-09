@@ -11,11 +11,30 @@ use crate::event::Event;
 /// This prevents OOM from corrupted/malicious WAL files
 const MAX_WAL_RECORD_SIZE: usize = 16 * 1024 * 1024;
 
+fn read_record(reader: &mut impl Read) -> anyhow::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_WAL_RECORD_SIZE {
+        tracing::error!(
+            len,
+            max = MAX_WAL_RECORD_SIZE,
+            "WAL record exceeds maximum size, possible corruption"
+        );
+        anyhow::bail!("WAL record size {len} exceeds maximum {MAX_WAL_RECORD_SIZE}");
+    }
+    let mut data = vec![0u8; len];
+    reader.read_exact(&mut data)?;
+    Ok(data)
+}
+
 /// WAL operation types
 #[derive(Debug, Clone)]
 pub enum WalOp {
     /// Insert an event
     Insert(Vec<u8>),
+    /// Insert an event, with the unix second the relay received it
+    InsertAt(u32, Vec<u8>),
     /// Delete an event by ID (32 bytes)
     Delete([u8; 32]),
     /// NIP-09 deletion of an event by ID (32 bytes). Replayed as a delete that
@@ -79,6 +98,7 @@ impl WriteAheadLog {
             WalOp::Insert(_) => file.write_all(&[0u8])?,
             WalOp::Delete(_) => file.write_all(&[1u8])?,
             WalOp::Tombstone(_) => file.write_all(&[2u8])?,
+            WalOp::InsertAt(..) => file.write_all(&[3u8])?,
         }
 
         match op {
@@ -87,6 +107,11 @@ impl WriteAheadLog {
                 let len = data.len() as u32;
                 file.write_all(&len.to_le_bytes())?;
                 // Write data
+                file.write_all(data)?;
+            }
+            WalOp::InsertAt(received_at, data) => {
+                file.write_all(&received_at.to_le_bytes())?;
+                file.write_all(&(data.len() as u32).to_le_bytes())?;
                 file.write_all(data)?;
             }
             WalOp::Delete(id) | WalOp::Tombstone(id) => {
@@ -108,6 +133,7 @@ impl WriteAheadLog {
         // Record-type byte (1) + payload (length prefix + data, or 32-byte id).
         let written = 1 + match op {
             WalOp::Insert(data) => 4 + data.len() as u64,
+            WalOp::InsertAt(_, data) => 8 + data.len() as u64,
             WalOp::Delete(_) | WalOp::Tombstone(_) => 32,
         };
         self.bytes_written.fetch_add(written, Ordering::Relaxed);
@@ -161,7 +187,7 @@ impl WriteAheadLog {
 
     /// Append an insert operation
     pub fn insert(&self, event: &Arc<Event>) -> anyhow::Result<()> {
-        self.append(&WalOp::Insert(event.raw.to_vec()))
+        self.append(&WalOp::InsertAt(event.received_at, event.raw.to_vec()))
     }
 
     /// Append a delete operation
@@ -209,29 +235,13 @@ impl WriteAheadLog {
 
             match op_type[0] {
                 0 => {
-                    // Insert operation
-                    let mut len_buf = [0u8; 4];
-                    reader.read_exact(&mut len_buf)?;
-                    let len = u32::from_le_bytes(len_buf) as usize;
-
-                    // Validate record size to prevent OOM from corrupted WAL
-                    if len > MAX_WAL_RECORD_SIZE {
-                        tracing::error!(
-                            len = len,
-                            max = MAX_WAL_RECORD_SIZE,
-                            "WAL record exceeds maximum size, possible corruption"
-                        );
-                        return Err(anyhow::anyhow!(
-                            "WAL record size {} exceeds maximum {}",
-                            len,
-                            MAX_WAL_RECORD_SIZE
-                        ));
-                    }
-
-                    let mut data = vec![0u8; len];
-                    reader.read_exact(&mut data)?;
-
-                    f(WalOp::Insert(data));
+                    f(WalOp::Insert(read_record(&mut reader)?));
+                }
+                3 => {
+                    let mut received_at = [0u8; 4];
+                    reader.read_exact(&mut received_at)?;
+                    let data = read_record(&mut reader)?;
+                    f(WalOp::InsertAt(u32::from_le_bytes(received_at), data));
                 }
                 1 => {
                     // Delete operation
@@ -318,7 +328,11 @@ impl WriteAheadLog {
             }
 
             match op_type[0] {
-                0 => {
+                op @ (0 | 3) => {
+                    let mut received_at = [0u8; 4];
+                    if op == 3 && reader.read_exact(&mut received_at).is_err() {
+                        break;
+                    }
                     let mut len_buf = [0u8; 4];
                     if reader.read_exact(&mut len_buf).is_err() {
                         break;
@@ -345,7 +359,10 @@ impl WriteAheadLog {
                     };
 
                     if keep {
-                        writer.write_all(&[0u8])?;
+                        writer.write_all(&[op])?;
+                        if op == 3 {
+                            writer.write_all(&received_at)?;
+                        }
                         writer.write_all(&len_buf)?;
                         writer.write_all(&data)?;
                         kept += 1;
@@ -432,7 +449,7 @@ mod tests {
         let mut tombstones = 0;
 
         wal.replay(|op| match op {
-            WalOp::Insert(_) => inserts += 1,
+            WalOp::Insert(_) | WalOp::InsertAt(..) => inserts += 1,
             WalOp::Delete(_) => deletes += 1,
             WalOp::Tombstone(_) => tombstones += 1,
         })
@@ -468,7 +485,7 @@ mod tests {
 
         let mut count = 0;
         wal2.replay(|op| {
-            if matches!(op, WalOp::Insert(_)) {
+            if matches!(op, WalOp::Insert(_) | WalOp::InsertAt(..)) {
                 count += 1;
             }
         })
@@ -522,5 +539,44 @@ mod tests {
         })
         .unwrap();
         assert_eq!(count, 20, "Should have 20 entries after compaction");
+    }
+
+    #[test]
+    fn received_at_survives_wal_replay_and_compaction() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let wal = WriteAheadLog::open(&path).unwrap();
+        let event = Arc::new(
+            EventBuilder::new()
+                .kind(1059)
+                .content("wrapped")
+                .build()
+                .with_received_at(1_700_000_123),
+        );
+        wal.insert(&event).unwrap();
+        wal.compact(&HashSet::from([event.id])).unwrap();
+
+        let mut seen = Vec::new();
+        wal.replay(|op| seen.push(op)).unwrap();
+        assert!(
+            matches!(seen.as_slice(), [WalOp::InsertAt(1_700_000_123, data)] if data == &event.raw[..]),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn wal_written_before_received_at_still_replays() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let wal = WriteAheadLog::open(&path).unwrap();
+        let event = EventBuilder::new().kind(1).content("old").build();
+        wal.append(&WalOp::Insert(event.raw.to_vec())).unwrap();
+        wal.delete(&[9; 32]).unwrap();
+
+        let mut seen = Vec::new();
+        wal.replay(|op| seen.push(op)).unwrap();
+        assert!(
+            matches!(seen.as_slice(), [WalOp::Insert(data), WalOp::Delete([9, ..])] if data == &event.raw[..])
+        );
     }
 }

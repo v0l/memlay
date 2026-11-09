@@ -40,6 +40,13 @@ idle_timeout: 10
 # analytics_max_entries: 10000
 # analytics_token: "change-me"
 
+# Per-kind retention, counted from when the relay received the event (not its
+# created_at, which clients can backdate). Units: s, m, h, d, w. Kinds not
+# listed are kept until memory eviction. Advertised in NIP-11 as `retention`.
+# kind_retention:
+#   1059: 2d
+#   30078: 2d
+
 # Prometheus server URL for metrics proxy (optional)
 # When set, /metrics endpoint will proxy requests to this Prometheus server
 # The landing page will also show a link to view metrics

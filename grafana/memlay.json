@@ -315,6 +315,11 @@
           "refId": "C",
           "expr": "rate(memlay_events_deleted_total[5m])",
           "legendFormat": "deleted (NIP-09)"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(memlay_events_expired_total[5m]))",
+          "legendFormat": "expired (retention)"
         }
       ],
       "fieldConfig": {

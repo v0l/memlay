@@ -87,6 +87,12 @@ lazy_static::lazy_static! {
         "Events evicted to stay inside the memory budget"
     ).expect("Failed to register events_evicted counter");
 
+    pub static ref EVENTS_EXPIRED: CounterVec = register_counter_vec!(
+        "memlay_events_expired_total",
+        "Events removed when their kind retention ran out, by kind",
+        &["kind"]
+    ).expect("Failed to register events_expired counter");
+
     pub static ref SAVED_BY_KIND: CounterVec = register_counter_vec!(
         "memlay_events_saved_by_kind_total",
         "Events saved, by kind (untracked kinds are grouped as other)",
@@ -218,6 +224,10 @@ pub fn add_bytes_received(n: usize) {
 
 pub fn inc_events_evicted(n: usize) {
     EVENTS_EVICTED.inc_by(n as f64);
+}
+
+pub fn inc_events_expired(kind: u32) {
+    EVENTS_EXPIRED.with_label_values(&[&kind_label(kind)]).inc();
 }
 
 pub fn observe_request(kind: &str, cpu: std::time::Duration, wall: std::time::Duration) {

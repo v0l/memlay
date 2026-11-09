@@ -346,6 +346,7 @@ curl http://localhost:8080/metrics
 | `memlay_events_dropped_total` | live events dropped on a full connection queue |
 | `memlay_subscriptions_overflowed_total` | subs closed with `CLOSED` because the client fell behind |
 | `memlay_idle_disconnects_total` | connections reaped by `idle_timeout` |
+| `memlay_events_expired_total{kind}` | events removed by `kind_retention` |
 | `memlay_request_cpu_seconds{kind}` | histogram of thread CPU time per REQ / EVENT |
 | `memlay_request_response_seconds{kind}` | histogram of wall time per REQ (to EOSE) / EVENT (to OK) |
 
@@ -355,6 +356,13 @@ sorted, deduped, hex lowercased) and keyed by hash, so reordered or repeated REQ
 collapse. Reports top REQs, REQ shapes (values stripped), clients (header fingerprint,
 UA, origin), IPs and live connections, each with CPU and response time histograms.
 Tracking is capped by `analytics_max_entries`; `analytics_token` requires a bearer token.
+
+### Kind retention (`kind_retention`)
+Map of kind to duration (`1059: 2d`). The clock starts when the relay receives the event
+(`Event::received_at`), because clients backdate `created_at` (gift wraps by up to 2 days).
+`received_at` is persisted in WAL op 3 and in `received_at.bin` beside the snapshot; events from
+older files fall back to the load time. Expired events are swept in the eviction task, skipped on
+load, and refused on insert with `OK true "expired: ..."`. Advertised in NIP-11 `retention`.
 
 ### Admin dashboard (`/admin`)
 Preact + Vite app in `dashboard/`, built to a single HTML file that `src/relay.rs` pulls in

@@ -114,6 +114,18 @@ async fn main() {
     tracing::info!("Starting memlay relay on {}", config.bind_addr);
     tracing::debug!("Config: {config:?}");
 
+    match config.kind_retention() {
+        Ok(retention) => {
+            for (kind, ttl) in &retention {
+                tracing::info!(kind, ttl_secs = ttl.as_secs(), "kind retention");
+            }
+        }
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    }
+
     let relay = Relay::new(config.clone());
     let events = relay.events.clone();
     let router = relay.router();

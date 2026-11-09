@@ -31,6 +31,7 @@ pub struct Event {
     pub pubkey: [u8; 32],
     pub created_at: u64,
     pub kind: u32,
+    pub received_at: u32,
     tags: Box<[IndexedTag]>,
 
     // Original JSON for zero-copy response
@@ -68,9 +69,15 @@ impl Event {
             pubkey,
             created_at: raw_event.created_at,
             kind: raw_event.kind,
+            received_at: now_secs(),
             tags: index_tags(json, &raw_event.tags),
             raw: Bytes::copy_from_slice(json),
         })
+    }
+
+    pub fn with_received_at(mut self, received_at: u32) -> Self {
+        self.received_at = received_at;
+        self
     }
 
     fn tag_bytes<'a>(&'a self, tag: &'a IndexedTag) -> &'a [u8] {
@@ -307,6 +314,12 @@ pub enum EventParseError {
     IdMismatch,
     #[error("Signature verification failed")]
     BadSignature,
+}
+
+fn now_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().min(u32::MAX as u64) as u32)
 }
 
 /// Parse a 32-byte hex string into bytes

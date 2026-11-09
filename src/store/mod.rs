@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -7,6 +8,7 @@ use std::time::Duration;
 
 mod index;
 mod pressure;
+mod retention;
 mod wal;
 
 use pressure::RssPressure;
@@ -53,6 +55,8 @@ const MIN_AMPLIFICATION_SAMPLE_BYTES: u64 = 64 * 1024 * 1024;
 
 const AMPLIFICATION_FILE: &str = "amplification";
 
+const RECEIVED_AT_FILE: &str = "received_at.bin";
+
 /// Adaptive eviction state
 struct EvictionState {
     interval_seconds: AtomicUsize,
@@ -70,6 +74,8 @@ pub enum InsertResult {
     /// Event was previously deleted by a NIP-09 deletion request; rejected to
     /// prevent resurrection of deleted events.
     Deleted,
+    /// Event's kind retention had already run out, so it was not stored.
+    Expired,
     /// Event was stored successfully
     Stored {
         /// The newly inserted event
@@ -95,6 +101,7 @@ pub struct EventStore {
     amplification_milli: AtomicU64,
     amplification_known: AtomicBool,
     peak_payload: AtomicU64,
+    retention: retention::Retention,
 }
 
 impl StoreConfig {
@@ -178,7 +185,68 @@ impl EventStore {
             amplification_milli: AtomicU64::new(DEFAULT_AMPLIFICATION_MILLI),
             amplification_known: AtomicBool::new(false),
             peak_payload: AtomicU64::new(0),
+            retention: retention::Retention::default(),
         }
+    }
+
+    pub fn with_kind_retention(mut self, ttl: &HashMap<u32, Duration>) -> Self {
+        self.retention = retention::Retention::new(ttl);
+        self
+    }
+
+    pub fn kind_retention(&self) -> &HashMap<u32, u32> {
+        self.retention.ttl()
+    }
+
+    fn is_expired(&self, event: &Event, now: u32) -> bool {
+        self.retention
+            .expires_at(event.kind, event.received_at)
+            .is_some_and(|at| at <= now)
+    }
+
+    fn track_expiry(&self, event: &Event) {
+        if let Some(at) = self.retention.expires_at(event.kind, event.received_at) {
+            self.retention.track(at, event.id);
+        }
+    }
+
+    /// Remove every event whose kind retention has run out. Returns how many
+    /// were removed.
+    pub fn expire(&self, now: u32) -> usize {
+        const BATCH: usize = 4096;
+        if self.retention.is_empty() {
+            return 0;
+        }
+        let mut removed = 0;
+        loop {
+            let due = self.retention.take_due(now, BATCH);
+            if due.is_empty() {
+                break;
+            }
+            for (at, id) in &due {
+                let still_due = self
+                    .index
+                    .get(id)
+                    .is_some_and(|e| self.retention.expires_at(e.kind, e.received_at) == Some(*at));
+                if !still_due {
+                    continue;
+                }
+                if let Some(event) = self.index.remove(id) {
+                    crate::metrics::inc_events_expired(event.kind);
+                    removed += 1;
+                }
+            }
+            if due.len() < BATCH {
+                break;
+            }
+        }
+        if removed > 0 {
+            tracing::debug!(removed, tracked = self.retention.len(), "expired events");
+        }
+        if self.retention.len() > self.index.len() {
+            self.retention.retain(|id| self.index.get(id).is_some());
+        }
+        removed
     }
 
     /// Start background WAL group-commit task (call from relay startup).
@@ -236,6 +304,7 @@ impl EventStore {
                 tokio::task::spawn_blocking(move || {
                     let inner_start = std::time::Instant::now();
                     tracing::trace!(task_id = %task_id, "eviction blocking task started");
+                    store.expire(retention::now_secs());
                     store.maybe_evict();
                     let duration = inner_start.elapsed();
                     tracing::trace!(task_id = %task_id, duration_us = %duration.as_micros(), "eviction blocking task completed");
@@ -484,6 +553,10 @@ impl EventStore {
             return InsertResult::Ephemeral;
         }
 
+        if self.is_expired(&event, retention::now_secs()) {
+            return InsertResult::Expired;
+        }
+
         // Insert the event and get replaced events (for replaceable events).
         // EventIndex::insert handles the duplicate check atomically (via the
         // by_id insert) and returns LostRace if we lost a replaceable race, so
@@ -498,6 +571,8 @@ impl EventStore {
                 return InsertResult::Deleted;
             }
             InsertOutcome::Inserted { replaced } => {
+                self.track_expiry(&event);
+
                 // Write to WAL if available
                 if let Some(ref wal) = self.wal {
                     if let Err(e) = wal.insert(&event) {
@@ -688,25 +763,46 @@ impl EventStore {
     fn write_snapshot(&self, data_dir: &Path) -> anyhow::Result<usize> {
         let events_file = data_dir.join("events.jsonl");
         let temp_file = data_dir.join("events.jsonl.tmp");
+        let received_file = data_dir.join(RECEIVED_AT_FILE);
+        let received_temp = data_dir.join(format!("{RECEIVED_AT_FILE}.tmp"));
 
-        let file = File::create(&temp_file)?;
-        let mut writer = BufWriter::new(file);
+        let mut writer = BufWriter::new(File::create(&temp_file)?);
+        let mut received = BufWriter::new(File::create(&received_temp)?);
 
         let mut count = 0;
         for event in self.index.iter_all() {
             writer.write_all(&event.raw)?;
             writer.write_all(b"\n")?;
+            received.write_all(&event.id)?;
+            received.write_all(&event.received_at.to_le_bytes())?;
             count += 1;
         }
 
-        writer.flush()?;
-        writer.get_ref().sync_data()?;
+        for w in [&mut writer, &mut received] {
+            w.flush()?;
+            w.get_ref().sync_data()?;
+        }
         drop(writer);
+        drop(received);
 
-        // Atomic rename into place.
+        fs::rename(&received_temp, &received_file)?;
         fs::rename(&temp_file, &events_file)?;
         self.persist_amplification(data_dir)?;
         Ok(count)
+    }
+
+    fn read_received_at(data_dir: &Path) -> HashMap<[u8; 32], u32> {
+        let Ok(bytes) = fs::read(data_dir.join(RECEIVED_AT_FILE)) else {
+            return HashMap::new();
+        };
+        bytes
+            .chunks_exact(36)
+            .map(|r| {
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&r[..32]);
+                (id, u32::from_le_bytes(r[32..36].try_into().unwrap()))
+            })
+            .collect()
     }
 
     fn persist_amplification(&self, data_dir: &Path) -> anyhow::Result<()> {
@@ -879,11 +975,19 @@ impl EventStore {
         let mut applied = 0usize;
         let mut errors = 0usize;
         let mut evicted = 0usize;
+        let mut expired = 0usize;
+        let now = retention::now_secs();
 
         // Insert one event, evicting the oldest events if we exceed the limit.
         let index = &self.index;
         let mut ingest = |event: Arc<Event>| {
-            index.insert(event);
+            if self.is_expired(&event, now) {
+                expired += 1;
+                return;
+            }
+            if matches!(index.insert(event.clone()), InsertOutcome::Inserted { .. }) {
+                self.track_expiry(&event);
+            }
             if eviction_threshold > 0 && index.memory_bytes() > eviction_threshold {
                 while index.memory_bytes() > eviction_target {
                     let oldest = index.get_oldest(1);
@@ -899,6 +1003,7 @@ impl EventStore {
         // 1. Restore the snapshot (events.jsonl), one raw JSON event per line.
         let snapshot_file = data_dir.join("events.jsonl");
         if snapshot_file.exists() {
+            let received_at = Self::read_received_at(data_dir);
             match File::open(&snapshot_file) {
                 Ok(f) => {
                     for line in BufReader::new(f).lines() {
@@ -911,6 +1016,10 @@ impl EventStore {
                         }
                         match Event::from_json_unchecked(line.as_bytes()) {
                             Ok(event) => {
+                                let event = match received_at.get(&event.id) {
+                                    Some(&at) => event.with_received_at(at),
+                                    None => event,
+                                };
                                 ingest(Arc::new(event));
                                 applied += 1;
                             }
@@ -932,6 +1041,16 @@ impl EventStore {
             WalOp::Insert(data) => match Event::from_json_unchecked(&data) {
                 Ok(event) => {
                     ingest(Arc::new(event));
+                    applied += 1;
+                }
+                Err(e) => {
+                    errors += 1;
+                    tracing::warn!(error = %e, "failed to parse event from WAL");
+                }
+            },
+            WalOp::InsertAt(received_at, data) => match Event::from_json_unchecked(&data) {
+                Ok(event) => {
+                    ingest(Arc::new(event.with_received_at(received_at)));
                     applied += 1;
                 }
                 Err(e) => {
@@ -979,6 +1098,7 @@ impl EventStore {
         tracing::info!(
             applied,
             evicted,
+            expired,
             errors,
             remaining = self.index.len(),
             memory = self.index.memory_bytes(),
@@ -1579,6 +1699,135 @@ mod tests {
         assert!(
             store2.get(&oldest_event_id).is_none(),
             "Should evict oldest event (created_at=0)"
+        );
+    }
+
+    fn kind_event(kind: u32, created_at: u64, received_at: u32) -> Arc<Event> {
+        Arc::new(
+            EventBuilder::new()
+                .kind(kind)
+                .created_at(created_at)
+                .content("retention")
+                .build()
+                .with_received_at(received_at),
+        )
+    }
+
+    fn gift_wrap_retention() -> HashMap<u32, Duration> {
+        HashMap::from([(1059, Duration::from_secs(100))])
+    }
+
+    #[test]
+    fn expire_removes_only_kinds_past_their_retention() {
+        let store =
+            EventStore::new(StoreConfig::default()).with_kind_retention(&gift_wrap_retention());
+        let now = retention::now_secs();
+        let old_wrap = kind_event(1059, 1, now - 150);
+        let fresh_wrap = kind_event(1059, 2, now - 50);
+        let old_note = kind_event(1, 3, now - 10_000);
+        for e in [&old_wrap, &fresh_wrap, &old_note] {
+            assert!(matches!(
+                store.insert(e.clone()),
+                InsertResult::Expired | InsertResult::Stored { .. }
+            ));
+        }
+        assert!(
+            store.get(&old_wrap.id).is_none(),
+            "already-expired wrap was stored"
+        );
+
+        assert_eq!(store.expire(now), 0);
+        assert!(store.get(&fresh_wrap.id).is_some());
+        assert!(store.get(&old_note.id).is_some());
+
+        assert_eq!(store.expire(now + 60), 1);
+        assert!(store.get(&fresh_wrap.id).is_none());
+        assert!(
+            store.get(&old_note.id).is_some(),
+            "kind without retention expired"
+        );
+    }
+
+    #[test]
+    fn retention_runs_from_receipt_not_created_at() {
+        let store =
+            EventStore::new(StoreConfig::default()).with_kind_retention(&gift_wrap_retention());
+        let now = retention::now_secs();
+        let backdated = kind_event(1059, (now - 2 * 86_400) as u64, now);
+        assert!(matches!(
+            store.insert(backdated.clone()),
+            InsertResult::Stored { .. }
+        ));
+        assert_eq!(store.expire(now + 99), 0);
+        assert_eq!(store.expire(now + 100), 1);
+    }
+
+    #[test]
+    fn expiry_skips_events_already_evicted_or_deleted() {
+        let store =
+            EventStore::new(StoreConfig::default()).with_kind_retention(&gift_wrap_retention());
+        let now = retention::now_secs();
+        let wrap = kind_event(1059, 1, now);
+        store.insert(wrap.clone());
+        store.index.remove(&wrap.id);
+        assert_eq!(store.expire(now + 1000), 0);
+        assert_eq!(store.retention.len(), 0);
+    }
+
+    #[test]
+    fn restart_keeps_receipt_time_and_drops_expired() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let open = || {
+            EventStore::new(StoreConfig::with_persistence(0, path.clone()))
+                .with_kind_retention(&gift_wrap_retention())
+        };
+        let now = retention::now_secs();
+        let expiring = kind_event(1059, 1, now - 99);
+        let fresh = kind_event(1059, 2, now);
+        let in_wal = kind_event(1059, 3, now - 98);
+
+        let store = open();
+        store.insert(expiring.clone());
+        store.insert(fresh.clone());
+        store.checkpoint().unwrap();
+        store.insert(in_wal.clone());
+        store.save_to_disk().unwrap();
+        drop(store);
+
+        std::thread::sleep(Duration::from_millis(2100));
+        let restored = open();
+        restored.load_from_disk().unwrap();
+        assert!(
+            restored.get(&expiring.id).is_none(),
+            "snapshot event outlived its retention"
+        );
+        assert!(
+            restored.get(&in_wal.id).is_none(),
+            "WAL event outlived its retention"
+        );
+        let kept = restored.get(&fresh.id).expect("fresh event lost");
+        assert_eq!(kept.received_at, now, "receipt time reset on restart");
+        assert_eq!(restored.expire(now + 100), 1);
+    }
+
+    #[test]
+    fn snapshot_without_receipt_times_still_loads() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let store = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        store.insert(kind_event(1059, 1, 5));
+        store.checkpoint().unwrap();
+        drop(store);
+        std::fs::remove_file(std::path::Path::new(&path).join(RECEIVED_AT_FILE)).unwrap();
+
+        let restored = EventStore::new(StoreConfig::with_persistence(0, path.clone()))
+            .with_kind_retention(&gift_wrap_retention());
+        restored.load_from_disk().unwrap();
+        assert_eq!(
+            restored.len(),
+            1,
+            "event without a recorded receipt time was dropped"
         );
     }
 

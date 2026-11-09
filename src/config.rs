@@ -1,4 +1,6 @@
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -43,6 +45,10 @@ pub struct Config {
     /// Bearer token required for /analytics. When unset the endpoint is open.
     #[serde(default)]
     pub analytics_token: Option<String>,
+    /// How long events of a kind are kept after the relay receives them, e.g.
+    /// `1059: 2d`. Kinds not listed are kept until memory eviction.
+    #[serde(default)]
+    pub kind_retention: HashMap<String, String>,
     /// Directory for the rotating log file. When unset, logs go to stdout only.
     #[serde(default)]
     pub log_dir: Option<String>,
@@ -57,6 +63,39 @@ impl Config {
 
         Ok(cfg.try_deserialize()?)
     }
+
+    pub fn kind_retention(&self) -> anyhow::Result<HashMap<u32, Duration>> {
+        self.kind_retention
+            .iter()
+            .map(|(kind, ttl)| {
+                let kind: u32 = kind
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("kind_retention: bad kind {kind:?}"))?;
+                let ttl = parse_duration(ttl).ok_or_else(|| {
+                    anyhow::anyhow!("kind_retention: bad duration {ttl:?} for kind {kind}")
+                })?;
+                Ok((kind, ttl))
+            })
+            .collect()
+    }
+}
+
+fn parse_duration(s: &str) -> Option<Duration> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (number, unit) = s.split_at(split);
+    let number: u64 = number.parse().ok()?;
+    let unit_secs = match unit.trim() {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        _ => return None,
+    };
+    let secs = number.checked_mul(unit_secs)?;
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 fn default_bind_addr() -> String {
@@ -102,7 +141,56 @@ impl Default for Config {
             prometheus_url: None,
             analytics_max_entries: default_analytics_max_entries(),
             analytics_token: None,
+            kind_retention: HashMap::new(),
             log_dir: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_retention_durations() {
+        assert_eq!(parse_duration("90"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_duration("45m"), Some(Duration::from_secs(2700)));
+        assert_eq!(parse_duration("36h"), Some(Duration::from_secs(129_600)));
+        assert_eq!(parse_duration(" 2d "), Some(Duration::from_secs(172_800)));
+        assert_eq!(parse_duration("1w"), Some(Duration::from_secs(604_800)));
+        for bad in ["", "0", "0h", "h", "2x", "-1d", "1.5d"] {
+            assert_eq!(parse_duration(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn kind_retention_rejects_bad_entries() {
+        let mut config = Config::default();
+        config.kind_retention.insert("1059".into(), "2d".into());
+        assert_eq!(
+            config.kind_retention().unwrap(),
+            HashMap::from([(1059, Duration::from_secs(172_800))])
+        );
+
+        config.kind_retention.insert("gift".into(), "2d".into());
+        assert!(config.kind_retention().is_err());
+        config.kind_retention.remove("gift");
+        config.kind_retention.insert("30078".into(), "soon".into());
+        assert!(config.kind_retention().is_err());
+    }
+
+    #[test]
+    fn kind_retention_loads_from_yaml() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "kind_retention:\n  1059: 2d\n  \"30078\": 12h\n").unwrap();
+        let config = Config::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            config.kind_retention().unwrap(),
+            HashMap::from([
+                (1059, Duration::from_secs(172_800)),
+                (30078, Duration::from_secs(43_200)),
+            ])
+        );
     }
 }
