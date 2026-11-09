@@ -32,7 +32,6 @@ pub struct Event {
     pub created_at: u64,
     pub kind: u32,
     pub tags: Vec<Tag>,
-    pub content: String,
     pub sig: [u8; 64],
 
     // Original JSON for zero-copy response
@@ -68,7 +67,6 @@ impl Event {
             created_at: raw_event.created_at,
             kind: raw_event.kind,
             tags,
-            content: raw_event.content,
             sig,
             raw: Bytes::copy_from_slice(json),
         })
@@ -127,7 +125,6 @@ impl Event {
             created_at: raw_event.created_at,
             kind: raw_event.kind,
             tags,
-            content: raw_event.content,
             sig,
             raw: Bytes::copy_from_slice(json),
         })
@@ -236,7 +233,6 @@ impl fmt::Debug for Event {
             .field("created_at", &self.created_at)
             .field("kind", &self.kind)
             .field("tags", &self.tags)
-            .field("content_len", &self.content.len())
             .field("raw_len", &self.raw.len())
             .finish()
     }
@@ -416,7 +412,6 @@ mod tests {
         assert_eq!(event.pubkey[31], 2);
         assert_eq!(event.created_at, 1234567890);
         assert_eq!(event.kind, 1);
-        assert_eq!(event.content, "hello world");
         assert_eq!(event.tags.len(), 2);
 
         let e_tags: Vec<_> = event.e_tags().collect();
