@@ -130,6 +130,7 @@ impl Relay {
 
         Router::new()
             .route("/analytics", get(analytics_handler))
+            .route("/admin", get(admin_handler))
             .route("/stats", get(stats_handler))
             .route("/", get(root_handler))
             .route("/metrics", get(metrics_handler))
@@ -199,6 +200,19 @@ async fn metrics_handler(State(_state): State<Arc<AppState>>) -> impl IntoRespon
         HeaderValue::from_static("text/plain; version=0.0.4"),
     );
     (headers, metrics)
+}
+
+async fn admin_handler() -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(
+        "Cache-Control",
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
+    (headers, include_str!("../dashboard/dist/index.html"))
 }
 
 async fn analytics_handler(

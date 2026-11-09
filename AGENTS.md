@@ -356,6 +356,13 @@ collapse. Reports top REQs, REQ shapes (values stripped), clients (header finger
 UA, origin), IPs and live connections, each with CPU and response time histograms.
 Tracking is capped by `analytics_max_entries`; `analytics_token` requires a bearer token.
 
+### Admin dashboard (`/admin`)
+Preact + Vite app in `dashboard/`, built to a single HTML file that `src/relay.rs` pulls in
+with `include_str!`. It is a build artifact: run `./scripts/build-dashboard.sh` (needs bun)
+before `cargo build`; `build.rs` fails with that hint when it is missing. `bun run dev` in
+`dashboard/` proxies `/analytics` to `RELAY_URL` (default `http://127.0.0.1:8080`). The Docker
+image builds it in a bun stage.
+
 Note: counters/gauges must be created with `register_counter!` / `register_gauge!`, **not**
 `Counter::new` / `Gauge::new` — the plain constructors never attach to the default registry,
 so `prometheus::gather()` silently omits them.
