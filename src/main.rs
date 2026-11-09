@@ -114,10 +114,10 @@ async fn main() {
     tracing::info!("Starting memlay relay on {}", config.bind_addr);
     tracing::debug!("Config: {config:?}");
 
-    match config.kind_retention() {
-        Ok(retention) => {
-            for (kind, ttl) in &retention {
-                tracing::info!(kind, ttl_secs = ttl.as_secs(), "kind retention");
+    match config.kind_quota() {
+        Ok(quota) => {
+            for (kind, share) in &quota {
+                tracing::info!(kind, percent = share * 100.0, "kind quota");
             }
         }
         Err(e) => {

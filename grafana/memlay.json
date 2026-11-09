@@ -318,8 +318,8 @@
         },
         {
           "refId": "D",
-          "expr": "sum(rate(memlay_events_expired_total[5m]))",
-          "legendFormat": "expired (retention)"
+          "expr": "sum(rate(memlay_events_quota_evicted_total[5m]))",
+          "legendFormat": "quota evicted"
         }
       ],
       "fieldConfig": {
@@ -896,6 +896,56 @@
           "unit": "s"
         },
         "overrides": []
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Quota kinds: bytes held vs limit",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 72
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "ef6tps5x5perkf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "memlay_store_kind_bytes",
+          "legendFormat": "kind {{kind}} held"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (kind) (rate(memlay_events_quota_evicted_total[5m]))",
+          "legendFormat": "kind {{kind}} quota evicted/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
       }
     }
   ]

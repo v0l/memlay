@@ -79,10 +79,10 @@ impl Relay {
             StoreConfig::from_target_ram_percent(config.target_ram_percent)
         };
 
-        let kind_retention = config
-            .kind_retention()
+        let kind_quota = config
+            .kind_quota()
             .unwrap_or_else(|e| panic!("invalid config: {e}"));
-        let events = Arc::new(EventStore::new(store_config).with_kind_retention(&kind_retention));
+        let events = Arc::new(EventStore::new(store_config).with_kind_quota(&kind_quota));
 
         // Load events from disk if persistence is enabled
         if let Err(e) = events.load_from_disk() {
@@ -118,6 +118,9 @@ impl Relay {
                 crate::metrics::PROCESS_MEMORY.set(store.cached_process_memory() as f64);
                 crate::metrics::AMPLIFICATION.set(store.amplification());
                 crate::metrics::TOMBSTONES.set(store.tombstone_count() as f64);
+                for &kind in store.kind_quota().keys() {
+                    crate::metrics::set_kind_bytes(kind, store.kind_bytes(kind));
+                }
             }
         });
 
@@ -172,7 +175,7 @@ async fn root_handler(
         .unwrap_or(false);
 
     if wants_info {
-        return nip11_handler(&state.config, state.events.kind_retention()).into_response();
+        return nip11_handler(&state.config).into_response();
     }
 
     let addr = state.trusted_proxies.client_addr(addr, &headers);
@@ -256,6 +259,20 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     let events = &state.events;
     let cfg = events.config();
     let store_memory = events.memory_bytes();
+    let kind_quota: serde_json::Map<String, serde_json::Value> = events
+        .kind_quota()
+        .iter()
+        .map(|(&kind, share)| {
+            (
+                kind.to_string(),
+                serde_json::json!({
+                    "percent": share * 100.0,
+                    "limit_bytes": events.kind_limit(kind),
+                    "bytes": events.kind_bytes(kind),
+                }),
+            )
+        })
+        .collect();
     let body = serde_json::json!({
         "events": events.len(),
         "tombstones": events.tombstone_count(),
@@ -266,6 +283,7 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         "process_memory": events.cached_process_memory(),
         "memory_limit": cfg.max_bytes,
         "memory_used": store_memory,
+        "kind_quota": kind_quota,
     });
     let mut headers = HeaderMap::new();
     headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
@@ -275,25 +293,8 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 /// NIPs this relay implements, advertised in NIP-11 and on the landing page.
 const SUPPORTED_NIPS: &[u16] = &[1, 9, 11];
 
-fn nip11_retention(ttl: &std::collections::HashMap<u32, u32>) -> Vec<serde_json::Value> {
-    let mut by_time: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
-    for (&kind, &secs) in ttl {
-        by_time.entry(secs).or_default().push(kind);
-    }
-    by_time
-        .into_iter()
-        .map(|(time, mut kinds)| {
-            kinds.sort_unstable();
-            serde_json::json!({ "kinds": kinds, "time": time })
-        })
-        .collect()
-}
-
-fn nip11_handler(
-    config: &Config,
-    kind_retention: &std::collections::HashMap<u32, u32>,
-) -> impl IntoResponse {
-    let mut body = serde_json::json!({
+fn nip11_handler(config: &Config) -> impl IntoResponse {
+    let body = serde_json::json!({
         "name": "memlay",
         "description": "High-performance in-memory Nostr relay",
         "software": "https://github.com/v0l/memlay",
@@ -306,9 +307,6 @@ fn nip11_handler(
             "idle_timeout": config.idle_timeout
         }
     });
-    if !kind_retention.is_empty() {
-        body["retention"] = nip11_retention(kind_retention).into();
-    }
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -739,15 +737,6 @@ fn process_event_message(
                         message: "ephemeral: will not be stored".to_string(),
                     }
                 }
-                InsertResult::Expired => {
-                    fanout.publish(BroadcastEvent::new(ev));
-                    NostrMessage::Ok {
-                        id: event_id,
-                        accepted: true,
-                        message: "expired: retention for this kind has passed, not stored"
-                            .to_string(),
-                    }
-                }
                 InsertResult::Duplicate => {
                     tracing::debug!(id = %event_id, "duplicate event");
                     NostrMessage::Ok {
@@ -841,7 +830,7 @@ fn apply_deletion_request(
             accepted: false,
             message: "deleted: this event was removed by a deletion request".to_string(),
         },
-        InsertResult::Ephemeral | InsertResult::Duplicate | InsertResult::Expired => {
+        InsertResult::Ephemeral | InsertResult::Duplicate => {
             fanout.publish(BroadcastEvent::new(ev.clone()));
             NostrMessage::Ok {
                 id: event_id,

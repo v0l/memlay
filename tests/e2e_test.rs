@@ -512,6 +512,45 @@ async fn test_oversized_frame_is_refused() {
     .unwrap();
 }
 
+/// A kind with a quota is stored, served and reported in /stats with its share.
+#[tokio::test]
+async fn test_kind_quota_reported_and_served() {
+    let mut config = Config::default();
+    config.kind_quota.insert("1059".into(), 20.0);
+    config.kind_quota.insert("30078".into(), 10.0);
+    let url = spawn_relay_with(config).await;
+
+    let client = make_client(&url).await;
+    let output = client
+        .send_event_builder(EventBuilder::new(Kind::Custom(1059), "wrapped"))
+        .await
+        .unwrap();
+    assert!(output.failed.is_empty());
+    let events = client
+        .fetch_events(Filter::new().id(output.val), Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1, "quota kind was not stored");
+    client.shutdown().await;
+
+    let http = url.replace("ws://", "");
+    let stats: serde_json::Value = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let mut tcp = std::net::TcpStream::connect(&http).unwrap();
+        tcp.write_all(b"GET /stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut body = String::new();
+        tcp.read_to_string(&mut body).unwrap();
+        serde_json::from_str(body.split("\r\n\r\n").nth(1).unwrap().trim()).unwrap()
+    })
+    .await
+    .unwrap();
+    let wraps = &stats["kind_quota"]["1059"];
+    assert_eq!(wraps["percent"], 20.0);
+    assert!(wraps["bytes"].as_u64().unwrap() > 0, "{stats}");
+    assert_eq!(stats["kind_quota"]["30078"]["bytes"], 0);
+}
+
 fn read_text(
     ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
 ) -> String {

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 mod index;
 mod pressure;
-mod retention;
+mod quota;
 mod wal;
 
 use pressure::RssPressure;
@@ -57,6 +57,8 @@ const AMPLIFICATION_FILE: &str = "amplification";
 
 const RECEIVED_AT_FILE: &str = "received_at.bin";
 
+const QUOTA_TRIM_PER_INSERT: usize = 64;
+
 /// Adaptive eviction state
 struct EvictionState {
     interval_seconds: AtomicUsize,
@@ -74,8 +76,6 @@ pub enum InsertResult {
     /// Event was previously deleted by a NIP-09 deletion request; rejected to
     /// prevent resurrection of deleted events.
     Deleted,
-    /// Event's kind retention had already run out, so it was not stored.
-    Expired,
     /// Event was stored successfully
     Stored {
         /// The newly inserted event
@@ -101,7 +101,7 @@ pub struct EventStore {
     amplification_milli: AtomicU64,
     amplification_known: AtomicBool,
     peak_payload: AtomicU64,
-    retention: retention::Retention,
+    quota: quota::KindQuota,
 }
 
 impl StoreConfig {
@@ -185,66 +185,74 @@ impl EventStore {
             amplification_milli: AtomicU64::new(DEFAULT_AMPLIFICATION_MILLI),
             amplification_known: AtomicBool::new(false),
             peak_payload: AtomicU64::new(0),
-            retention: retention::Retention::default(),
+            quota: quota::KindQuota::default(),
         }
     }
 
-    pub fn with_kind_retention(mut self, ttl: &HashMap<u32, Duration>) -> Self {
-        self.retention = retention::Retention::new(ttl);
+    pub fn with_kind_quota(mut self, share: &HashMap<u32, f64>) -> Self {
+        self.quota = quota::KindQuota::new(share);
         self
     }
 
-    pub fn kind_retention(&self) -> &HashMap<u32, u32> {
-        self.retention.ttl()
+    pub fn kind_quota(&self) -> &HashMap<u32, f64> {
+        self.quota.shares()
     }
 
-    fn is_expired(&self, event: &Event, now: u32) -> bool {
-        self.retention
-            .expires_at(event.kind, event.received_at)
-            .is_some_and(|at| at <= now)
-    }
-
-    fn track_expiry(&self, event: &Event) {
-        if let Some(at) = self.retention.expires_at(event.kind, event.received_at) {
-            self.retention.track(at, event.id);
+    /// Byte cap for `kind`, if it has a quota.
+    pub fn kind_limit(&self, kind: u32) -> Option<usize> {
+        let budget = self.payload_budget();
+        if budget == 0 {
+            return None;
         }
+        self.quota.limit(kind, budget)
     }
 
-    /// Remove every event whose kind retention has run out. Returns how many
-    /// were removed.
-    pub fn expire(&self, now: u32) -> usize {
-        const BATCH: usize = 4096;
-        if self.retention.is_empty() {
+    pub fn kind_bytes(&self, kind: u32) -> usize {
+        self.index.kind_bytes(kind)
+    }
+
+    fn track_quota(&self, event: &Event) {
+        self.quota.track(event.kind, event.received_at, event.id);
+    }
+
+    /// Trim `kind` back under its quota, earliest-received first, removing at
+    /// most `max` events. Returns how many were removed.
+    fn enforce_quota(&self, kind: u32, max: usize) -> usize {
+        let Some(limit) = self.kind_limit(kind) else {
             return 0;
-        }
+        };
         let mut removed = 0;
-        loop {
-            let due = self.retention.take_due(now, BATCH);
-            if due.is_empty() {
+        while removed < max && self.index.kind_bytes(kind) > limit {
+            let Some(id) = self.quota.pop_oldest(kind, 1).pop() else {
                 break;
-            }
-            for (at, id) in &due {
-                let still_due = self
-                    .index
-                    .get(id)
-                    .is_some_and(|e| self.retention.expires_at(e.kind, e.received_at) == Some(*at));
-                if !still_due {
-                    continue;
-                }
-                if let Some(event) = self.index.remove(id) {
-                    crate::metrics::inc_events_expired(event.kind);
-                    removed += 1;
-                }
-            }
-            if due.len() < BATCH {
-                break;
+            };
+            if self.index.get(&id).is_some_and(|e| e.kind == kind)
+                && self.index.remove(&id).is_some()
+            {
+                removed += 1;
             }
         }
         if removed > 0 {
-            tracing::debug!(removed, tracked = self.retention.len(), "expired events");
+            crate::metrics::inc_quota_evicted(kind, removed);
         }
-        if self.retention.len() > self.index.len() {
-            self.retention.retain(|id| self.index.get(id).is_some());
+        removed
+    }
+
+    /// Trim every quota kind back under its share and drop queue entries for
+    /// events that left the store some other way. Returns how many were removed.
+    pub fn enforce_quotas(&self) -> usize {
+        if self.quota.is_empty() {
+            return 0;
+        }
+        let kinds: Vec<u32> = self.quota.kinds().collect();
+        let mut removed = 0;
+        for kind in kinds {
+            removed += self.enforce_quota(kind, usize::MAX);
+            if self.quota.tracked(kind) > self.index.kind_count(kind) * 2 + 1024 {
+                self.quota.retain(kind, |id| {
+                    self.index.get(id).is_some_and(|e| e.kind == kind)
+                });
+            }
         }
         removed
     }
@@ -304,7 +312,7 @@ impl EventStore {
                 tokio::task::spawn_blocking(move || {
                     let inner_start = std::time::Instant::now();
                     tracing::trace!(task_id = %task_id, "eviction blocking task started");
-                    store.expire(retention::now_secs());
+                    store.enforce_quotas();
                     store.maybe_evict();
                     let duration = inner_start.elapsed();
                     tracing::trace!(task_id = %task_id, duration_us = %duration.as_micros(), "eviction blocking task completed");
@@ -553,10 +561,6 @@ impl EventStore {
             return InsertResult::Ephemeral;
         }
 
-        if self.is_expired(&event, retention::now_secs()) {
-            return InsertResult::Expired;
-        }
-
         // Insert the event and get replaced events (for replaceable events).
         // EventIndex::insert handles the duplicate check atomically (via the
         // by_id insert) and returns LostRace if we lost a replaceable race, so
@@ -571,7 +575,8 @@ impl EventStore {
                 return InsertResult::Deleted;
             }
             InsertOutcome::Inserted { replaced } => {
-                self.track_expiry(&event);
+                self.track_quota(&event);
+                self.enforce_quota(event.kind, QUOTA_TRIM_PER_INSERT);
 
                 // Write to WAL if available
                 if let Some(ref wal) = self.wal {
@@ -975,18 +980,12 @@ impl EventStore {
         let mut applied = 0usize;
         let mut errors = 0usize;
         let mut evicted = 0usize;
-        let mut expired = 0usize;
-        let now = retention::now_secs();
 
         // Insert one event, evicting the oldest events if we exceed the limit.
         let index = &self.index;
         let mut ingest = |event: Arc<Event>| {
-            if self.is_expired(&event, now) {
-                expired += 1;
-                return;
-            }
             if matches!(index.insert(event.clone()), InsertOutcome::Inserted { .. }) {
-                self.track_expiry(&event);
+                self.track_quota(&event);
             }
             if eviction_threshold > 0 && index.memory_bytes() > eviction_threshold {
                 while index.memory_bytes() > eviction_target {
@@ -1095,10 +1094,11 @@ impl EventStore {
         if errors > 0 {
             tracing::warn!(errors, "some events failed to load");
         }
+        let over_quota = self.enforce_quotas();
         tracing::info!(
             applied,
             evicted,
-            expired,
+            over_quota,
             errors,
             remaining = self.index.len(),
             memory = self.index.memory_bytes(),
@@ -1707,108 +1707,142 @@ mod tests {
             EventBuilder::new()
                 .kind(kind)
                 .created_at(created_at)
-                .content("retention")
+                .content(&format!("quota {created_at}"))
                 .build()
                 .with_received_at(received_at),
         )
     }
 
-    fn gift_wrap_retention() -> HashMap<u32, Duration> {
-        HashMap::from([(1059, Duration::from_secs(100))])
+    const QUOTA_BUDGET: usize = 100_000;
+
+    fn quota_config(persistence_path: Option<String>) -> StoreConfig {
+        StoreConfig {
+            max_bytes: QUOTA_BUDGET,
+            persistence_path,
+            use_wal: true,
+        }
+    }
+
+    fn quota_store(persistence_path: Option<String>) -> EventStore {
+        let store = EventStore::new(quota_config(persistence_path))
+            .with_kind_quota(&HashMap::from([(1059, 0.2)]));
+        store.amplification_milli.store(1000, Ordering::Relaxed);
+        store
     }
 
     #[test]
-    fn expire_removes_only_kinds_past_their_retention() {
+    fn kind_over_quota_loses_earliest_received_first() {
+        let store = quota_store(None);
+        let limit = store.kind_limit(1059).unwrap();
+        assert_eq!(limit, QUOTA_BUDGET / 5);
+
+        let mut wraps = Vec::new();
+        for i in 0..200u32 {
+            let created_at = 10_000 - i as u64;
+            let wrap = kind_event(1059, created_at, 1_000 + i);
+            store.insert(wrap.clone());
+            wraps.push(wrap);
+        }
+
+        assert!(store.kind_bytes(1059) <= limit, "kind is over its quota");
+        assert!(
+            store.kind_bytes(1059) > limit - 200,
+            "trimmed far below the quota"
+        );
+        let kept: Vec<bool> = wraps.iter().map(|w| store.get(&w.id).is_some()).collect();
+        let first_kept = kept.iter().position(|k| *k).unwrap();
+        assert!(first_kept > 0, "nothing was trimmed");
+        assert!(
+            kept[first_kept..].iter().all(|k| *k),
+            "trimmed by created_at instead of receipt order"
+        );
+    }
+
+    #[test]
+    fn quota_leaves_other_kinds_alone() {
+        let store = quota_store(None);
+        let notes: Vec<_> = (0..100u64).map(|i| kind_event(1, i, i as u32)).collect();
+        for n in &notes {
+            store.insert(n.clone());
+        }
+        for i in 0..300u32 {
+            store.insert(kind_event(1059, 50_000 + i as u64, 5_000 + i));
+        }
+        assert!(notes.iter().all(|n| store.get(&n.id).is_some()));
+        assert!(store.kind_bytes(1059) <= store.kind_limit(1059).unwrap());
+    }
+
+    #[test]
+    fn quota_skips_events_already_removed() {
+        let store = quota_store(None);
+        let first = kind_event(1059, 1, 1);
+        store.insert(first.clone());
+        store.index.remove(&first.id);
+        let later: Vec<_> = (0..200u32)
+            .map(|i| kind_event(1059, 100 + i as u64, 100 + i))
+            .collect();
+        for w in &later {
+            store.insert(w.clone());
+        }
+        assert!(store.kind_bytes(1059) <= store.kind_limit(1059).unwrap());
+        assert!(store.get(&later.last().unwrap().id).is_some());
+    }
+
+    #[test]
+    fn replaced_quota_events_do_not_pin_the_queue() {
         let store =
-            EventStore::new(StoreConfig::default()).with_kind_retention(&gift_wrap_retention());
-        let now = retention::now_secs();
-        let old_wrap = kind_event(1059, 1, now - 150);
-        let fresh_wrap = kind_event(1059, 2, now - 50);
-        let old_note = kind_event(1, 3, now - 10_000);
-        for e in [&old_wrap, &fresh_wrap, &old_note] {
-            assert!(matches!(
-                store.insert(e.clone()),
-                InsertResult::Expired | InsertResult::Stored { .. }
+            EventStore::new(quota_config(None)).with_kind_quota(&HashMap::from([(30078, 0.2)]));
+        store.amplification_milli.store(1000, Ordering::Relaxed);
+        for i in 0..5_000u32 {
+            store.insert(Arc::new(
+                EventBuilder::new()
+                    .kind(30078)
+                    .created_at(i as u64)
+                    .tag("d", "settings")
+                    .content("v")
+                    .build()
+                    .with_received_at(i),
             ));
         }
-        assert!(
-            store.get(&old_wrap.id).is_none(),
-            "already-expired wrap was stored"
-        );
-
-        assert_eq!(store.expire(now), 0);
-        assert!(store.get(&fresh_wrap.id).is_some());
-        assert!(store.get(&old_note.id).is_some());
-
-        assert_eq!(store.expire(now + 60), 1);
-        assert!(store.get(&fresh_wrap.id).is_none());
-        assert!(
-            store.get(&old_note.id).is_some(),
-            "kind without retention expired"
-        );
+        assert_eq!(store.index.kind_count(30078), 1);
+        store.enforce_quotas();
+        assert!(store.quota.tracked(30078) <= 1024 + 3);
     }
 
     #[test]
-    fn retention_runs_from_receipt_not_created_at() {
-        let store =
-            EventStore::new(StoreConfig::default()).with_kind_retention(&gift_wrap_retention());
-        let now = retention::now_secs();
-        let backdated = kind_event(1059, (now - 2 * 86_400) as u64, now);
-        assert!(matches!(
-            store.insert(backdated.clone()),
-            InsertResult::Stored { .. }
-        ));
-        assert_eq!(store.expire(now + 99), 0);
-        assert_eq!(store.expire(now + 100), 1);
-    }
-
-    #[test]
-    fn expiry_skips_events_already_evicted_or_deleted() {
-        let store =
-            EventStore::new(StoreConfig::default()).with_kind_retention(&gift_wrap_retention());
-        let now = retention::now_secs();
-        let wrap = kind_event(1059, 1, now);
-        store.insert(wrap.clone());
-        store.index.remove(&wrap.id);
-        assert_eq!(store.expire(now + 1000), 0);
-        assert_eq!(store.retention.len(), 0);
-    }
-
-    #[test]
-    fn restart_keeps_receipt_time_and_drops_expired() {
+    fn restart_trims_by_original_receipt_order() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_str().unwrap().to_string();
-        let open = || {
-            EventStore::new(StoreConfig::with_persistence(0, path.clone()))
-                .with_kind_retention(&gift_wrap_retention())
-        };
-        let now = retention::now_secs();
-        let expiring = kind_event(1059, 1, now - 99);
-        let fresh = kind_event(1059, 2, now);
-        let in_wal = kind_event(1059, 3, now - 98);
 
-        let store = open();
-        store.insert(expiring.clone());
-        store.insert(fresh.clone());
-        store.checkpoint().unwrap();
-        store.insert(in_wal.clone());
-        store.save_to_disk().unwrap();
-        drop(store);
+        let unlimited = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        let wraps: Vec<_> = (0..200u32)
+            .map(|i| kind_event(1059, 10_000 - i as u64, 1_000 + i))
+            .collect();
+        for (i, w) in wraps.iter().enumerate() {
+            unlimited.insert(w.clone());
+            if i == 100 {
+                unlimited.checkpoint().unwrap();
+            }
+        }
+        unlimited.save_to_disk().unwrap();
+        drop(unlimited);
 
-        std::thread::sleep(Duration::from_millis(2100));
-        let restored = open();
+        let restored = quota_store(Some(path.clone()));
         restored.load_from_disk().unwrap();
+        let limit = restored.kind_limit(1059).unwrap();
+        assert!(restored.kind_bytes(1059) <= limit);
         assert!(
-            restored.get(&expiring.id).is_none(),
-            "snapshot event outlived its retention"
+            restored.kind_bytes(1059) > limit - 200,
+            "trimmed far below the quota"
         );
+        let newest = restored
+            .get(&wraps.last().unwrap().id)
+            .expect("newest wrap lost");
+        assert_eq!(newest.received_at, 1_199, "receipt time reset on restart");
         assert!(
-            restored.get(&in_wal.id).is_none(),
-            "WAL event outlived its retention"
+            restored.get(&wraps[0].id).is_none(),
+            "earliest-received wrap kept"
         );
-        let kept = restored.get(&fresh.id).expect("fresh event lost");
-        assert_eq!(kept.received_at, now, "receipt time reset on restart");
-        assert_eq!(restored.expire(now + 100), 1);
     }
 
     #[test]
@@ -1821,8 +1855,7 @@ mod tests {
         drop(store);
         std::fs::remove_file(std::path::Path::new(&path).join(RECEIVED_AT_FILE)).unwrap();
 
-        let restored = EventStore::new(StoreConfig::with_persistence(0, path.clone()))
-            .with_kind_retention(&gift_wrap_retention());
+        let restored = quota_store(Some(path.clone()));
         restored.load_from_disk().unwrap();
         assert_eq!(
             restored.len(),

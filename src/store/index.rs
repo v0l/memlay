@@ -213,6 +213,8 @@ pub struct EventIndex {
 
     // Track event count for lock-free stats
     event_count: AtomicUsize,
+
+    kind_bytes: DashMap<u32, (AtomicUsize, AtomicUsize)>,
 }
 
 impl EventIndex {
@@ -229,6 +231,7 @@ impl EventIndex {
             tombstones: Tombstones::new(),
             memory_bytes: AtomicUsize::new(0),
             event_count: AtomicUsize::new(0),
+            kind_bytes: DashMap::new(),
         }
     }
 
@@ -308,9 +311,7 @@ impl EventIndex {
         }
 
         // Track memory usage (raw JSON bytes) — only after confirmed new insert
-        self.memory_bytes
-            .fetch_add(event.raw.len(), AtomicOrdering::Relaxed);
-        self.event_count.fetch_add(1, AtomicOrdering::Relaxed);
+        self.account_added(&event);
 
         // Pubkey index
         {
@@ -411,9 +412,7 @@ impl EventIndex {
     /// while we were adding to secondary indexes, leaving orphaned entries).
     fn cleanup_event(&self, event: &Arc<Event>) {
         if self.by_id.remove(&event.id).is_some() {
-            self.memory_bytes
-                .fetch_sub(event.raw.len(), AtomicOrdering::Relaxed);
-            self.event_count.fetch_sub(1, AtomicOrdering::Relaxed);
+            self.account_removed(event);
         }
 
         self.cleanup_secondary_indexes(event);
@@ -551,11 +550,7 @@ impl EventIndex {
 
     fn internal_remove(&self, id: &[u8; 32], skip_replaceable: bool) -> Option<Arc<Event>> {
         let (_, event) = self.by_id.remove(id)?;
-
-        let event_size = event.raw.len();
-        self.memory_bytes
-            .fetch_sub(event_size, AtomicOrdering::Relaxed);
-        self.event_count.fetch_sub(1, AtomicOrdering::Relaxed);
+        self.account_removed(&event);
 
         if !skip_replaceable && event.is_replaceable() {
             let key = event.replacement_key();
@@ -699,6 +694,39 @@ impl EventIndex {
     /// Get current memory usage in bytes (raw JSON only)
     pub fn memory_bytes(&self) -> usize {
         self.memory_bytes.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Payload bytes currently held for `kind`.
+    pub fn kind_bytes(&self, kind: u32) -> usize {
+        self.kind_bytes
+            .get(&kind)
+            .map_or(0, |b| b.0.load(AtomicOrdering::Relaxed))
+    }
+
+    /// Events currently held for `kind`.
+    pub fn kind_count(&self, kind: u32) -> usize {
+        self.kind_bytes
+            .get(&kind)
+            .map_or(0, |b| b.1.load(AtomicOrdering::Relaxed))
+    }
+
+    fn account_added(&self, event: &Event) {
+        let size = event.raw.len();
+        self.memory_bytes.fetch_add(size, AtomicOrdering::Relaxed);
+        self.event_count.fetch_add(1, AtomicOrdering::Relaxed);
+        let entry = self.kind_bytes.entry(event.kind).or_default();
+        entry.0.fetch_add(size, AtomicOrdering::Relaxed);
+        entry.1.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn account_removed(&self, event: &Event) {
+        let size = event.raw.len();
+        self.memory_bytes.fetch_sub(size, AtomicOrdering::Relaxed);
+        self.event_count.fetch_sub(1, AtomicOrdering::Relaxed);
+        if let Some(entry) = self.kind_bytes.get(&event.kind) {
+            entry.0.fetch_sub(size, AtomicOrdering::Relaxed);
+            entry.1.fetch_sub(1, AtomicOrdering::Relaxed);
+        }
     }
 
     /// Inflate the payload accounting without storing events, so memory-budget
@@ -895,6 +923,30 @@ mod tests {
             "0"
         );
         Arc::new(Event::from_json_unchecked(json.as_bytes()).unwrap())
+    }
+
+    #[test]
+    fn kind_bytes_follow_insert_replace_and_remove() {
+        let index = EventIndex::new();
+        let wrap = make_event_with_content(1, 1, 1059, 10, "aaaa");
+        let note = make_event_with_content(2, 1, 1, 10, "bb");
+        let app_v1 = make_event_with_content(3, 1, 10078, 10, "cccccc");
+        let app_v2 = make_event_with_content(4, 1, 10078, 20, "dd");
+        for e in [&wrap, &note, &app_v1, &app_v2] {
+            index.insert(e.clone());
+        }
+        assert_eq!(index.kind_bytes(1059), wrap.raw.len());
+        assert_eq!(index.kind_bytes(1), note.raw.len());
+        assert_eq!(
+            index.kind_bytes(10078),
+            app_v2.raw.len(),
+            "replaced version still counted"
+        );
+        assert_eq!(index.kind_bytes(7), 0);
+
+        index.remove(&wrap.id);
+        assert_eq!(index.kind_bytes(1059), 0);
+        assert_eq!(index.memory_bytes(), note.raw.len() + app_v2.raw.len());
     }
 
     #[test]

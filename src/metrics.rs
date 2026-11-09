@@ -1,6 +1,7 @@
 use prometheus::{
-    Counter, CounterVec, Encoder, Gauge, Histogram, HistogramVec, TextEncoder, register_counter,
-    register_counter_vec, register_gauge, register_histogram, register_histogram_vec,
+    Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramVec, TextEncoder,
+    register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
+    register_histogram_vec,
 };
 
 const TRACKED_KINDS: [u32; 16] = [
@@ -87,11 +88,17 @@ lazy_static::lazy_static! {
         "Events evicted to stay inside the memory budget"
     ).expect("Failed to register events_evicted counter");
 
-    pub static ref EVENTS_EXPIRED: CounterVec = register_counter_vec!(
-        "memlay_events_expired_total",
-        "Events removed when their kind retention ran out, by kind",
+    pub static ref QUOTA_EVICTED: CounterVec = register_counter_vec!(
+        "memlay_events_quota_evicted_total",
+        "Events removed to keep a kind inside its kind_quota share, by kind",
         &["kind"]
-    ).expect("Failed to register events_expired counter");
+    ).expect("Failed to register quota_evicted counter");
+
+    pub static ref KIND_BYTES: GaugeVec = register_gauge_vec!(
+        "memlay_store_kind_bytes",
+        "Payload bytes currently held for each kind with a kind_quota",
+        &["kind"]
+    ).expect("Failed to register kind_bytes gauge");
 
     pub static ref SAVED_BY_KIND: CounterVec = register_counter_vec!(
         "memlay_events_saved_by_kind_total",
@@ -226,8 +233,16 @@ pub fn inc_events_evicted(n: usize) {
     EVENTS_EVICTED.inc_by(n as f64);
 }
 
-pub fn inc_events_expired(kind: u32) {
-    EVENTS_EXPIRED.with_label_values(&[&kind_label(kind)]).inc();
+pub fn inc_quota_evicted(kind: u32, n: usize) {
+    QUOTA_EVICTED
+        .with_label_values(&[&kind_label(kind)])
+        .inc_by(n as f64);
+}
+
+pub fn set_kind_bytes(kind: u32, bytes: usize) {
+    KIND_BYTES
+        .with_label_values(&[&kind_label(kind)])
+        .set(bytes as f64);
 }
 
 pub fn observe_request(kind: &str, cpu: std::time::Duration, wall: std::time::Duration) {

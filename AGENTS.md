@@ -346,7 +346,8 @@ curl http://localhost:8080/metrics
 | `memlay_events_dropped_total` | live events dropped on a full connection queue |
 | `memlay_subscriptions_overflowed_total` | subs closed with `CLOSED` because the client fell behind |
 | `memlay_idle_disconnects_total` | connections reaped by `idle_timeout` |
-| `memlay_events_expired_total{kind}` | events removed by `kind_retention` |
+| `memlay_events_quota_evicted_total{kind}` | events removed to keep a kind inside `kind_quota` |
+| `memlay_store_kind_bytes{kind}` | payload bytes held for each quota kind |
 | `memlay_request_cpu_seconds{kind}` | histogram of thread CPU time per REQ / EVENT |
 | `memlay_request_response_seconds{kind}` | histogram of wall time per REQ (to EOSE) / EVENT (to OK) |
 
@@ -357,12 +358,13 @@ collapse. Reports top REQs, REQ shapes (values stripped), clients (header finger
 UA, origin), IPs and live connections, each with CPU and response time histograms.
 Tracking is capped by `analytics_max_entries`; `analytics_token` requires a bearer token.
 
-### Kind retention (`kind_retention`)
-Map of kind to duration (`1059: 2d`). The clock starts when the relay receives the event
-(`Event::received_at`), because clients backdate `created_at` (gift wraps by up to 2 days).
-`received_at` is persisted in WAL op 3 and in `received_at.bin` beside the snapshot; events from
-older files fall back to the load time. Expired events are swept in the eviction task, skipped on
-load, and refused on insert with `OK true "expired: ..."`. Advertised in NIP-11 `retention`.
+### Kind quota (`kind_quota`)
+Map of kind to percent of the payload budget (`1059: 20`); shares may not add up past 100.
+A kind over its share loses its earliest-received events first (`Event::received_at`, not
+`created_at`, which clients backdate). Trimmed on insert (up to 64 per insert), in the eviction
+task, and once after load. Kinds without a quota are only trimmed by normal memory eviction.
+`received_at` is persisted in WAL op 3 and `received_at.bin` beside the snapshot; events from older
+files fall back to the load time. Usage per kind is in `/stats` under `kind_quota`.
 
 ### Admin dashboard (`/admin`)
 Preact + Vite app in `dashboard/`, built to a single HTML file that `src/relay.rs` pulls in
