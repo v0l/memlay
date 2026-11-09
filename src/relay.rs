@@ -99,10 +99,18 @@ impl Relay {
 
         // Always start metrics collection for active connections
         let conn_count = connection_count.clone();
+        let store = events.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 crate::metrics::ACTIVE_CONNECTIONS.set(conn_count.load(Ordering::Relaxed) as f64);
+                crate::metrics::STORE_EVENTS.set(store.len() as f64);
+                crate::metrics::STORE_BYTES.set(store.memory_bytes() as f64);
+                crate::metrics::PAYLOAD_BUDGET.set(store.payload_budget() as f64);
+                crate::metrics::MEMORY_LIMIT.set(store.config().max_bytes as f64);
+                crate::metrics::PROCESS_MEMORY.set(store.cached_process_memory() as f64);
+                crate::metrics::AMPLIFICATION.set(store.amplification());
+                crate::metrics::TOMBSTONES.set(store.tombstone_count() as f64);
             }
         });
 

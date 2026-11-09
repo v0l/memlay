@@ -365,6 +365,7 @@ impl EventStore {
             }
 
             if removed > 0 {
+                crate::metrics::inc_events_evicted(removed);
                 let new_mem = self.index.memory_bytes();
                 let evictions = self
                     .state
@@ -509,6 +510,7 @@ impl EventStore {
                 // Record write delay metric
                 crate::metrics::observe_write_delay(start.elapsed());
                 crate::metrics::inc_events_saved();
+                crate::metrics::observe_saved(event.kind, event.raw.len());
 
                 InsertResult::Stored {
                     event,
