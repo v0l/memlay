@@ -5,9 +5,7 @@ RUN bun install --frozen-lockfile
 COPY dashboard ./
 RUN bun run build
 
-FROM rust:1-alpine AS builder
-
-RUN apk add --no-cache musl-dev
+FROM rust:1-bookworm AS builder
 
 WORKDIR /build
 
@@ -18,9 +16,11 @@ COPY --from=dashboard /dash/dist/index.html dashboard/dist/index.html
 
 RUN cargo build --release --bin memlay
 
-FROM alpine:3
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache ca-certificates
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/memlay /usr/local/bin/memlay
 
