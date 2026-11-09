@@ -51,6 +51,8 @@ const DEFAULT_AMPLIFICATION_MILLI: u64 = 4000;
 /// Payload bytes required before the amplification measurement is trusted.
 const MIN_AMPLIFICATION_SAMPLE_BYTES: u64 = 64 * 1024 * 1024;
 
+const AMPLIFICATION_FILE: &str = "amplification";
+
 /// Adaptive eviction state
 struct EvictionState {
     interval_seconds: AtomicUsize,
@@ -700,7 +702,36 @@ impl EventStore {
 
         // Atomic rename into place.
         fs::rename(&temp_file, &events_file)?;
+        self.persist_amplification(data_dir)?;
         Ok(count)
+    }
+
+    fn persist_amplification(&self, data_dir: &Path) -> anyhow::Result<()> {
+        let file = data_dir.join(AMPLIFICATION_FILE);
+        let temp = data_dir.join(format!("{AMPLIFICATION_FILE}.tmp"));
+        fs::write(
+            &temp,
+            self.amplification_milli.load(Ordering::Relaxed).to_string(),
+        )?;
+        fs::rename(&temp, &file)?;
+        Ok(())
+    }
+
+    fn restore_amplification(&self, data_dir: &Path) {
+        let Ok(text) = fs::read_to_string(data_dir.join(AMPLIFICATION_FILE)) else {
+            return;
+        };
+        match text.trim().parse::<u64>() {
+            Ok(milli) => {
+                let milli = milli.clamp(1000, 16_000);
+                self.amplification_milli.store(milli, Ordering::Relaxed);
+                tracing::info!(
+                    amplification = milli as f64 / 1000.0,
+                    "restored memory amplification"
+                );
+            }
+            Err(e) => tracing::warn!(error = %e, "ignoring unreadable amplification file"),
+        }
     }
 
     /// Checkpoint: bound WAL growth by folding it into a fresh snapshot.
@@ -832,10 +863,11 @@ impl EventStore {
             return Ok(0);
         };
         let data_dir = Path::new(path);
+        self.restore_amplification(data_dir);
 
         let budget = self.payload_budget();
-        let eviction_threshold = budget * 90 / 100;
-        let eviction_target = budget * 70 / 100;
+        let eviction_threshold = budget;
+        let eviction_target = budget * 90 / 100;
 
         let mut applied = 0usize;
         let mut errors = 0usize;
@@ -1541,6 +1573,33 @@ mod tests {
             store2.get(&oldest_event_id).is_none(),
             "Should evict oldest event (created_at=0)"
         );
+    }
+
+    #[test]
+    fn restart_restores_a_store_that_fit_in_its_budget() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let config = |path: &String| StoreConfig {
+            max_bytes: 1 << 20,
+            persistence_path: Some(path.clone()),
+            use_wal: true,
+        };
+
+        let store = EventStore::new(config(&path));
+        store.amplification_milli.store(1000, Ordering::Relaxed);
+        let mut created_at = 0;
+        while store.memory_bytes() < (1 << 20) * 85 / 100 {
+            created_at += 1;
+            store.insert(make_event(0, 1, 1, created_at));
+        }
+        let before = store.len();
+        assert!(store.memory_bytes() < store.payload_budget() * 90 / 100);
+        store.checkpoint().unwrap();
+        drop(store);
+
+        let restored = EventStore::new(config(&path));
+        restored.load_from_disk().unwrap();
+        assert_eq!(restored.len(), before, "restart dropped stored events");
     }
 
     #[test]
