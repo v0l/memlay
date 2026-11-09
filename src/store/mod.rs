@@ -2,7 +2,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 mod index;
@@ -93,6 +93,7 @@ pub struct EventStore {
     /// larger than the raw JSON the store accounts for; production runs sit
     /// near 3.8x. Sampled alongside RSS and used to size the payload budget.
     amplification_milli: AtomicU64,
+    amplification_known: AtomicBool,
     peak_payload: AtomicU64,
 }
 
@@ -175,6 +176,7 @@ impl EventStore {
             wal,
             cached_rss_bytes: AtomicU64::new(Self::read_rss_bytes()),
             amplification_milli: AtomicU64::new(DEFAULT_AMPLIFICATION_MILLI),
+            amplification_known: AtomicBool::new(false),
             peak_payload: AtomicU64::new(0),
         }
     }
@@ -287,6 +289,7 @@ impl EventStore {
         let smoothed = (previous + (observed - previous) / 8).clamp(1000, 16_000);
         self.amplification_milli
             .store(smoothed as u64, Ordering::Relaxed);
+        self.amplification_known.store(true, Ordering::Relaxed);
     }
 
     /// Payload bytes the store may hold before the process is expected to reach
@@ -707,6 +710,9 @@ impl EventStore {
     }
 
     fn persist_amplification(&self, data_dir: &Path) -> anyhow::Result<()> {
+        if !self.amplification_known.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let file = data_dir.join(AMPLIFICATION_FILE);
         let temp = data_dir.join(format!("{AMPLIFICATION_FILE}.tmp"));
         fs::write(
@@ -725,6 +731,7 @@ impl EventStore {
             Ok(milli) => {
                 let milli = milli.clamp(1000, 16_000);
                 self.amplification_milli.store(milli, Ordering::Relaxed);
+                self.amplification_known.store(true, Ordering::Relaxed);
                 tracing::info!(
                     amplification = milli as f64 / 1000.0,
                     "restored memory amplification"
@@ -1576,6 +1583,26 @@ mod tests {
     }
 
     #[test]
+    fn unmeasured_amplification_is_not_persisted() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let store = EventStore::new(StoreConfig::with_persistence(0, path.clone()));
+        store.insert(make_event(0, 1, 1, 1));
+        store.checkpoint().unwrap();
+        let file = std::path::Path::new(&path).join(AMPLIFICATION_FILE);
+        assert!(
+            !file.exists(),
+            "the startup default was saved as if measured"
+        );
+
+        store.index.add_memory_bytes_for_test(1 << 30);
+        store.sample_amplification(2 << 30);
+        store.checkpoint().unwrap();
+        let saved: u64 = std::fs::read_to_string(&file).unwrap().parse().unwrap();
+        assert!(saved < DEFAULT_AMPLIFICATION_MILLI);
+    }
+
+    #[test]
     fn restart_restores_a_store_that_fit_in_its_budget() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_str().unwrap().to_string();
@@ -1587,6 +1614,7 @@ mod tests {
 
         let store = EventStore::new(config(&path));
         store.amplification_milli.store(1000, Ordering::Relaxed);
+        store.amplification_known.store(true, Ordering::Relaxed);
         let mut created_at = 0;
         while store.memory_bytes() < (1 << 20) * 85 / 100 {
             created_at += 1;
