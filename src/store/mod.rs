@@ -16,6 +16,15 @@ use pressure::RssPressure;
 pub use index::{EventIndex, EventRef, InsertOutcome};
 pub use wal::{WalOp, WriteAheadLog};
 
+pub fn release_free_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+const HEAP_RELEASE_INTERVAL: Duration = Duration::from_secs(60);
+
 use crate::deletion::{DeletionOutcome, DeletionRequest};
 use crate::event::Event;
 
@@ -297,6 +306,18 @@ impl EventStore {
                 }
             });
         }
+
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(HEAP_RELEASE_INTERVAL).await;
+                let start = std::time::Instant::now();
+                tokio::task::spawn_blocking(release_free_heap).await.ok();
+                tracing::debug!(
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "released free heap"
+                );
+            }
+        });
 
         tokio::spawn(async move {
             let task_id = std::process::id();
