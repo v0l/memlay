@@ -107,6 +107,31 @@ impl TagIdHash {
     }
 }
 
+type RefSet = RwLock<BTreeSet<EventRef>>;
+
+/// Add `er` to the set under `key`, creating the set if needed. The entry
+/// guard holds the map's shard write lock until the ref is in the set, so a
+/// concurrent `remove_ref` cannot drop the set in between.
+fn insert_ref<K: Eq + std::hash::Hash>(map: &DashMap<K, RefSet>, key: K, er: EventRef) {
+    map.entry(key).or_default().get_mut().insert(er);
+}
+
+/// Remove `er` from the set under `key`, and drop the set once it is empty.
+/// Runs under the map's shard write lock, the same lock an insert holds while
+/// adding to the set through `entry()`, so an insert can never land in a set
+/// that is being dropped.
+fn remove_ref<K, Q>(map: &DashMap<K, RefSet>, key: &Q, er: &EventRef)
+where
+    K: Eq + std::hash::Hash + std::borrow::Borrow<Q>,
+    Q: Eq + std::hash::Hash + ?Sized,
+{
+    map.remove_if_mut(key, |_, set| {
+        let set = set.get_mut();
+        set.remove(er);
+        set.is_empty()
+    });
+}
+
 /// Reference to an event, used in sorted indexes.
 /// Stores the Arc<Event> pointer for zero-copy event access.
 #[derive(Clone)]
@@ -316,31 +341,19 @@ impl EventIndex {
         // Pubkey index
         {
             let pubkey_hash = TagIdHash::from_id(&event.pubkey);
-            let set_lock = self
-                .by_pubkey
-                .entry(pubkey_hash)
-                .or_insert_with(|| RwLock::new(BTreeSet::new()));
-            set_lock.write().insert(EventRef::new(event.clone()));
+            insert_ref(&self.by_pubkey, pubkey_hash, EventRef::new(event.clone()));
         }
 
         // Kind index
         {
-            let set_lock = self
-                .by_kind
-                .entry(event.kind)
-                .or_insert_with(|| RwLock::new(BTreeSet::new()));
-            set_lock.write().insert(EventRef::new(event.clone()));
+            insert_ref(&self.by_kind, event.kind, EventRef::new(event.clone()));
         }
 
         // E-tag index
         {
             for e_tag in event.e_tags() {
                 let e_tag_hash = TagIdHash::from_id(&e_tag);
-                let set_lock = self
-                    .by_tag_e
-                    .entry(e_tag_hash)
-                    .or_insert_with(|| RwLock::new(BTreeSet::new()));
-                set_lock.write().insert(EventRef::new(event.clone()));
+                insert_ref(&self.by_tag_e, e_tag_hash, EventRef::new(event.clone()));
             }
         }
 
@@ -348,11 +361,7 @@ impl EventIndex {
         {
             for p_tag in event.p_tags() {
                 let p_tag_hash = TagIdHash::from_id(&p_tag);
-                let set_lock = self
-                    .by_tag_p
-                    .entry(p_tag_hash)
-                    .or_insert_with(|| RwLock::new(BTreeSet::new()));
-                set_lock.write().insert(EventRef::new(event.clone()));
+                insert_ref(&self.by_tag_p, p_tag_hash, EventRef::new(event.clone()));
             }
         }
 
@@ -360,10 +369,7 @@ impl EventIndex {
         {
             for (letter, value) in event.generic_tags() {
                 let inner_map = self.by_tag_other.entry(letter).or_insert_with(DashMap::new);
-                let set_lock = inner_map
-                    .entry(value.to_string())
-                    .or_insert_with(|| RwLock::new(BTreeSet::new()));
-                set_lock.write().insert(EventRef::new(event.clone()));
+                insert_ref(&inner_map, value.to_string(), EventRef::new(event.clone()));
             }
         }
 
@@ -427,41 +433,31 @@ impl EventIndex {
 
         {
             let pubkey_hash = TagIdHash::from_id(&event.pubkey);
-            if let Some(set_lock) = self.by_pubkey.get(&pubkey_hash) {
-                set_lock.write().remove(&er);
-            }
+            remove_ref(&self.by_pubkey, &pubkey_hash, &er);
         }
 
         {
-            if let Some(set_lock) = self.by_kind.get(&event.kind) {
-                set_lock.write().remove(&er);
-            }
+            remove_ref(&self.by_kind, &event.kind, &er);
         }
 
         {
             for e_tag in event.e_tags() {
                 let e_tag_hash = TagIdHash::from_id(&e_tag);
-                if let Some(set_lock) = self.by_tag_e.get(&e_tag_hash) {
-                    set_lock.write().remove(&er);
-                }
+                remove_ref(&self.by_tag_e, &e_tag_hash, &er);
             }
         }
 
         {
             for p_tag in event.p_tags() {
                 let p_tag_hash = TagIdHash::from_id(&p_tag);
-                if let Some(set_lock) = self.by_tag_p.get(&p_tag_hash) {
-                    set_lock.write().remove(&er);
-                }
+                remove_ref(&self.by_tag_p, &p_tag_hash, &er);
             }
         }
 
         {
             for (letter, value) in event.generic_tags() {
                 if let Some(inner_map) = self.by_tag_other.get(&letter) {
-                    if let Some(set_lock) = inner_map.get(value) {
-                        set_lock.write().remove(&er);
-                    }
+                    remove_ref(&inner_map, value, &er);
                 }
             }
         }
@@ -566,41 +562,31 @@ impl EventIndex {
         // slightly more memory but eliminates the race.
         {
             let pubkey_hash = TagIdHash::from_id(&event.pubkey);
-            if let Some(set_lock) = self.by_pubkey.get(&pubkey_hash) {
-                set_lock.write().remove(&er);
-            }
+            remove_ref(&self.by_pubkey, &pubkey_hash, &er);
         }
 
         {
-            if let Some(set_lock) = self.by_kind.get(&event.kind) {
-                set_lock.write().remove(&er);
-            }
+            remove_ref(&self.by_kind, &event.kind, &er);
         }
 
         {
             for e_tag in event.e_tags() {
                 let e_tag_hash = TagIdHash::from_id(&e_tag);
-                if let Some(set_lock) = self.by_tag_e.get(&e_tag_hash) {
-                    set_lock.write().remove(&er);
-                }
+                remove_ref(&self.by_tag_e, &e_tag_hash, &er);
             }
         }
 
         {
             for p_tag in event.p_tags() {
                 let p_tag_hash = TagIdHash::from_id(&p_tag);
-                if let Some(set_lock) = self.by_tag_p.get(&p_tag_hash) {
-                    set_lock.write().remove(&er);
-                }
+                remove_ref(&self.by_tag_p, &p_tag_hash, &er);
             }
         }
 
         {
             for (letter, value) in event.generic_tags() {
                 if let Some(inner_map) = self.by_tag_other.get(&letter) {
-                    if let Some(set_lock) = inner_map.get(value) {
-                        set_lock.write().remove(&er);
-                    }
+                    remove_ref(&inner_map, value, &er);
                 }
             }
         }
@@ -734,6 +720,20 @@ impl EventIndex {
     #[cfg(test)]
     pub fn add_memory_bytes_for_test(&self, bytes: usize) {
         self.memory_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+    }
+
+    /// Number of index keys held across the pubkey, kind and tag indexes.
+    #[cfg(test)]
+    pub fn index_key_count(&self) -> usize {
+        self.by_pubkey.len()
+            + self.by_kind.len()
+            + self.by_tag_e.len()
+            + self.by_tag_p.len()
+            + self
+                .by_tag_other
+                .iter()
+                .map(|inner| inner.len())
+                .sum::<usize>()
     }
 
     /// Get event count (lock-free)
@@ -947,6 +947,74 @@ mod tests {
         index.remove(&wrap.id);
         assert_eq!(index.kind_bytes(1059), 0);
         assert_eq!(index.memory_bytes(), note.raw.len() + app_v2.raw.len());
+    }
+
+    #[test]
+    fn removed_events_leave_no_index_keys_behind() {
+        let index = EventIndex::new();
+        let ids: Vec<[u8; 32]> = (0..500u32)
+            .map(|i| {
+                let json = format!(
+                    r#"{{"id":"{i:064x}","pubkey":"{:064x}","created_at":{i},"kind":{},"tags":[["e","{:064x}"],["p","{:064x}"],["t","tag{i}"]],"content":"","sig":"{:0128}"}}"#,
+                    i + 10_000,
+                    i,
+                    i + 20_000,
+                    i + 30_000,
+                    0
+                );
+                let event = Arc::new(Event::from_json_unchecked(json.as_bytes()).unwrap());
+                let id = event.id;
+                index.insert(event);
+                id
+            })
+            .collect();
+        assert!(index.index_key_count() >= 2500);
+        for id in &ids {
+            index.remove(id);
+        }
+        assert_eq!(index.len(), 0);
+        assert_eq!(index.index_key_count(), 0, "emptied index sets were kept");
+    }
+
+    #[test]
+    fn concurrent_churn_on_shared_keys_never_hides_a_live_event() {
+        let index = Arc::new(EventIndex::new());
+        let make = |n: u32, pair: u32| {
+            let json = format!(
+                r#"{{"id":"{n:064x}","pubkey":"{:064x}","created_at":{n},"kind":1,"tags":[["p","{:064x}"],["t","shared{pair}"]],"content":"","sig":"{:0128}"}}"#,
+                n % 3,
+                n % 2,
+                0
+            );
+            Arc::new(Event::from_json_unchecked(json.as_bytes()).unwrap())
+        };
+        let threads: Vec<_> = (0..16u32)
+            .map(|t| {
+                let index = index.clone();
+                std::thread::spawn(move || {
+                    let pair = t / 2;
+                    let tag = format!("shared{pair}");
+                    let mut lost = 0usize;
+                    for i in 0..20_000u32 {
+                        let event = make(t * 1_000_000 + i, pair);
+                        index.insert(event.clone());
+                        if !index
+                            .query_by_tag('t', &tag, usize::MAX)
+                            .iter()
+                            .any(|e| e.id == event.id)
+                        {
+                            lost += 1;
+                        }
+                        index.remove(&event.id);
+                    }
+                    lost
+                })
+            })
+            .collect();
+        let lost: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(lost, 0, "live events missing from the tag index");
+        assert_eq!(index.len(), 0);
+        assert_eq!(index.index_key_count(), 0, "emptied index sets were kept");
     }
 
     #[test]
