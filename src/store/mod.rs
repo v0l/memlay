@@ -1012,6 +1012,7 @@ impl EventStore {
         let mut ingest = |event: Arc<Event>| {
             if matches!(index.insert(event.clone()), InsertOutcome::Inserted { .. }) {
                 self.track_quota(&event);
+                self.enforce_quota(event.kind, QUOTA_TRIM_PER_INSERT);
             }
             if eviction_threshold > 0 && index.memory_bytes() > eviction_threshold {
                 while index.memory_bytes() > eviction_target {
@@ -1869,6 +1870,36 @@ mod tests {
             restored.get(&wraps[0].id).is_none(),
             "earliest-received wrap kept"
         );
+    }
+
+    #[test]
+    fn restart_keeps_normal_events_when_quota_kinds_churned() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let store = quota_store(Some(path.clone()));
+        store.amplification_known.store(true, Ordering::Relaxed);
+
+        let normal: Vec<_> = (0..150u32)
+            .map(|i| kind_event(1, 1_000 + i as u64, i))
+            .collect();
+        for e in &normal {
+            store.insert(e.clone());
+        }
+        for i in 0..3_000u32 {
+            store.insert(kind_event(1059, 5_000 + i as u64, 1_000 + i));
+        }
+        assert_eq!(store.index.kind_count(1), normal.len());
+        assert!(store.memory_bytes() < store.payload_budget());
+        drop(store);
+
+        let restored = quota_store(Some(path));
+        restored.load_from_disk().unwrap();
+        assert_eq!(
+            restored.index.kind_count(1),
+            normal.len(),
+            "replayed quota events pushed out normal events"
+        );
+        assert!(restored.kind_bytes(1059) <= restored.kind_limit(1059).unwrap());
     }
 
     #[test]
