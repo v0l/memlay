@@ -264,6 +264,12 @@
           "refId": "E",
           "expr": "max(container_memory_working_set_bytes{namespace=\"v0l\",pod=~\"memlay.*\",container=\"memlay\"})",
           "legendFormat": "cgroup working set"
+        },
+        {
+          "datasource": null,
+          "expr": "memlay_send_queue_bytes",
+          "legendFormat": "send queues",
+          "refId": "F"
         }
       ],
       "fieldConfig": {
