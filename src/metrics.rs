@@ -147,6 +147,11 @@ lazy_static::lazy_static! {
         "NIP-09 tombstones currently held"
     ).expect("Failed to register tombstones gauge");
 
+    pub static ref SEND_QUEUE_BYTES: Gauge = register_gauge!(
+        "memlay_send_queue_bytes",
+        "Bytes waiting in connection send queues"
+    ).expect("Failed to register send_queue_bytes gauge");
+
     pub static ref REQUEST_CPU: HistogramVec = register_histogram_vec!(
         "memlay_request_cpu_seconds",
         "CPU time spent handling a client request, by kind (req or event)",
@@ -223,6 +228,14 @@ pub fn observe_saved(kind: u32, bytes: usize) {
 
 pub fn add_bytes_sent(n: usize) {
     BYTES_SENT.inc_by(n as f64);
+}
+
+pub fn add_send_queue_bytes(n: usize) {
+    SEND_QUEUE_BYTES.add(n as f64);
+}
+
+pub fn sub_send_queue_bytes(n: usize) {
+    SEND_QUEUE_BYTES.sub(n as f64);
 }
 
 pub fn add_bytes_received(n: usize) {

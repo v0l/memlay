@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const CUT_PERCENT: usize = 90;
 const REARM_PERCENT: u64 = 90;
-const GROWTH_STEP_DIVISOR: u64 = 100;
 
 pub(super) struct RssPressure {
     ceiling: AtomicUsize,
@@ -31,17 +30,9 @@ impl RssPressure {
             return None;
         }
 
-        let last_cut = self.rss_at_cut.load(Ordering::Relaxed);
-        let grown = if last_cut == 0 {
-            rss > max_bytes
-        } else {
-            rss > last_cut + max_bytes / GROWTH_STEP_DIVISOR
-        };
-        if grown {
+        if self.rss_at_cut.load(Ordering::Relaxed) == 0 && rss > max_bytes {
             let cut = (payload * CUT_PERCENT / 100).max(floor).max(1);
-            let current = self.ceiling.load(Ordering::Relaxed);
-            let next = if current == 0 { cut } else { current.min(cut) };
-            self.ceiling.store(next, Ordering::Relaxed);
+            self.ceiling.store(cut, Ordering::Relaxed);
             self.rss_at_cut.store(rss, Ordering::Relaxed);
         }
 
@@ -75,24 +66,27 @@ mod tests {
     }
 
     #[test]
-    fn growing_rss_cuts_again() {
+    fn rss_growth_after_a_cut_does_not_drain_the_store() {
         let pressure = RssPressure::new();
-        let rss = MAX as u64 + 1;
-        pressure.payload_ceiling(10_000, rss, MAX, 0);
-        let grown = rss + MAX as u64 / GROWTH_STEP_DIVISOR + 1;
-        assert_eq!(pressure.payload_ceiling(9_000, grown, MAX, 0), Some(8_100));
+        let mut rss = MAX as u64 + 1;
+        let mut payload = pressure.payload_ceiling(10_000, rss, MAX, 1_000).unwrap();
+        for _ in 0..20 {
+            rss += MAX as u64 / 100 + 1;
+            payload = pressure.payload_ceiling(payload, rss, MAX, 1_000).unwrap();
+        }
+        assert_eq!(
+            payload, 9_000,
+            "payload is held at the ceiling, so further RSS growth is not events"
+        );
     }
 
     #[test]
     fn never_cuts_below_the_floor() {
         let pressure = RssPressure::new();
-        let mut rss = MAX as u64 + 1;
-        let mut payload = 10_000;
-        for _ in 0..100 {
-            payload = pressure.payload_ceiling(payload, rss, MAX, 4_000).unwrap();
-            rss += MAX as u64;
-        }
-        assert_eq!(payload, 4_000);
+        assert_eq!(
+            pressure.payload_ceiling(10_000, MAX as u64 + 1, MAX, 9_500),
+            Some(9_500)
+        );
     }
 
     #[test]

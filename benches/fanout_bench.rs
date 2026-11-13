@@ -14,7 +14,7 @@ use memlay::fanout::{BroadcastEvent, Fanout};
 use memlay::subscription::{Filter, FilterMatch};
 use std::hint::black_box;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 const SEND_CAP: usize = 16384;
 
@@ -49,11 +49,11 @@ fn build_fanout(
     conns: usize,
     idle_pct: usize,
     kind_pool: &[u32],
-) -> (Arc<Fanout>, Vec<mpsc::Receiver<String>>) {
+) -> (Arc<Fanout>, Vec<memlay::sendq::SendQueueRx>) {
     let fanout = Arc::new(Fanout::new());
     let mut rxs = Vec::with_capacity(conns);
     for i in 0..conns {
-        let (tx, rx) = mpsc::channel(SEND_CAP);
+        let (tx, rx) = memlay::sendq::send_queue(SEND_CAP * 512);
         let state = fanout.register(tx);
         if i * 100 / conns >= idle_pct {
             let kind = kind_pool[i % kind_pool.len()];

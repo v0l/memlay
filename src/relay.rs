@@ -19,11 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 
-/// Capacity of per-connection send channels (backpressure for slow clients).
-/// Sized to absorb a sync/import burst without dropping. Live delivery is
-/// routed per-connection by `Fanout`, so this is the only queue an event sits
-/// in and it is never shared with unrelated connections.
-const CONN_SEND_CAP: usize = 16384;
+const CONN_SEND_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum inbound WebSocket text frame size (bytes) we will parse. Larger
 /// frames are rejected to bound per-message CPU/allocation.
@@ -397,7 +393,7 @@ async fn handle_socket(
     let (mut ws_send, mut ws_recv) = socket.split();
 
     // Per-connection send channel for async event delivery (prevents slow clients from blocking).
-    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<String>(CONN_SEND_CAP);
+    let (send_tx, mut send_rx) = crate::sendq::send_queue(CONN_SEND_BYTES);
 
     // Register with the live-event router. No events are routed here until a
     // REQ opens a subscription, so idle connections cost the publisher nothing.

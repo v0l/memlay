@@ -17,9 +17,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 
 use crate::event::Event;
+use crate::sendq::SendQueue;
 use crate::subscription::{Filter, FilterMatch};
 
 /// Sliding window over which dropped-event rate is measured for slow peers.
@@ -66,7 +67,7 @@ enum KindKey {
 /// whichever thread is publishing an event.
 pub struct ConnState {
     pub id: ConnId,
-    tx: mpsc::Sender<String>,
+    tx: SendQueue,
     /// sub_id → filters. Small (bounded by `max_subscriptions`), read on every
     /// candidate delivery, written only on REQ/CLOSE.
     subs: RwLock<Vec<SubEntry>>,
@@ -195,7 +196,7 @@ impl Fanout {
 
     /// Register a connection. It receives no events until it opens a
     /// subscription, so idle connections cost nothing on the publish path.
-    pub fn register(&self, tx: mpsc::Sender<String>) -> Arc<ConnState> {
+    pub fn register(&self, tx: SendQueue) -> Arc<ConnState> {
         let mut inner = self.inner.write();
         inner.next_id += 1;
         let id = inner.next_id;
@@ -376,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn idle_connections_receive_nothing() {
         let fanout = Fanout::new();
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = crate::sendq::send_queue(8 * 4096);
         let _conn = fanout.register(tx);
 
         let ev = crate::event::EventBuilder::new().kind(1).build();
@@ -389,15 +390,15 @@ mod tests {
     async fn kind_index_routes_only_to_interested() {
         let fanout = Fanout::new();
 
-        let (tx1, mut rx1) = mpsc::channel(8);
+        let (tx1, mut rx1) = crate::sendq::send_queue(8 * 4096);
         let c1 = fanout.register(tx1);
         fanout.set_sub(&c1, "a", vec![kind_filter(Some(vec![1]))]);
 
-        let (tx2, mut rx2) = mpsc::channel(8);
+        let (tx2, mut rx2) = crate::sendq::send_queue(8 * 4096);
         let c2 = fanout.register(tx2);
         fanout.set_sub(&c2, "b", vec![kind_filter(Some(vec![7]))]);
 
-        let (tx3, mut rx3) = mpsc::channel(8);
+        let (tx3, mut rx3) = crate::sendq::send_queue(8 * 4096);
         let c3 = fanout.register(tx3);
         fanout.set_sub(&c3, "c", vec![kind_filter(None)]);
 
@@ -412,7 +413,7 @@ mod tests {
     #[tokio::test]
     async fn removing_subs_deindexes() {
         let fanout = Fanout::new();
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = crate::sendq::send_queue(8 * 4096);
         let conn = fanout.register(tx);
         fanout.set_sub(&conn, "a", vec![kind_filter(Some(vec![1]))]);
         assert!(fanout.remove_sub(&conn, "a"));
@@ -425,7 +426,7 @@ mod tests {
     #[tokio::test]
     async fn overflow_queues_closed_and_kills_slow_peer() {
         let fanout = Fanout::new();
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, _rx) = crate::sendq::send_queue(1);
         let conn = fanout.register(tx);
         fanout.set_sub(&conn, "a", vec![kind_filter(Some(vec![1]))]);
 
